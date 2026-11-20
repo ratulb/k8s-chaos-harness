@@ -1,4 +1,4 @@
-# PHASES.md — etcd-chaos-bench
+# PHASES.md — k8s-chaos-bench
 
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 

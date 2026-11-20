@@ -38,7 +38,7 @@ class LLMClient:
             try:
                 data = None if payload is None else json.dumps(payload).encode("utf-8")
                 req = urllib.request.Request(self._url(path), data=data, method=method)
-                req.add_header("User-Agent", "etcd-chaos-bench/1.0")
+                req.add_header("User-Agent", "k8s-chaos-bench/1.0")
                 if self.backend.api_key:
                     req.add_header("Authorization", f"Bearer {self.backend.api_key}")
                 if data is not None:
@@ -64,7 +64,7 @@ class LLMClient:
             self._url("/chat/completions"),
             data=data,
             headers={
-                "User-Agent": "etcd-chaos-bench/1.0",
+                "User-Agent": "k8s-chaos-bench/1.0",
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.backend.api_key}",
             },

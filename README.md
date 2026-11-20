@@ -1,4 +1,4 @@
-# etcd-chaos-bench
+# k8s-chaos-bench
 
 Reproducible etcd fault diagnosis and repair benchmark.
 
