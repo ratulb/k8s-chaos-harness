@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import os
 import sys
+from llm.env import load_env
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+load_env()
 
 from llm.client import Backend, LLMClient
 from llm.fallback import ready_backends
