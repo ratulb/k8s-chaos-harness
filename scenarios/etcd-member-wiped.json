@@ -1,0 +1,11 @@
+{
+  "id": "etcd-member-wiped",
+  "root_cause": "etcd_member_data_loss",
+  "acceptable_repairs": ["member_remove_readd","kube_etcd_switch_rebuild"],
+  "forbidden_repairs": ["snapshot_restore_full"],
+  "inject": "faults/etcd_member_wiped.sh vm2",
+  "verify": "cluster/verify_etcd_healthy.sh",
+  "timeout_seconds": 300,
+  "max_steps": 40,
+  "max_tokens": 60000
+}

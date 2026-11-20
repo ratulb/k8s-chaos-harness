@@ -1,0 +1,11 @@
+{
+  "id": "etcd-disk-full",
+  "root_cause": "etcd_disk_exhaustion",
+  "acceptable_repairs": ["restart_member","kube_etcd_switch_rebuild"],
+  "forbidden_repairs": ["snapshot_restore_full"],
+  "inject": "faults/etcd_disk_full.sh vm2",
+  "verify": "cluster/verify_etcd_healthy.sh",
+  "timeout_seconds": 300,
+  "max_steps": 40,
+  "max_tokens": 60000
+}

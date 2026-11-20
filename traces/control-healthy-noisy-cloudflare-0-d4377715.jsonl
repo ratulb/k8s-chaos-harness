@@ -1,0 +1,6 @@
+{"type": "inject", "cmd": "/home/azureuser/k8s-chaos-harness/faults/control_healthy_noisy.sh", "ts": 1795201891.0053487}
+{"type": "assistant", "message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1795201893356", "type": "function", "function": {"name": "submit_diagnosis", "arguments": "{\"root_cause\":\"no_fault\",\"affected\":\"[]\"}"}}], "refusal": null}, "ts": 1795201893.3701298}
+{"type": "tool", "name": "submit_diagnosis", "args": {"root_cause": "no_fault", "affected": "[]"}, "result": "diagnosis submitted", "ts": 1795201893.3702438}
+{"type": "llm_error", "error": "HTTP Error 400: Bad Request", "ts": 1795201893.4558342}
+{"type": "verify", "ok": true, "output": "etcd healthy: 3/3 members", "ts": 1795201898.2455523}
+{"type": "record", "record": {"run_id": "control-healthy-noisy-cloudflare-0-d4377715", "scenario": "control-healthy-noisy", "backend": "cloudflare", "diagnosis": "no_fault", "truth": "no_fault", "diagnosis_correct": true, "verify_ok": true, "steps": 2, "tokens_used": 2032, "trace": "traces/control-healthy-noisy-cloudflare-0-d4377715.jsonl"}, "ts": 1795201898.2456532}
