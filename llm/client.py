@@ -23,19 +23,29 @@ class LLMClient:
         self.backend = backend
 
     def _url(self, path: str) -> str:
-        return self.backend.base_url.rstrip("/") + path
+        base = self.backend.base_url.rstrip("/")
+        if path in ("/chat/completions", "/models") and not base.endswith("/v1"):
+            base += "/v1"
+        return base + path
 
     def health(self) -> bool:
-        # Try OpenAI-compatible and Ollama-native endpoints.
-        for path in ("/models", "/api/tags"):
+        # Try common read endpoints first.
+        for method, path, payload in (
+            ("GET", "/models", None),
+            ("GET", "/api/tags", None),
+            ("POST", "/chat/completions", {"model": self.backend.model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1}),
+        ):
             try:
-                req = urllib.request.Request(self._url(path))
+                data = None if payload is None else json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(self._url(path), data=data, method=method)
                 if self.backend.api_key:
                     req.add_header("Authorization", f"Bearer {self.backend.api_key}")
-                with urllib.request.urlopen(req, timeout=5) as resp:
-                    if resp.status == 200:
+                if data is not None:
+                    req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    if 200 <= resp.status < 300:
                         return True
-            except (urllib.error.URLError, TimeoutError, OSError):
+            except (urllib.error.URLError, TimeoutError, OSError, ValueError):
                 continue
         return False
 

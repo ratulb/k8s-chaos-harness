@@ -5,9 +5,10 @@ from __future__ import annotations
 
 import os
 import sys
-from llm.env import load_env
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from llm.env import load_env
+
 load_env()
 
 from llm.client import Backend, LLMClient
@@ -55,7 +56,7 @@ if cf_account and cf_token:
         Backend(
             name="cloudflare",
             base_url=f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/v1",
-            model=os.environ.get("CLOUDFLARE_MODEL", "@cf/qwen/qwq-32b"),
+            model=os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
             api_key=cf_token,
         )
     )
