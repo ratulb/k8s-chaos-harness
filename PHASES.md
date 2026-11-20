@@ -1,4 +1,4 @@
-# PHASES.md — k8s-chaos-bench
+# PHASES.md — k8s-chaos-harness
 
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
