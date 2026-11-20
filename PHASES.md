@@ -3,10 +3,10 @@
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
 ## Phase 0 — Foundations
-- [~] Kaggle LLM bootstrap script
-- [~] Ollama health check
+- [x] Kaggle LLM bootstrap script
+- [x] Ollama health check
 - [ ] zrok tunnel automation
-- [ ] Hosted backend smoke tests
+- [x] Hosted backend smoke tests
 - Deliverable: one-command LLM readiness check
 - Acceptance: local wrapper can reach Kaggle and one hosted backend
 
