@@ -21,4 +21,14 @@ for ip in 10.1.0.4 10.2.0.4 10.3.0.4; do
 done
 
 cd "$ROOT"
-exec "$(dirname "${BASH_SOURCE[0]}")/verify_etcd_healthy.sh"
+for i in $(seq 1 36); do
+  if bash "$(dirname "${BASH_SOURCE[0]}")/verify_etcd_healthy.sh" >/dev/null 2>&1; then
+    bash "$(dirname "${BASH_SOURCE[0]}")/snapshot_clean_state.sh"
+    echo "cluster reset and verified"
+    exit 0
+  fi
+  sleep 5
+done
+
+bash "$(dirname "${BASH_SOURCE[0]}")/verify_etcd_healthy.sh"
+exit 1

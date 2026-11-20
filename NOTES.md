@@ -17,7 +17,8 @@ Build an AI agent from scratch that diagnoses and fixes injected faults in a Kub
 3. First deliverable: DESIGN.md.
 
 ## Current cluster status
-- 3 nodes (vm1, vm2 workers; vm3 control-plane), all Ready.
+- 3 nodes (vm1, vm2, vm3), all control-plane with stacked etcd, all Ready.
+- Kubernetes v1.36.6; HAProxy LB at `10.3.0.4:8080`; kubeconfig server `https://10.3.0.4:8080`.
 - Calico 1/1, cross-namespace pod connectivity verified.
 
 ## Reference: tool_call_loop (cloned at /home/tool_call_loop)

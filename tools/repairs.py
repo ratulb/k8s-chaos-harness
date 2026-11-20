@@ -20,15 +20,22 @@ def _wait_for_etcd(node: str, timeout: int = 180) -> str:
     return f"timeout waiting for etcd-{node}"
 
 
-def restart_member(node: str) -> str:
+def _restore_manifest(node: str) -> None:
     run_on_node(node, """
 set -e
 MAN=/etc/kubernetes/manifests/etcd.yaml
-DISABLED=/etc/kubernetes/manifests/etcd.yaml.disabled
-if [ -f "$DISABLED" ]; then sudo mv "$DISABLED" "$MAN"; fi
-if [ -f /tmp/etcd.yaml.orig ]; then sudo cp /tmp/etcd.yaml.orig "$MAN"; fi
-sudo rm -f /var/lib/etcd/filler
+if [ -f /tmp/etcd.yaml.clean ]; then
+  sudo cp /tmp/etcd.yaml.clean "$MAN"
+elif [ -f /tmp/etcd.yaml.orig ]; then
+  sudo cp /tmp/etcd.yaml.orig "$MAN"
+fi
+sudo rm -f /etc/kubernetes/manifests/etcd.yaml.disabled /var/lib/etcd/filler
+sudo systemctl restart kubelet
 """)
+
+
+def restart_member(node: str) -> str:
+    _restore_manifest(node)
     _kubectl(["kubectl", "delete", "pod", f"etcd-{node}", "-n", "kube-system", "--ignore-not-found=true"], timeout=60)
     return _wait_for_etcd(node)
 
@@ -36,9 +43,6 @@ sudo rm -f /var/lib/etcd/filler
 def member_remove_readd(node: str) -> str:
     ip = node_ip(node)
     healthy = "vm1" if node != "vm1" else "vm2"
-
-    # stop target
-    run_on_node(node, "sudo mv /etc/kubernetes/manifests/etcd.yaml /etc/kubernetes/manifests/etcd.yaml.disabled 2>/dev/null || true")
 
     # find member id
     proc = _kubectl(["kubectl", "exec", "-n", "kube-system", f"etcd-{healthy}", "--", "etcdctl",
@@ -78,13 +82,7 @@ def member_remove_readd(node: str) -> str:
     run_on_node(node, "sudo rm -rf /var/lib/etcd/*")
 
     # restore manifest
-    run_on_node(node, """
-set -e
-MAN=/etc/kubernetes/manifests/etcd.yaml
-DISABLED=/etc/kubernetes/manifests/etcd.yaml.disabled
-if [ -f "$DISABLED" ]; then sudo mv "$DISABLED" "$MAN"; fi
-if [ -f /tmp/etcd.yaml.orig ]; then sudo cp /tmp/etcd.yaml.orig "$MAN"; fi
-""")
+    _restore_manifest(node)
 
     # update manifest fields
     script = f"""

@@ -7,13 +7,20 @@ import time
 from pathlib import Path
 
 from llm.client import LLMClient
-from tools.schemas import TOOLS, REPAIR_TOOLS, DIAGNOSIS_TOOL
+from tools.schemas import TOOLS, REPAIR_TOOLS, DIAGNOSIS_TOOL, ROOT_CAUSE_LABELS, NODES
 from tools import k8s, node_etcd as netcd
 from tools.repairs import (
     restart_member, member_remove_readd, kube_etcd_switch_rebuild,
     snapshot_restore_full, reset_cluster,
 )
 from tools.truncate import truncate
+
+
+def _check_node(value: str, default: str = "vm1") -> tuple[str | None, str]:
+    node = value or default
+    if node not in NODES:
+        return None, f"invalid node {value!r}; expected one of {', '.join(NODES)}"
+    return node, ""
 
 
 def _exec_diagnostic(name: str, args: dict) -> str:
@@ -27,29 +34,37 @@ def _exec_diagnostic(name: str, args: dict) -> str:
         return k8s.kubectl_events(args.get("namespace", "default"))
     if name == "etcdctl_endpoint_health":
         return netcd.etcdctl_endpoint_health()
-    if name == "etcdctl_endpoint_status":
-        return netcd.etcdctl_endpoint_status(args.get("node", "vm1"))
-    if name == "etcdctl_member_list":
-        return netcd.etcdctl_member_list(args.get("node", "vm1"))
-    if name == "etcdctl_alarm_list":
-        return netcd.etcdctl_alarm_list(args.get("node", "vm1"))
-    if name == "journalctl_tail":
-        return netcd.journalctl_tail(args.get("node", ""), args.get("unit", ""), args.get("lines", 100))
-    if name == "crictl_ps":
-        return netcd.crictl_ps(args.get("node", ""))
-    if name == "crictl_logs":
-        return netcd.crictl_logs(args.get("node", ""), args.get("container_id", ""), args.get("tail", 100))
-    if name == "systemctl_status":
-        return netcd.systemctl_status(args.get("node", ""), args.get("unit", ""))
-    if name == "df_path":
-        return netcd.df_path(args.get("node", ""), args.get("path", ""))
-    if name == "ls_path":
-        return netcd.ls_path(args.get("node", ""), args.get("path", ""))
+    if name in {"etcdctl_endpoint_status", "etcdctl_member_list", "etcdctl_alarm_list"}:
+        node, err = _check_node(args.get("node", ""), "vm1")
+        if err:
+            return err
+        if name == "etcdctl_endpoint_status":
+            return netcd.etcdctl_endpoint_status(node)
+        if name == "etcdctl_member_list":
+            return netcd.etcdctl_member_list(node)
+        return netcd.etcdctl_alarm_list(node)
+    if name in {"journalctl_tail", "crictl_ps", "crictl_logs", "systemctl_status", "df_path", "ls_path"}:
+        node, err = _check_node(args.get("node", ""))
+        if err:
+            return err
+        if name == "journalctl_tail":
+            return netcd.journalctl_tail(node, args.get("unit", ""), args.get("lines", 100))
+        if name == "crictl_ps":
+            return netcd.crictl_ps(node)
+        if name == "crictl_logs":
+            return netcd.crictl_logs(node, args.get("container_id", ""), args.get("tail", 100))
+        if name == "systemctl_status":
+            return netcd.systemctl_status(node, args.get("unit", ""))
+        if name == "df_path":
+            return netcd.df_path(node, args.get("path", ""))
+        return netcd.ls_path(node, args.get("path", ""))
     return f"unknown tool: {name}"
 
 
 def _exec_repair(name: str, args: dict) -> str:
-    node = args.get("node", "")
+    node, err = _check_node(args.get("node", ""))
+    if err:
+        return err
     if name == "restart_member":
         return restart_member(node)
     if name == "member_remove_readd":
@@ -63,15 +78,48 @@ def _exec_repair(name: str, args: dict) -> str:
     return f"unknown repair: {name}"
 
 
-SYSTEM_PROMPT = """You are an etcd fault diagnosis and repair agent for a Kubernetes cluster.
-Investigate with read-only tools. You MUST call submit_diagnosis exactly once before finishing or repairing.
-Check pod status and etcd member list. A stopped member appears as missing or NotReady. Use root cause label no_fault if the cluster is healthy. Only after diagnosis may you call repair tools.
-Choose repairs from acceptable actions; forbidden repairs are blocked. Keep steps efficient."""
+def normalize_diagnosis(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    lowered = text.lower()
+    if lowered in ROOT_CAUSE_LABELS:
+        return lowered
+    for label in ROOT_CAUSE_LABELS:
+        if label in lowered or label.replace("_", " ") in lowered:
+            return label
+    if "no fault" in lowered or "cluster healthy" in lowered or "healthy" in lowered:
+        return "no_fault"
+    return text
 
 
-def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_cmd: str, trace_dir: str = "traces") -> dict:
-    from llm.client import LLMClient
+SYSTEM_PROMPT = """You are an etcd fault diagnosis and repair agent for a 3-control-plane Kubernetes cluster (vm1, vm2, vm3).
 
+Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
+root_cause MUST be exactly one of: """ + ", ".join(ROOT_CAUSE_LABELS) + """. Do not write a sentence, a node name, or an explanation in root_cause.
+
+If the diagnosis is accepted, submit_diagnosis returns an approval_token. Every repair call MUST include that exact approval_token.
+If the diagnosis is rejected, do not repair; investigate again and submit a corrected diagnosis.
+Use etcdctl_member_list and etcdctl_endpoint_health from vm1, plus pod status and logs, to identify the affected node.
+A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
+A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. Two stopped members are etcd_quorum_loss.
+A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
+Choose only repairs allowed by the scenario. Keep steps efficient."""
+
+
+def run_scenario(
+    scenario: dict,
+    backend,
+    run_id: str,
+    inject_cmd: str,
+    verify_cmd: str,
+    trace_dir: str = "traces",
+    verify_timeout: int = 300,
+    baseline_ok: bool = True,
+    reset_ok: bool = True,
+    inject_ok: bool = True,
+    setup_output: str = "",
+) -> dict:
     Path(trace_dir).mkdir(parents=True, exist_ok=True)
     trace_path = Path(trace_dir) / f"{run_id}.jsonl"
     trace = []
@@ -82,9 +130,7 @@ def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_c
         with trace_path.open("a") as f:
             f.write(json.dumps(event) + "\n")
 
-    # inject
-    log({"type": "inject", "cmd": inject_cmd})
-    subprocess.run(inject_cmd, shell=True, check=False)
+    log({"type": "setup", "reset_ok": reset_ok, "baseline_ok": baseline_ok, "inject_ok": inject_ok, "output": truncate(setup_output, 2000)})
 
     client = LLMClient(backend)
     messages = [
@@ -92,7 +138,13 @@ def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_c
         {"role": "user", "content": "Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."},
     ]
     diagnosis = None
+    diagnosis_raw = None
     diagnosis_submitted = False
+    approval_token = None
+    repair = None
+    repair_args = None
+    policy_violations: list[str] = []
+    forbidden_reason = None
     steps = 0
     tokens_used = 0
     max_steps = scenario.get("max_steps", 40)
@@ -116,7 +168,7 @@ def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_c
         tool_calls = msg.get("tool_calls") or []
         if not tool_calls and not diagnosis_submitted:
             if steps < max_steps:
-                messages.append({"role": "user", "content": "You have not submitted a diagnosis. Investigate more if needed, then call submit_diagnosis with the root cause."})
+                messages.append({"role": "user", "content": "You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label."})
                 continue
             break
         if not tool_calls:
@@ -130,19 +182,38 @@ def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_c
                 args = {}
             result = ""
             if name == DIAGNOSIS_TOOL:
-                diagnosis = args.get("root_cause")
+                diagnosis_raw = args.get("root_cause")
+                diagnosis = normalize_diagnosis(diagnosis_raw)
                 diagnosis_submitted = True
-                result = "diagnosis submitted"
+                if diagnosis == scenario["root_cause"]:
+                    approval_token = f"approved:{run_id}"
+                    result = f"diagnosis accepted; approval_token={approval_token}"
+                else:
+                    approval_token = None
+                    result = f"diagnosis rejected: expected one of {ROOT_CAUSE_LABELS}"
+                log({"type": "approval", "granted": approval_token is not None, "diagnosis": diagnosis, "raw": diagnosis_raw})
             elif name in REPAIR_TOOLS:
+                reason = None
                 if not diagnosis_submitted:
-                    result = "BLOCKED: diagnosis required first"
+                    reason = "BLOCKED: diagnosis required first"
+                elif approval_token is None:
+                    reason = "BLOCKED: diagnosis rejected; no approval token"
+                elif args.get("approval_token") != approval_token:
+                    reason = "BLOCKED: missing or invalid approval_token"
                 elif name in forbidden:
-                    result = "BLOCKED: forbidden repair for this scenario"
+                    reason = "BLOCKED: forbidden repair for this scenario"
                 elif name not in acceptable:
-                    result = "BLOCKED: repair not acceptable for this scenario"
+                    reason = "BLOCKED: repair not acceptable for this scenario"
+                if reason:
+                    result = reason
+                    policy_violations.append(f"{name}: {reason}")
+                    if "forbidden" in reason:
+                        forbidden_reason = reason
                 else:
                     try:
                         result = _exec_repair(name, args)
+                        repair = name
+                        repair_args = {k: v for k, v in args.items() if k != "approval_token"}
                     except Exception as e:
                         result = f"ERROR: {e}"
             else:
@@ -155,24 +226,33 @@ def run_scenario(scenario: dict, backend, run_id: str, inject_cmd: str, verify_c
             messages.append(tool_msg)
             log({"type": "tool", "name": name, "args": args, "result": result})
 
-    # verify
     try:
-        v = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=300)
+        v = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=verify_timeout)
         verify_ok = (v.returncode == 0)
         verify_output = (v.stdout + v.stderr).strip()
     except Exception as e:
         verify_ok = False
         verify_output = str(e)
-    log({"type": "verify", "ok": verify_ok, "output": verify_output})
+    log({"type": "verify", "ok": verify_ok, "output": truncate(verify_output, 2000)})
 
     record = {
         "run_id": run_id,
         "scenario": scenario["id"],
         "backend": backend.name,
+        "reset_ok": reset_ok,
+        "baseline_ok": baseline_ok,
+        "inject_ok": inject_ok,
         "diagnosis": diagnosis,
+        "diagnosis_raw": diagnosis_raw,
         "truth": scenario["root_cause"],
         "diagnosis_correct": diagnosis == scenario["root_cause"],
+        "approval_granted": approval_token is not None,
+        "repair": repair,
+        "repair_args": repair_args,
+        "policy_violations": policy_violations,
+        "forbidden_reason": forbidden_reason,
         "verify_ok": verify_ok,
+        "verify_output": truncate(verify_output, 1000),
         "steps": steps,
         "tokens_used": tokens_used,
         "trace": str(trace_path),

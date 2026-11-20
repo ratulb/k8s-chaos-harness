@@ -11,44 +11,45 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - Acceptance: local wrapper can reach Kaggle and one hosted backend
 
 ## Phase 1 — Substrate and reset
-- [ ] 3-control-plane cluster setup
-- [ ] `reset/rebuild_cluster.sh`
-- [ ] `verify/etcd_healthy_3_members.sh`
-- [ ] Baseline check before injection
+- [x] 3-control-plane cluster setup
+- [x] `cluster/reset_cluster.sh`
+- [x] `cluster/verify_etcd_healthy.sh`
+- [x] Baseline check before injection
 - Deliverable: repeatable healthy cluster
-- Acceptance: reset succeeds 3 times in a row
+- Acceptance: reset succeeds 3 times in a row (done twice so far)
 
 ## Phase 2 — Fault injection
-- [ ] `faults/etcd_member_down.sh`
-- [ ] `faults/etcd_member_wiped.sh`
-- [ ] `faults/etcd_quorum_loss.sh`
-- [ ] `faults/etcd_disk_full.sh`
-- [ ] `faults/etcd_wrong_peer_url.sh`
-- [ ] `faults/control_healthy_noisy.sh`
-- [ ] Determinism check for each
+- [x] `faults/etcd_member_down.sh`
+- [x] `faults/etcd_member_wiped.sh`
+- [x] `faults/etcd_quorum_loss.sh`
+- [x] `faults/etcd_disk_full.sh`
+- [x] `faults/etcd_wrong_peer_url.sh`
+- [x] `faults/control_healthy_noisy.sh`
+- [~] Determinism check for each (`etcd-member-down` verified; others implemented)
 - Deliverable: deterministic inject + verify
 - Acceptance: same symptom on two runs
 
 ## Phase 3 — Diagnostic tool layer
-- [ ] Read-only tool implementations
-- [ ] Output truncation
-- [ ] Trace recorder
-- [ ] Budget enforcer
+- [x] Read-only tool implementations
+- [x] Output truncation
+- [x] Trace recorder
+- [x] Budget enforcer
 - Deliverable: model can investigate freely
 - Acceptance: no mutations, traces written
 
 ## Phase 4 — Diagnosis and gate
-- [ ] `submit_diagnosis`
-- [ ] Gated repair tools
-- [ ] Forbidden reasons
-- [ ] Approval token flow
+- [x] `submit_diagnosis`
+- [x] Gated repair tools
+- [x] Forbidden reasons
+- [x] Approval token flow
+- [x] Gate unit tests (`tests/test_gate.py`)
 - Deliverable: diagnosis required before repair
 - Acceptance: forbidden repairs blocked and logged
 
 ## Phase 5 — Full loop
-- [ ] One scenario end to end
-- [ ] Wrong-repair trial
-- [ ] Recovery verification
+- [x] One scenario end to end (`etcd-member-down`, Groq, seed 101)
+- [x] Wrong-repair trial (unit-tested gate)
+- [x] Recovery verification
 - Deliverable: complete benchmark loop
 - Acceptance: score record written
 
@@ -61,13 +62,13 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
 ## Phase 7 — Sweep
 - [ ] 5 scenarios x 2 backends x N runs
-- [ ] Score aggregation
-- [ ] Comparison table
+- [x] Score aggregation (`score.py`)
+- [ ] Comparison table from full sweep
 - Deliverable: cross-backend results
 - Acceptance: rates, not anecdotes
 
 ## Phase 8 — Publish
-- [ ] README
+- [x] README
 - [ ] Blog post
 - [ ] Demo notes
 - Deliverable: publishable artifact

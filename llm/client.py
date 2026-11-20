@@ -69,22 +69,23 @@ class LLMClient:
                 "Authorization": f"Bearer {self.backend.api_key}",
             },
         )
+        import random
         import time
-        last=None
-        for attempt in range(5):
+        last = None
+        for attempt in range(9):
             try:
                 with urllib.request.urlopen(req, timeout=kwargs.get("timeout", 120)) as resp:
                     return json.loads(resp.read().decode("utf-8"))
             except urllib.error.HTTPError as e:
-                last=e
-                if e.code in (429, 500, 502, 503, 504) and attempt < 4:
-                    time.sleep(2 ** attempt)
+                last = e
+                if e.code in (429, 500, 502, 503, 504) and attempt < 8:
+                    time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
                 raise
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                last=e
-                if attempt < 4:
-                    time.sleep(2 ** attempt)
+                last = e
+                if attempt < 8:
+                    time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
                 raise
         if last is not None:

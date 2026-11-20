@@ -10,16 +10,29 @@ run_node() {
 run_node <<'REMOTE'
 set -e
 MAN=/etc/kubernetes/manifests/etcd.yaml
-if [ ! -f "$MAN" ] && [ -f "${MAN}.disabled" ]; then sudo mv "${MAN}.disabled" "$MAN"; fi
-BACKUP=/tmp/etcd.yaml.orig
-if [ ! -f "$BACKUP" ]; then sudo cp "$MAN" "$BACKUP"; fi
-sudo mv "$MAN" "${MAN}.disabled"
+if [ -f /tmp/etcd.yaml.clean ]; then
+  sudo cp /tmp/etcd.yaml.clean "$MAN"
+elif [ ! -f /tmp/etcd.yaml.orig ]; then
+  sudo cp "$MAN" /tmp/etcd.yaml.orig
+fi
 sudo rm -rf /var/lib/etcd/*
+sudo systemctl restart kubelet
 REMOTE
 
-for i in $(seq 1 30); do
-  ready=$(kubectl get pod etcd-${NODE} -n kube-system -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
-  if [ "$ready" != "true" ]; then break; fi
+kubectl delete pod "etcd-${NODE}" -n kube-system --ignore-not-found=true >/dev/null 2>&1 || true
+
+for i in $(seq 1 60); do
+  if ! kubectl exec -n kube-system etcd-vm1 -- etcdctl \
+      --endpoints=https://127.0.0.1:2379 \
+      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+      --cert=/etc/kubernetes/pki/etcd/server.crt \
+      --key=/etc/kubernetes/pki/etcd/server.key \
+      endpoint health --cluster >/dev/null 2>&1; then
+    echo "injected etcd-member-wiped on $NODE"
+    exit 0
+  fi
   sleep 2
 done
-echo "injected etcd-member-wiped on $NODE"
+
+echo "failed to inject etcd-member-wiped on $NODE: cluster still healthy" >&2
+exit 1
