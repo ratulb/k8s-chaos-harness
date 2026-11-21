@@ -191,23 +191,30 @@ def _parse_etcd_members(text: str) -> list[dict[str, Any]]:
     stripped = text.strip()
     if not stripped:
         return []
-    if stripped.startswith("["):
+    if stripped.startswith("[") or stripped.startswith("{"):
         try:
-            raw = json.loads(stripped)
+            payload = json.loads(stripped)
         except json.JSONDecodeError:
-            raw = []
+            payload = []
+        raw = payload.get("members", []) if isinstance(payload, dict) else payload
         result: list[dict[str, Any]] = []
         for item in raw if isinstance(raw, list) else []:
+            if not isinstance(item, dict):
+                continue
             name = str(item.get("name", "")).strip()
             if not name:
                 continue
-            peers = item.get("peerURLs", []) or []
+            peers = item.get("peerURLs") or item.get("peerUrls") or item.get("peer_url") or []
+            if isinstance(peers, str):
+                peers = [peers]
+            member_id = str(item.get("ID") or item.get("id") or item.get("member") or "").strip()
             result.append({
-                "id": str(item.get("member", "")).strip() or name,
+                "id": member_id or name,
                 "name": name,
                 "peer_url": str(peers[0]).strip() if peers else "",
             })
         return result
+
 
     result = []
     for line in stripped.splitlines():

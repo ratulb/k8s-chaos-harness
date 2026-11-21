@@ -43,6 +43,21 @@ class TestTopology(unittest.TestCase):
             self.assertEqual(topology.quorum_for(members), quorum)
             self.assertEqual(topology.quorum_loss_target_count(members), targets)
 
+    def test_parse_etcdctl_member_json(self) -> None:
+        payload = json.dumps({
+            "header": {"cluster_id": 1},
+            "members": [{
+                "ID": "9347646635025838355",
+                "name": "node-1",
+                "peerURLs": ["https://10.0.0.1:2380"],
+                "clientURLs": ["https://10.0.0.1:2379"],
+            }],
+        })
+        self.assertEqual(
+            topology._parse_etcd_members(payload),
+            [{"id": "9347646635025838355", "name": "node-1", "peer_url": "https://10.0.0.1:2380"}],
+        )
+
     def test_fixture_topologies(self) -> None:
         expected = {
             "n1": (1, 1, 1),
