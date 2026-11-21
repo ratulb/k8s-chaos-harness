@@ -68,6 +68,10 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - [~] 6 scenarios x 1 backend x multiple runs (Kaggle); Groq smoke only
 - [x] Score aggregation (`score.py`, now with `--db`)
 - [x] Comparison table from Kaggle sweeps (`python3 score.py --db results.sqlite3`)
+- [ ] Candidate extra scenario: rebuild with prior etcd state; consider
+  https://github.com/ratulb/kubemcp as the fallback provisioning path; it
+  copies/uses https://github.com/ratulb/k8s-easy-install, worked on GCP, and
+  may be broken on Azure
 - Deliverable: cross-backend results
 - Acceptance: rates, not anecdotes
 

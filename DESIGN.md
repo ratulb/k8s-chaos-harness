@@ -14,8 +14,8 @@ log and score inputs. JSONL files remain as derived, human-readable exports.
 
 - First: etcd only, 5 fault variants + 1 control scenario.
 - Later: load balancer and node-join fault classes.
-- Out of scope for now: MCP wrapping, kubemcp integration, full Kubernetes API
-  behavior faults.
+- Out of scope for benchmark transport: MCP wrapping and kubemcp integration.
+- Out of scope for now: full Kubernetes API behavior faults.
 - Fault injection is always scripted by the harness. The model never sees a
   fault-injection tool.
 - The model gets primitives, not a `diagnose_etcd()` shortcut. The reasoning is
@@ -151,6 +151,10 @@ Two reset paths are used:
 2. Full rebuild: `cluster/reset_cluster.sh`
    - Nuke/rebuild via `K8S_EASY_INSTALL`.
    - Re-snapshots clean state and verifies.
+   - Candidate extra scenario: rebuild with prior etcd state. Revisit
+     https://github.com/ratulb/kubemcp for this fallback path; it copies/uses
+     https://github.com/ratulb/k8s-easy-install, worked on GCP, and may be
+     broken on Azure. Keep it outside the benchmark transport unless needed.
 
 Between every run the harness:
 
