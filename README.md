@@ -8,6 +8,30 @@ workflow, and troubleshooting. `DESIGN.md` is the canonical decision record,
 `PHASES.md` is current status, and the remaining documents are historical or
 focused supplements.
 
+> **Authority.** If anything conflicts, current code plus `DESIGN.md` win;
+> `PHASES.md` is status. Historical docs are context, not truth.
+
+Contents:
+
+- [1. Why this exists](#1-why-this-exists)
+- [2. Scope](#2-scope)
+- [3. System at a glance](#3-system-at-a-glance)
+- [4. Core concepts](#4-core-concepts)
+- [5. Cluster and topology](#5-cluster-and-topology)
+- [6. Scenarios](#6-scenarios)
+- [7. Backends and configuration](#7-backends-and-configuration)
+- [8. Quickstart](#8-quickstart)
+- [9. Command map](#9-command-map)
+- [10. One run, end to end](#10-one-run-end-to-end)
+- [11. Agent tools and gates](#11-agent-tools-and-gates)
+- [12. State and artifacts](#12-state-and-artifacts)
+- [13. State lifecycle](#13-state-lifecycle)
+- [14. Observability and reporting](#14-observability-and-reporting)
+- [15. Operations and safety](#15-operations-and-safety) — **destructive commands**
+- [16. Testing and troubleshooting](#16-testing-and-troubleshooting) — live tests cost tokens
+- [17. Current status and limitations](#17-current-status-and-limitations)
+- [18. Documentation map](#18-documentation-map)
+
 ## 1. Why this exists
 
 A toy agent demo can look impressive while proving very little. This harness
@@ -23,12 +47,28 @@ That question drives the design:
 - **Harness-owned faults.** The injector is never visible to the model.
 - **Separate diagnosis and repair.** A correct guess is not a safe repair.
 - **Comparable backends.** The same scenarios run against `ollama`, `groq`,
-  `openrouter`, and `cloudflare`.
+  `openrouter`, and `cloudflare`; there is no fallback chain, and each is a
+  comparable baseline rather than a reference/default path.
 - **Auditability.** Messages, tools, approvals, repairs, and verification are
   stored in SQLite and can be replayed.
 - **Safety.** The model sees named tools, not a shell, and repairs are gated.
 
 This is a benchmark of operational reasoning, not a generic Kubernetes autopilot.
+
+### Requirements at a glance
+
+- Linux, Python 3, and `kubectl`/`etcdctl` access to a control plane
+- SSH access to control-plane nodes for fault injection and reset
+- An existing cluster; three etcd members are recommended, not required
+- At least one configured backend endpoint or key (`ollama` needs no hosted key)
+
+### What good looks like
+
+The headline metric is `loop_success`: the fraction of runs with correct
+diagnosis, passing verification, and repair presence matching fault status.
+Higher is better, but it does not require an acceptable repair or zero forbidden
+actions (§14). The reduced 13-run sweep scored `0.462`; a full cross-backend
+sweep is pending.
 
 ## 2. Scope
 
@@ -38,7 +78,8 @@ dynamically, stores history in SQLite, and gates repairs on diagnosis and
 approval. It is not a generic Kubernetes autopilot, an MCP-first system, a
 raw-shell interface, a fixed three-node tool, or a JSONL-first store. It works
 with an existing cluster; `k8s-easy-install` and Kaggle are optional
-infrastructure, and `kaggle` is not a backend name.
+infrastructure. `kaggle` is not a selectable backend; legacy `kaggle` and
+`kaggle-ollama` values in the DB normalize to `ollama` (§12).
 
 ## 3. System at a glance
 
@@ -51,10 +92,15 @@ operator / CI
        -> cluster/*.sh, faults/*.sh, verify/*.sh -> live Kubernetes/etcd
        -> LLM backend -> tool registry + diagnosis/repair gates
        -> SQLite events/state/score
-            -> live UI, attach, score.py, replay.py, exports
+             -> live UI, attach, score.py, replay.py, exports
 ```
 
+Legend: the operator, `./chaos`, and `run_benchmark.py` are orchestration;
+cluster scripts, the LLM backend, tool registry/gates, SQLite, and reports are
+external systems or outputs.
+
 SQLite is both the coordination layer and the history. The runner writes
+
 intents and results; the UI, attach, scoring, and replay read them. The model
 never sees fault scripts or scoring truth.
 
@@ -72,6 +118,7 @@ never sees fault scripts or scoring truth.
 | Resume | Continuation of an unfinished agent session; refuses topology changes |
 | Approval token | Run-specific token returned after a correct diagnosis and required by repairs |
 | Verification | Final `cluster/verify_etcd_healthy.sh` result |
+| End reason | Terminal cause: `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `legacy_exploratory` marks imported legacy runs without approval evidence and is excluded from headline score |
 | Headline score | Default aggregate over clean, finished, non-interactive, non-resumed runs |
 
 ## 5. Cluster and topology
@@ -92,12 +139,12 @@ Inspect topology offline:
 CHAOS_TOPOLOGY_JSON=tests/fixtures/topologies/n5.json ./chaos target show --json
 ```
 
-Three etcd members are the loud recommendation. Odd counts above three are
+Three etcd members are recommended, not required. Odd counts above three are
 acceptable; even counts and one- or two-member clusters warn and use best effort.
 
 | Members | Quorum | Stopped for quorum loss |
 | ---: | ---: | ---: |
-| 1 | 1 | 1, benchmark-ineligible total outage |
+| 1 | 1 | 1 (benchmark-ineligible: total outage) |
 | 2 | 2 | 1 |
 | 3 | 2 | 2 |
 | 4 | 3 | 2 |
@@ -250,7 +297,7 @@ Implemented `./chaos` commands:
 | Option | Meaning |
 | --- | --- |
 | `--scenario`, `--backend` | Required scenario ID and backend |
-| `--mode`, `--approve` | Benchmark/repair; policy/prompt approval |
+| `--mode`, `--approve` | `benchmark` (default) or `repair` (best-effort incident context; see caveat below) |
 | `--runs`, `--seed` | Batch size and recorded seed |
 | `--ui`, `--detach`, `--logs-dir` | Rendering and detached launch/logging |
 | `--resume-of`, `--force-resume`, `--no-jsonl` | Resume and export controls |
@@ -259,6 +306,9 @@ The `repair` mode changes capability and reporting context, but the current
 runner still resets, verifies baseline, and injects. It is best-effort, not a
 no-injection incident workflow. The design's
 `recovered|partial|unverified|cannot_proceed` statuses are not implemented.
+
+`./chaos` is the intended entry point; the `python3 ...` commands below are the
+underlying tools it wraps.
 
 Lower-level commands:
 
@@ -289,7 +339,7 @@ Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 6. **Create run** as `pending`, take lease, move to `running`.
 7. **Reset** with `cluster/restore_clean_state.sh`, timeout 900 seconds.
 8. **Baseline verify** with `cluster/verify_etcd_healthy.sh`; failure means
-   `aborted` with `reset_failed` or `baseline_failed`.
+   `aborted` with `reset_failed` or `baseline_failed` (see §16).
 9. **Inject** the fault with a 120-second timeout; failure is recorded but does
    not stop the agent.
 10. **Agent loop**: model calls read-only tools and receives truncated output.
@@ -307,22 +357,37 @@ pending -> running -> finished
              |-> skipped_unsupported
 ```
 
+> **Reset failure is an infrastructure failure, not an agent failure.** These
+> runs abort before injection, so they say nothing about diagnosis or repair.
+
 `interrupted` is recognized for resume candidates but is not written by the
 current runner; crashed runs usually remain `running` until abort or discard.
 
 ## 11. Agent tools and gates
 
 The model sees the system prompt, frozen topology, tool schemas, named
-diagnostic and repair tools, conversation state, and about 4000 characters per
-tool result. It does not see fault scripts, scenario truth, raw shell, SQLite,
-or the reset ladder.
+diagnostic and repair tools, and conversation state. Tool output is truncated
+at roughly 4,000 characters. It does not see fault scripts, scenario truth, raw
+shell, SQLite, or the reset ladder.
 
 Diagnostic tools:
 
-`kubectl_get`, `kubectl_describe`, `kubectl_logs`, `kubectl_events`,
-`etcdctl_endpoint_health`, `etcdctl_endpoint_status`, `etcdctl_member_list`,
-`etcdctl_alarm_list`, `journalctl_tail`, `crictl_ps`, `crictl_logs`,
-`systemctl_status`, `df_path`, `ls_path`.
+| Tool | Shows |
+| --- | --- |
+| `kubectl_get` | Kubernetes resources |
+| `kubectl_describe` | Details for one Kubernetes resource |
+| `kubectl_logs` | Pod logs |
+| `kubectl_events` | Namespace events |
+| `etcdctl_endpoint_health` | Endpoint health across the cluster |
+| `etcdctl_endpoint_status` | Endpoint status from a node |
+| `etcdctl_member_list` | etcd members from a node |
+| `etcdctl_alarm_list` | etcd alarms from a node |
+| `journalctl_tail` | Systemd unit journal on a node |
+| `crictl_ps` | Containers on a node |
+| `crictl_logs` | Container logs on a node |
+| `systemctl_status` | Systemd unit status on a node |
+| `df_path` | Disk usage for a path on a node |
+| `ls_path` | Directory listing for a path on a node |
 
 `submit_diagnosis` accepts exactly:
 
@@ -354,16 +419,14 @@ score unless requested.
 SQLite is the authoritative active epoch. Event tables are truth;
 `runs.state_json` is a rebuildable cache.
 
-| Artifact | Role |
-| --- | --- |
-| `results.sqlite3` | Authoritative events, control rows, state, scores |
-| `state_snapshots`, `ui_stream` | Durable state snapshots and redacted UI chunks |
-| `runs.jsonl` | Derived export; never edit as source of truth |
-| `traces/*.jsonl` | Derived run traces |
-| `traces/*.snapshots.jsonl`, `traces/*.ui.jsonl` | Derived v3 artifacts |
-| `logs/<run_id>.log` | Runner command log |
-| `logs/<launch_id>.log` | Detached launcher output |
-| `replay.html` | Static redacted HTML from SQLite |
+| Artifact | Authority | Role |
+| --- | --- | --- |
+| `results.sqlite3` | authoritative | Events, control rows, state, scores |
+| `state_snapshots`, `ui_stream` | authoritative DB tables | Durable state snapshots and redacted UI chunks |
+| `runs.jsonl` | derived | Legacy export; never edit as source of truth |
+| `traces/*.jsonl` | derived | Run traces, including `<run_id>.snapshots.jsonl` and `<run_id>.ui.jsonl` v3 artifacts |
+| `logs/<run_id>.log`, `logs/<launch_id>.log` | local logs | Runner command log and detached launcher output |
+| `replay.html` | derived | Static redacted HTML from SQLite |
 
 Tables group into configuration (`scenarios`, `batches`), run lifecycle
 (`runs`), conversation (`messages`), tooling (`tool_calls`), LLM calls
@@ -391,7 +454,7 @@ does not import `.snapshots.jsonl` or `.ui.jsonl`.
 | normal `./chaos run` | yes | Loudly discards stale state, then exits |
 | `./chaos run --resume-of <id>` | yes | Refuses; never discards |
 | `./chaos status`, `attach` | yes | Read-only warning |
-| `./chaos state discard --yes` | n/a | Deletes active epoch; no archive |
+| `./chaos state discard --yes` | n/a | Deletes active epoch, DB/WAL/SHM, and all `traces/*.jsonl`; truncates `runs.jsonl`; `logs/` survives; no archive |
 | `./chaos cluster nuke --yes` | n/a | Rebuilds, rediscovers, then discards on success |
 
 `--force-resume` bypasses config-hash mismatch only, not topology mismatch.
@@ -431,20 +494,50 @@ excludes resumed and interactive runs by default; detail sections include all
 runs. Text is escaped and redacted before rendering.
 
 Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `loop_success`,
-`policy_violations`, `forbidden`, `avg_steps`, `avg_tokens`.
+`policy_violations` (fraction of runs with any blocked call), `forbidden`,
+`avg_steps`, `avg_tokens`. Token totals can be zero or undercounted for streamed
+responses (see §17).
 
 SQLite headline records require `status='finished'`, `resume_count=0`,
 `interactive=0`, no `legacy_exploratory` end reason, and present `truth`.
 `--include-resumed` and `--include-interactive` opt into excluded groups.
 `loop_success` means correct diagnosis, verify pass, and repair presence
-matching fault status; it does not require an acceptable repair or absence of
-forbidden actions.
+matching fault status. **It does not require an acceptable repair or absence of
+forbidden actions.**
 
 ```bash
 python3 score.py --db results.sqlite3 --format md
 python3 score.py --db results.sqlite3 --format json
 python3 score.py --db results.sqlite3 --format md --include-interactive
 ```
+
+### Results (reduced sweep)
+
+The full cross-backend sweep is pending. The 2026-11-21 reduced sweep produced:
+
+| Scope | Runs | Diagnosis | Verify | `loop_success` | Runs with policy violations |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Overall | 13 | 53.8% | 92.3% | 46.2% | 7.7% |
+
+| Backend | Scenario | Diagnosis | Verify | `loop_success` | Runs with policy violations |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `cloudflare` | `control-healthy-noisy` | 100% | 100% | 100% | 0% |
+| `cloudflare` | `etcd-member-down` | 0% | 100% | 0% | 0% |
+| `cloudflare` | `etcd-wrong-peer-url` | 0% | 100% | 0% | 0% |
+| `groq` | `control-healthy-noisy` | 100% | 100% | 100% | 0% |
+| `groq` | `etcd-member-down` | 0% | 100% | 0% | 0% |
+| `groq` | `etcd-wrong-peer-url` | 0% | 100% | 0% | 0% |
+| `ollama` | `control-healthy-noisy` | 100% | 100% | 100% | 0% |
+| `ollama` | `etcd-member-down` | 100% | 100% | 100% | 0% |
+| `ollama` | `etcd-member-wiped` | 100% | 0% | 0% | 0% |
+| `ollama` | `etcd-wrong-peer-url` | 100% | 100% | 100% | 100% |
+| `openrouter` | `control-healthy-noisy` | 100% | 100% | 100% | 0% |
+| `openrouter` | `etcd-member-down` | 0% | 100% | 0% | 0% |
+| `openrouter` | `etcd-wrong-peer-url` | 0% | 100% | 0% | 0% |
+
+Coverage is uneven: `ollama` ran four scenarios and the other backends ran
+three. Treat this as smoke evidence, not a backend ranking. See `PHASES.md` for
+sweep history.
 
 ## 15. Operations and safety
 
@@ -493,6 +586,8 @@ OLLAMA_MODEL=qwen3:8b python3 -m unittest discover -s tests -v
 CHAOS_LIVE_BACKEND_TESTS=1 python3 -m unittest tests.test_backends -v
 ```
 
+`CHAOS_LIVE_BACKEND_TESTS=1` requires a reachable backend and will spend tokens.
+
 `doctor()` checks schema version, finished runs missing final records,
 in-flight tool calls, and `runs.seq` versus maximum `trace_events.seq`. It does
 not check cluster health, artifact checksums, missing trace files, or UI stream
@@ -516,7 +611,8 @@ unreadable DB.
 
 ## 17. Current status and limitations
 
-As of 2026-11-21:
+Live status as of 2026-11-21, verified at commit `704b43e`; later commits may
+change behavior.
 
 - live topology discovery and `chaos cluster nuke` acceptance passed
 - the three lab control planes returned Ready after rebuild
@@ -535,9 +631,13 @@ As of 2026-11-21:
 - `--no-jsonl` disables export, but topology-mismatch discard still truncates the
   default `runs.jsonl`
 
-See `PHASES.md` for the full checklist and validation history.
+These gaps are kept inline deliberately so users see them before filing issues;
+there is no separate roadmap. See `PHASES.md` for the full checklist and
+validation history.
 
 ## 18. Documentation map
+
+Start here: README → §8 Quickstart → §10 One run, end to end.
 
 | Document | Role |
 | --- | --- |
