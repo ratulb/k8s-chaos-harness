@@ -71,10 +71,10 @@ class TestSQLiteStore(unittest.TestCase):
 
         report = self.store.doctor()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertEqual(report["counts"]["scenarios"], 2)
 
-    def test_v2_database_migrates_to_v3(self) -> None:
+    def test_v2_database_migrates_to_current(self) -> None:
         self.store.close()
         self.db_path.unlink()
         conn = sqlite3.connect(self.db_path)
@@ -128,7 +128,7 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertIn("ui_stream", table_names)
         report = self.store.doctor()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 3)
+        self.assertEqual(report["schema_version"], 4)
         self.assertIn("state_snapshots", report["counts"])
         self.assertIn("ui_stream", report["counts"])
 

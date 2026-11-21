@@ -8,6 +8,7 @@
   "inject": "faults/etcd_member_down.sh $TARGET_NODE",
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
+  "fault_present_timeout_seconds": 60,
   "max_steps": 40,
   "max_tokens": 60000,
   "risk": "disruptive",

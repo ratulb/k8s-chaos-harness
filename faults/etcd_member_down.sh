@@ -26,5 +26,18 @@ PY
 sudo systemctl restart kubelet
 REMOTE
 
-sleep 5
+delete_etcd_pod "$NODE"
+ready="true"
+for _ in $(seq 1 60); do
+  ready=$(kubectl --request-timeout=5s get pod "etcd-$NODE" -n kube-system \
+    -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+  if [[ "$ready" != "true" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$ready" == "true" ]]; then
+  echo "etcd member $NODE did not go down" >&2
+  exit 1
+fi
 echo "injected etcd-member-down on $NODE"

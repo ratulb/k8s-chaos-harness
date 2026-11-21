@@ -15,7 +15,8 @@ from llm.env import load_env
 load_env()
 from llm.backends import BACKEND_NAMES, build_backend
 from llm.client import LLMClient
-from tools import topology as topology_tools
+from tools import fault_checks, topology as topology_tools
+from tools import safety as safety_tools
 from tools.scenario_schema import load_scenario, validate_scenario
 from harness.agent import run_scenario
 from harness.reporter import UiReporter
@@ -78,6 +79,7 @@ def _terminal_record(
     baseline_ok: bool,
     setup_output: str,
     reason: str,
+    fault_present: bool = False,
 ) -> dict:
     from tools.truncate import truncate
     return {
@@ -87,6 +89,7 @@ def _terminal_record(
         "reset_ok": reset_ok,
         "baseline_ok": baseline_ok,
         "inject_ok": False,
+        "fault_present": fault_present,
         "diagnosis": None,
         "diagnosis_raw": None,
         "truth": scenario["root_cause"],
@@ -164,6 +167,38 @@ def _run_fresh(
     _artifact(store, run_id, "injection_output_full", inject_out)
     store.add_event(run_id, "inject", {"ok": inject_ok, "output": inject_out[:2000]})
     store.update_run(run_id, inject_ok=inject_ok)
+    if not inject_ok:
+        reason = "injection_failed"
+        rec = _terminal_record(run_id, scenario, backend, reset_ok, baseline_ok, setup_output, reason)
+        store.finish_run(run_id, rec, status="aborted", end_reason=reason)
+        if runs_path:
+            store.export_all(runs_path, trace_dir)
+        return rec
+
+    store.update_run(run_id, phase="fault_check")
+    targets = [item for item in str(run_env.get("TARGET_NODES", "")).split() if item]
+    fault_present, fault_detail, fault_elapsed = fault_checks.wait_for_fault(scenario, targets)
+    fault_payload = {
+        "present": fault_present,
+        "detail": fault_detail,
+        "elapsed_seconds": round(fault_elapsed, 3),
+        "timeout_seconds": fault_checks.timeout_for(scenario),
+        "targets": targets,
+    }
+    store.add_artifact(run_id, "fault_check", json.dumps(fault_payload, sort_keys=True), "application/json")
+    store.add_event(run_id, "fault_check", fault_payload)
+    _append_log(log_path, {"type": "fault_check", **fault_payload})
+    if not fault_present:
+        reason = "fault_not_observed"
+        setup_parts.append(f"FAULT CHECK: {fault_detail}")
+        rec = _terminal_record(
+            run_id, scenario, backend, reset_ok, baseline_ok,
+            "\n".join(setup_parts), reason, fault_present=False,
+        )
+        store.finish_run(run_id, rec, status="aborted", end_reason=reason)
+        if runs_path:
+            store.export_all(runs_path, trace_dir)
+        return rec
 
     reporter = UiReporter(run_id, store)
     view = LiveView(store.path, run_id, mode=mode) if ui != "none" else None
@@ -187,6 +222,7 @@ def _run_fresh(
             baseline_ok=baseline_ok,
             reset_ok=reset_ok,
             inject_ok=inject_ok,
+            fault_present=fault_present,
             setup_output=setup_output,
             store=store,
             resume=False,
@@ -360,6 +396,7 @@ def main() -> None:
 
     try:
         topology_data = topology_tools.discover_topology()
+        destructive_guard = safety_tools.require_destructive_guard(topology_data)
         topology_tools.freeze_topology(topology_data)
         capability = topology_tools.capability_check(scenario, topology_data, args.mode)
         targets = scenario.get("target_nodes", [])
@@ -416,6 +453,8 @@ def main() -> None:
 
     run_env = os.environ.copy()
     run_env["CHAOS_TOPOLOGY_JSON"] = json.dumps(topology_data, sort_keys=True)
+    if topology_data.get("source") == "fixture":
+        run_env["CHAOS_FAULT_CHECK_MODE"] = "fixture"
     run_env["TARGET_NODE"] = resolved[0] if resolved else ""
     run_env["TARGET_NODES"] = " ".join(resolved)
 
@@ -429,6 +468,7 @@ def main() -> None:
         "approve": args.approve,
         "topology_hash": topology_data["topology_hash"],
         "impact_class": capability["impact_class"],
+        "safety_guard": destructive_guard,
     }
     config_hash = store.hash_spec(config_hash_input)
 

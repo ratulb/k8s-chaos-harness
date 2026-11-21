@@ -6,6 +6,7 @@
   "inject": "faults/control_healthy_noisy.sh",
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
+  "fault_present_timeout_seconds": 0,
   "max_steps": 40,
   "max_tokens": 60000,
   "risk": "read-only",

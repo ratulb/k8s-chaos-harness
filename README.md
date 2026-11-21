@@ -3,6 +3,12 @@
 A reproducible benchmark for testing whether an LLM can diagnose and repair real
 etcd failures in a live Kubernetes cluster.
 
+> **Destructive benchmark.** `./chaos run`, fault scripts, reset scripts, state
+> discard, and cluster nuke can break or erase a cluster. Use a disposable lab
+> cluster only. Live benchmark runs are default-deny until the current kubectl
+> context or an explicit cluster ID and the active topology hash are allow-listed
+> (§15).
+
 This README is the main guide: motivation, architecture, data model, operator
 workflow, and troubleshooting. `DESIGN.md` is the canonical decision record,
 `PHASES.md` is current status, and the remaining documents are historical or
@@ -64,11 +70,12 @@ This is a benchmark of operational reasoning, not a generic Kubernetes autopilot
 
 ### What good looks like
 
-The headline metric is `loop_success`: the fraction of runs with correct
-diagnosis, passing verification, and repair presence matching fault status.
-Higher is better, but it does not require an acceptable repair or zero forbidden
-actions (§14). The reduced 13-run sweep scored `0.462`; a full cross-backend
-sweep is pending.
+The headline metric is `strict_loop_success`: the fraction of runs with an
+observed fault, correct diagnosis, passing verification, an acceptable repair,
+and zero forbidden actions or policy violations (§14). `loop_success` is kept
+as the legacy secondary metric. The archived 13-run sweep scored `0.462` on
+`loop_success`; live strict scoring validation and the full cross-backend sweep
+are pending.
 
 ## 2. Scope
 
@@ -322,9 +329,9 @@ python3 replay.py --db results.sqlite3 --output replay.html
 
 For `db_cli.py`, global `--db` goes before the subcommand. Its subcommands are
 `init`, `migrate`, `import-legacy`, `doctor`, `status`, `export`, `prune`, and
-`resume`. `run_benchmark.sh` is the older init/run/score wrapper; `menu.sh` is a
-generated picker that calls it and does not provide `./chaos`
-detach/attach/status behavior.
+`resume`. `run_benchmark.sh` is the older init/run/score wrapper. The generated
+`menu.sh` picker calls `./chaos run` and accepts its run flags; use `./chaos
+attach` and `./chaos status` separately for monitoring.
 
 Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 `score.py --reference-only`. Use the lower-level commands above.
@@ -467,7 +474,7 @@ unknown outcome. Retries link through `resume_of` and increment `resume_count`.
 
 `discard_state()` refuses live PIDs, aborts non-live active rows, deletes DB/WAL/
 SHM, truncates `runs.jsonl`, deletes `traces/*.jsonl`, optionally clears IP
-cache, and reinitializes schema v3. `logs/` survives.
+cache, and reinitializes schema v4. `logs/` survives.
 
 ## 14. Observability and reporting
 
@@ -493,17 +500,19 @@ Replay's matrix groups by scenario, backend, topology class, and seed. It
 excludes resumed and interactive runs by default; detail sections include all
 runs. Text is escaped and redacted before rendering.
 
-Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `loop_success`,
-`policy_violations` (fraction of runs with any blocked call), `forbidden`,
-`avg_steps`, `avg_tokens`. Token totals can be zero or undercounted for streamed
-responses (see §17).
+Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `strict_loop_success`,
+`loop_success`, `policy_violations` (fraction of runs with any blocked call),
+`forbidden`, `avg_steps`, `avg_tokens`. Streamed responses request provider
+usage payloads; live accounting is pending verification (§17).
 
 SQLite headline records require `status='finished'`, `resume_count=0`,
-`interactive=0`, no `legacy_exploratory` end reason, and present `truth`.
-`--include-resumed` and `--include-interactive` opt into excluded groups.
-`loop_success` means correct diagnosis, verify pass, and repair presence
-matching fault status. **It does not require an acceptable repair or absence of
-forbidden actions.**
+`interactive=0`, no `legacy_exploratory` end reason, present `truth`, an observed
+fault, and no provider failure end reason. `--include-resumed`, `--include-interactive`, `--include-provider-errors`, and
+`--include-unverified-faults` opt into excluded groups for historical analysis.
+`strict_loop_success` additionally requires an acceptable repair, no forbidden
+repair, and no policy violations. `loop_success` is the legacy secondary metric:
+correct diagnosis, verify pass, and repair presence matching fault status. **It
+does not require an acceptable repair or absence of forbidden actions.**
 
 ```bash
 python3 score.py --db results.sqlite3 --format md
@@ -513,7 +522,9 @@ python3 score.py --db results.sqlite3 --format md --include-interactive
 
 ### Results (reduced sweep)
 
-The full cross-backend sweep is pending. The 2026-11-21 reduced sweep produced:
+The full cross-backend sweep is pending. The archived 2026-11-21 reduced sweep
+preceded fault-present gates and strict scoring; its `loop_success` values are
+not comparable to the new headline metric:
 
 | Scope | Runs | Diagnosis | Verify | `loop_success` | Runs with policy violations |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -566,6 +577,20 @@ bash cluster/restore_clean_state.sh
 bash cluster/reset_cluster.sh
 faults/*.sh
 ```
+
+Live benchmark runs refuse to start unless the resolved identity is allow-listed.
+Set `CHAOS_ALLOWED_CLUSTER_CONTEXTS` to the current `kubectl config
+current-context`, or set `CHAOS_CLUSTER_ID` plus
+`CHAOS_ALLOWED_CLUSTER_IDS`. Optionally pin `CHAOS_ALLOWED_TOPOLOGY_HASHES` to
+the hash printed by `./chaos target show --json`. The guard also applies to
+`CHAOS_TOPOLOGY_JSON` fixtures passed to `./chaos run`; never use fixture inputs
+against a live cluster.
+
+Every fault injection is followed by a bounded fault-present check before the
+agent starts. If the stimulus is not observed, the run is aborted as
+`fault_not_observed` and excluded from scoring. Provider failures such as HTTP
+413/429 are classified as `provider_error_*` and also excluded from the
+headline rates.
 
 Reset ladder: kill leftovers, restore clean etcd manifests, restart kubelet,
 verify up to 12 times, repair non-ready members with `member_remove_readd`, fall
@@ -621,9 +646,10 @@ change behavior.
 - the cluster and local DB were rebuilt clean afterwards
 - prompt approval is validated offline only
 - the full fresh cross-backend sweep remains pending
-- fault repeatability varies; `--seed` is metadata, not sampling control
+- fault repeatability now fails closed via bounded fault-present checks, but live calibration is pending
+- `--seed` is metadata, not sampling control
 - `--ui plain` and `--ui live` use the same renderer
-- streamed responses report zero token usage, so totals can be undercounted
+- streamed usage capture is implemented, but live token accounting is pending verification
 - `./chaos doctor|score|export` and `--reference-only` are not implemented
 - repair-mode semantics do not yet match the design's incident-mode statuses
 - UI/replay redact secrets, but raw DB fields and snapshots can retain values
@@ -644,10 +670,11 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `README.md` | Main guide: motivation, concepts, architecture, operation, troubleshooting |
 | `DESIGN.md` | Canonical decisions and locked constraints |
 | `PHASES.md` | Status, acceptance history, remaining work |
-| `SQLite.md` | Historical event-store reviewer input |
-| `feedback.md` | Historical reviewer dialogue and rationale |
-| `NOTES.md` | Historical notes; defers to design and phases |
-| `skeleton.md` | Superseded early roadmap |
+| `docs/archive/SQLite.md` | Historical event-store reviewer input |
+| `docs/archive/feedback.md` | Historical reviewer dialogue and rationale |
+| `docs/archive/NOTES.md` | Historical notes; defers to design and phases |
+| `docs/archive/skeleton.md` | Superseded early roadmap |
+| `docs/archive/reviewer_feedback_on_readme.md` | Historical README review notes |
 | `kaggle/README.md` | Optional Kaggle-hosted Ollama endpoint |
 | `scripts/README.md` | Helper-script details |
 

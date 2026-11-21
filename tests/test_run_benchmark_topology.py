@@ -38,6 +38,8 @@ class TestRunBenchmarkTopology(unittest.TestCase):
     def _runner(self, db: Path, tmp_path: Path, *extra: str) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["CHAOS_TOPOLOGY_JSON"] = str(ROOT / "tests" / "fixtures" / "topologies" / "n1.json")
+        env["CHAOS_CLUSTER_ID"] = "fixture"
+        env["CHAOS_ALLOWED_CLUSTER_IDS"] = "fixture"
         env["CHECKPOINT_DB"] = str(db)
         return subprocess.run(
             [
@@ -63,6 +65,8 @@ class TestRunBenchmarkTopology(unittest.TestCase):
             db = tmp_path / "results.sqlite3"
             env = os.environ.copy()
             env["CHAOS_TOPOLOGY_JSON"] = str(ROOT / "tests" / "fixtures" / "topologies" / "n1.json")
+            env["CHAOS_CLUSTER_ID"] = "fixture"
+            env["CHAOS_ALLOWED_CLUSTER_IDS"] = "fixture"
             env["CHECKPOINT_DB"] = str(db)
             result = subprocess.run(
                 [

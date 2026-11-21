@@ -98,7 +98,9 @@ class LLMClient:
     ) -> dict[str, Any]:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
+        stream_payload["stream_options"] = {"include_usage": True}
         content_parts: list[str] = []
+        usage: dict[str, Any] | None = None
         tool_calls: dict[int, dict[str, Any]] = {}
         with self._open_completion(
             stream_payload, timeout, {"Accept": "text/event-stream"}
@@ -113,6 +115,8 @@ class LLMClient:
                 if data == "[DONE]":
                     break
                 chunk = json.loads(data)
+                if chunk.get("usage"):
+                    usage = dict(chunk["usage"])
                 for choice in chunk.get("choices", []):
                     delta = choice.get("delta", {}) or {}
                     text = delta.get("content") or ""
@@ -140,7 +144,7 @@ class LLMClient:
             message["tool_calls"] = [tool_calls[key] for key in sorted(tool_calls)]
         return {
             "choices": [{"message": message, "finish_reason": "stop"}],
-            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         }
 
     def chat(

@@ -83,6 +83,11 @@ def validate_scenario(
         elif expected_type is int and isinstance(scenario[field], bool):
             errors.append(f"{field}: expected int, got bool")
 
+    if "fault_present_timeout_seconds" in scenario:
+        timeout = scenario["fault_present_timeout_seconds"]
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout < 0:
+            errors.append("fault_present_timeout_seconds: expected non-negative number")
+
     scenario_id = str(scenario.get("id", ""))
     if expected_id and scenario_id != expected_id:
         errors.append(f"id: {scenario_id!r} does not match filename {expected_id!r}")

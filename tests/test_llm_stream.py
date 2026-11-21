@@ -63,6 +63,20 @@ class TestLlmStreaming(unittest.TestCase):
         self.assertEqual(message["tool_calls"][0]["function"]["name"], "submit_diagnosis")
         self.assertEqual(json.loads(message["tool_calls"][0]["function"]["arguments"]), {"root_cause": "no_fault"})
 
+    def test_stream_requests_and_uses_provider_usage(self) -> None:
+        lines = [
+            sse({"choices": [{"delta": {"content": "ok"}}], "usage": {
+                "prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12,
+            }}),
+            "data: [DONE]\n\n",
+        ]
+        with patch("llm.client.urllib.request.urlopen", return_value=FakeResponse(lines=lines)) as opener:
+            response = self.client.chat([{"role": "user", "content": "hi"}], on_chunk=lambda _: None)
+        payload = json.loads(opener.call_args.args[0].data.decode("utf-8"))
+        self.assertTrue(payload["stream"])
+        self.assertEqual(payload["stream_options"], {"include_usage": True})
+        self.assertEqual(response["usage"]["total_tokens"], 12)
+
     def test_stream_failure_falls_back_to_non_stream(self) -> None:
         fallback = {"choices": [{"message": {"role": "assistant", "content": "fallback"}}]}
         chunks: list[str] = []

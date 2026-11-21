@@ -2,11 +2,11 @@
 
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
-Canonical design: `DESIGN.md`. Historical inputs: `SQLite.md`, `feedback.md`.
+Canonical design: `DESIGN.md`. Historical inputs: `docs/archive/SQLite.md`,
+`docs/archive/feedback.md`.
 
-Machines were down during offline implementation. All three control planes are
-back as of 2026-11-21; live topology and rebuild acceptance passed after the
-Phase 9 hardening commit.
+Cluster/GPU rebuild is in progress; wait for operator confirmation before live
+or destructive validation.
 
 ## Skipped or deferred live work
 - `vm1` is back; live topology discovery and `chaos cluster nuke` rebuild
@@ -248,3 +248,23 @@ Phase 9 hardening commit.
 - Deliverable: publishable visual artifact
 - Acceptance: replay renders arbitrary topology snapshots without re-running
   the cluster
+
+## Phase 11 — Credibility hardening before publication
+- [x] Add bounded fault-present checks before every injected agent run
+- [x] Fail closed as `fault_not_observed` when no stimulus is observed
+- [x] Fix member-down success reporting and live etcd peer-URL injection
+- [x] Add strict metric and exclude provider/observer failures from headline rates
+- [x] Classify provider 413/429/5xx end reasons
+- [x] Add default-deny destructive guard for live benchmark runs
+- [x] Route generated menus through `./chaos run`
+- [x] Request and consume streamed usage payloads
+- [x] Archive historical reviewer documents
+- [x] Run full offline suite after changes
+- [ ] Calibrate fault-present timeouts on the rebuilt cluster
+- [ ] Run non-destructive live smoke after cluster/GPU are ready
+- [ ] Run destructive calibration and model pilots only after explicit approval
+- [ ] Run full public sweep and publish refreshed replay/score artifacts
+- Deliverable: benchmark results that prove the faults existed and separate
+  model failures from harness/provider failures
+- Acceptance: every scored run has an observed fault, no provider failure, and
+  a strict metric backed by auditable fault-check artifacts

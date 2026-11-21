@@ -150,7 +150,12 @@ def _run_sections(db_path: str | Path, allowed: set[str] | None = None) -> list[
 def build_html(db_path: str | Path, include_interactive: bool = False) -> str:
     store = SQLiteStore(db_path)
     try:
-        records = store.load_records(include_resumed=False, include_interactive=include_interactive)
+        records = store.load_records(
+            include_resumed=False,
+            include_interactive=include_interactive,
+            include_provider_errors=True,
+            include_unverified_faults=True,
+        )
         matrix = _matrix_rows(store, records)
     finally:
         store.close()

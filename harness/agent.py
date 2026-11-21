@@ -20,6 +20,17 @@ from tools.repairs import (
 from tools.truncate import truncate
 
 
+def _classify_llm_error(error: str) -> str:
+    text = str(error).lower()
+    if "413" in text or "payload too large" in text:
+        return "provider_error_413"
+    if "429" in text or "too many requests" in text:
+        return "provider_error_429"
+    if any(code in text for code in ("500", "502", "503", "504")):
+        return "provider_error_5xx"
+    return "error"
+
+
 def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:
     nodes = cluster_config.nodes()
     node = value or default or cluster_config.default_node()
@@ -155,6 +166,7 @@ def run_scenario(
     baseline_ok: bool = True,
     reset_ok: bool = True,
     inject_ok: bool = True,
+    fault_present: bool = True,
     setup_output: str = "",
     store: Any = None,
     resume: bool = False,
@@ -274,7 +286,7 @@ def run_scenario(
             )
         return snapshot
 
-    log({"type": "resume_started", "from_seq": state.get("seq", 0)} if resume else {"type": "setup", "reset_ok": reset_ok, "baseline_ok": baseline_ok, "inject_ok": inject_ok, "output": truncate(setup_output, 2000)})
+    log({"type": "resume_started", "from_seq": state.get("seq", 0)} if resume else {"type": "setup", "reset_ok": reset_ok, "baseline_ok": baseline_ok, "inject_ok": inject_ok, "fault_present": fault_present, "output": truncate(setup_output, 2000)})
     if not resume:
         artifact("setup_output_full", {"output": setup_output})
     checkpoint()
@@ -293,7 +305,7 @@ def run_scenario(
             )
         except Exception as e:
             llm_error = True
-            end_reason = "error"
+            end_reason = _classify_llm_error(str(e))
             if store is not None:
                 store.add_llm_request(run_id, getattr(backend, "name", "unknown"), int((time.time() - started) * 1000), 0, 0, str(e))
             log({"type": "llm_error", "error": str(e)})
@@ -476,9 +488,9 @@ def run_scenario(
             log({"type": "nudge", "step": steps})
             checkpoint()
 
-    if steps >= max_steps:
+    if not llm_error and steps >= max_steps:
         end_reason = "budget_steps"
-    elif tokens_used >= max_tokens:
+    elif not llm_error and tokens_used >= max_tokens:
         end_reason = "budget_tokens"
 
     if store is not None:
@@ -512,6 +524,7 @@ def run_scenario(
         "reset_ok": reset_ok,
         "baseline_ok": baseline_ok,
         "inject_ok": inject_ok,
+        "fault_present": fault_present,
         "diagnosis": diagnosis,
         "diagnosis_raw": diagnosis_raw,
         "truth": scenario["root_cause"],
@@ -526,20 +539,28 @@ def run_scenario(
         "steps": steps,
         "tokens_used": tokens_used,
         "trace": str(trace_path),
+        "end_reason": end_reason,
     }
     log({"type": "record", "record": record})
     final_state = checkpoint()
+    no_fault = scenario["root_cause"] == "no_fault"
     loop_success = bool(
         record["diagnosis_correct"]
         and verify_ok
-        and (bool(repair) != (scenario["root_cause"] == "no_fault"))
+        and (bool(repair) != no_fault)
     )
+    if no_fault:
+        repair_acceptable = repair is None
+    else:
+        repair_acceptable = bool(repair and repair in acceptable)
     score = {
         "scorer_version": "legacy-record-v1",
+        "fault_present": fault_present,
+        "end_reason": end_reason,
         "diagnosis": diagnosis,
         "diagnosis_correct": record["diagnosis_correct"],
         "repair_action": repair,
-        "repair_acceptable": bool(repair and repair in acceptable),
+        "repair_acceptable": repair_acceptable,
         "repair_forbidden": bool(repair and repair in forbidden),
         "recovered": verify_ok,
         "policy_violations": len(policy_violations),

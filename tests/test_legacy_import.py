@@ -27,6 +27,7 @@ def record(run_id: str, *, pre_gate: bool = False, backend: str = "groq") -> dic
         "truth": "etcd_member_unreachable",
         "diagnosis": "etcd_member_unreachable",
         "diagnosis_correct": True,
+        "fault_present": True,
         "repair": "restart_member",
         "verify_ok": True,
         "steps": 4,

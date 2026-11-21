@@ -21,7 +21,7 @@ from typing import Any, Iterator
 
 from tools.naming import normalize_backend
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 DIAGNOSIS_TOOL = "submit_diagnosis"
 REPAIR_TOOLS = {
@@ -64,6 +64,7 @@ RUN_COLUMNS = {
     "reset_ok": "INTEGER",
     "baseline_ok": "INTEGER",
     "inject_ok": "INTEGER",
+    "fault_present": "INTEGER DEFAULT 0",
     "verify_ok": "INTEGER",
     "steps": "INTEGER NOT NULL DEFAULT 0",
     "tokens_used": "INTEGER NOT NULL DEFAULT 0",
@@ -90,6 +91,7 @@ RUN_BOOL_COLUMNS = {
     "reset_ok",
     "baseline_ok",
     "inject_ok",
+    "fault_present",
     "verify_ok",
     "interactive",
 }
@@ -110,6 +112,7 @@ RECORD_TO_COLUMN = {
     "reset_ok": "reset_ok",
     "baseline_ok": "baseline_ok",
     "inject_ok": "inject_ok",
+    "fault_present": "fault_present",
     "verify_ok": "verify_ok",
     "steps": "steps",
     "tokens_used": "tokens_used",
@@ -635,7 +638,7 @@ class SQLiteStore:
             conn.execute("UPDATE llm_requests SET backend='ollama' WHERE backend='kaggle'")
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(version, applied_at, notes) VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, and UI stream"),
+                (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, UI stream, fault presence"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -1320,6 +1323,8 @@ class SQLiteStore:
         include_resumed: bool = False,
         include_aborted: bool = False,
         include_interactive: bool = False,
+        include_provider_errors: bool = False,
+        include_unverified_faults: bool = False,
     ) -> list[dict[str, Any]]:
         clauses = ["status='finished'"]
         if not include_resumed:
@@ -1328,18 +1333,45 @@ class SQLiteStore:
             clauses.append("(end_reason IS NULL OR end_reason != 'legacy_exploratory')")
         if not include_interactive:
             clauses.append("interactive=0")
+        if not include_provider_errors:
+            clauses.append("(end_reason IS NULL OR (end_reason NOT LIKE 'provider_error%' AND end_reason NOT IN ('error', 'fault_not_observed', 'injection_failed')))")
+        if not include_unverified_faults:
+            clauses.append("fault_present=1")
         sql = "SELECT * FROM runs WHERE " + " AND ".join(clauses)
         sql += " ORDER BY COALESCE(started_at, 0), run_id"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
-        return [self.record_from_row(dict(row)) for row in rows if row["truth"] is not None]
+            run_ids = [row["run_id"] for row in rows]
+            score_rows: list[sqlite3.Row] = []
+            if run_ids:
+                placeholders = ",".join("?" for _ in run_ids)
+                score_rows = conn.execute(
+                    f"SELECT * FROM scores WHERE run_id IN ({placeholders})", run_ids
+                ).fetchall()
+        score_by_run = {str(row["run_id"]): dict(row) for row in score_rows}
+        records: list[dict[str, Any]] = []
+        for row in rows:
+            if row["truth"] is None:
+                continue
+            record = self.record_from_row(dict(row))
+            score = score_by_run.get(str(row["run_id"]), {})
+            for key in ("repair_acceptable", "repair_forbidden", "loop_success", "scorer_version"):
+                if key in score:
+                    record[key] = bool(score[key]) if key != "scorer_version" else score[key]
+            records.append(record)
+        return records
 
     def export_all(self, runs_path: str | Path, trace_dir: str | Path) -> dict[str, Any]:
         runs_path = Path(runs_path)
         trace_dir = Path(trace_dir)
         runs_path.parent.mkdir(parents=True, exist_ok=True)
         trace_dir.mkdir(parents=True, exist_ok=True)
-        records = self.load_records(include_resumed=True, include_interactive=True)
+        records = self.load_records(
+            include_resumed=True,
+            include_interactive=True,
+            include_provider_errors=True,
+            include_unverified_faults=True,
+        )
         runs_path.write_text(
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
             encoding="utf-8",

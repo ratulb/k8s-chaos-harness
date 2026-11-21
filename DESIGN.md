@@ -390,7 +390,7 @@ Canonical run statuses:
 - Plain SQL and additive migrations are used. No ORM.
 - A store-level `RLock` protects access from the UI/background reader threads.
 
-### 10.2 Schema version 3
+### 10.2 Schema versions 3 and 4
 
 Existing v2 tables remain. Version 3 adds:
 
@@ -401,6 +401,10 @@ Existing v2 tables remain. Version 3 adds:
 - `runs.pid`
 - `state_snapshots(run_id, snapshot_seq, event_seq, ts, source, state_json)`
 - `ui_stream(run_id, seq, ts, kind, text)`
+
+Version 4 adds:
+
+- `runs.fault_present INTEGER DEFAULT 0`
 
 `state_snapshots` records dynamic cluster state for arbitrary node counts. It
 must land before static replay so history is not unrecoverable later.
@@ -663,5 +667,5 @@ The redesign is complete when:
   predictable, and never applied to explicit resume or read-only commands.
 - SQLite DB can grow; `db_cli.py prune` may be used for report snapshots, but
   full-epoch cleanup is `chaos state discard`.
-- `SQLite.md` and `feedback.md` are historical reviewer inputs. This document is
-  the reconciled source of truth.
+- `docs/archive/SQLite.md` and `docs/archive/feedback.md` are historical reviewer
+  inputs. This document is the reconciled source of truth.

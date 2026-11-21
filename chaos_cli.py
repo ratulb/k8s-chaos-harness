@@ -191,7 +191,8 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
         "  exit 2",
         "fi",
         'id="${ids[$((choice - 1))]}"',
-        'exec bash "$ROOT/run_benchmark.sh" --scenario "$id" --backend "$BACKEND" "$@"',
+        'cd "$ROOT"',
+        'exec ./chaos run --scenario "$id" --backend "$BACKEND" "$@"',
         "",
     ]
     return "\n".join(lines)

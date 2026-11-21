@@ -31,6 +31,7 @@ def finished_record(run_id: str, correct: bool) -> dict:
         "diagnosis": "etcd_member_unreachable" if correct else "no_fault",
         "diagnosis_correct": correct,
         "approval_granted": correct,
+        "fault_present": True,
         "repair": "restart_member" if correct else None,
         "repair_args": {"node": "node-b"} if correct else None,
         "policy_violations": [],
