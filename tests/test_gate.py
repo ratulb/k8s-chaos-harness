@@ -11,7 +11,7 @@ import os
 import sys
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -56,23 +56,26 @@ class TestRepairGate(unittest.TestCase):
         ]
         original = agent.LLMClient
         agent.LLMClient = lambda backend: FakeClient(responses)
+        cluster_config.nodes.cache_clear()
         try:
-            with tempfile.TemporaryDirectory() as d:
-                rec = agent.run_scenario(
-                    {
-                        "id": "gate-test",
-                        "root_cause": "etcd_member_unreachable",
-                        "acceptable_repairs": ["restart_member"],
-                        "forbidden_repairs": ["reset_cluster"],
-                    },
-                    FakeBackend(),
-                    "gate-test",
-                    "true",
-                    "true",
-                    trace_dir=d,
-                )
+            with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
+                with tempfile.TemporaryDirectory() as d:
+                    rec = agent.run_scenario(
+                        {
+                            "id": "gate-test",
+                            "root_cause": "etcd_member_unreachable",
+                            "acceptable_repairs": ["restart_member"],
+                            "forbidden_repairs": ["reset_cluster"],
+                        },
+                        FakeBackend(),
+                        "gate-test",
+                        "true",
+                        "true",
+                        trace_dir=d,
+                    )
         finally:
             agent.LLMClient = original
+            cluster_config.nodes.cache_clear()
 
         # Approval and diagnosis must be recognized, but the forbidden call
         # must not produce a repair and must leave both audit fields populated.
@@ -95,29 +98,116 @@ class TestRepairGate(unittest.TestCase):
         ]
         original = agent.LLMClient
         agent.LLMClient = lambda backend: FakeClient(responses)
+        cluster_config.nodes.cache_clear()
         try:
-            with tempfile.TemporaryDirectory() as d:
-                rec = agent.run_scenario(
-                    {
-                        "id": "gate-test-2",
-                        "root_cause": "etcd_member_unreachable",
-                        "acceptable_repairs": ["restart_member"],
-                        "forbidden_repairs": [],
-                    },
-                    FakeBackend(),
-                    "gate-test-2",
-                    "true",
-                    "true",
-                    trace_dir=d,
-                )
+            with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
+                with tempfile.TemporaryDirectory() as d:
+                    rec = agent.run_scenario(
+                        {
+                            "id": "gate-test-2",
+                            "root_cause": "etcd_member_unreachable",
+                            "acceptable_repairs": ["restart_member"],
+                            "forbidden_repairs": [],
+                        },
+                        FakeBackend(),
+                        "gate-test-2",
+                        "true",
+                        "true",
+                        trace_dir=d,
+                    )
         finally:
             agent.LLMClient = original
+            cluster_config.nodes.cache_clear()
 
         # A repair attempted before submit_diagnosis has no approval token, so
         # it must be blocked and logged as a policy violation.
         self.assertFalse(rec["approval_granted"])
         self.assertIsNone(rec["repair"])
         self.assertTrue(any("diagnosis required" in v for v in rec["policy_violations"]))
+
+    def test_prompt_approval_grants_without_showing_token(self):
+        responses = [
+            assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
+            assistant([tool_call("restart_member", {"approval_token": "approved:gate-prompt"})]),
+            assistant([]),
+        ]
+        pause = Mock()
+        resume = Mock()
+        original = agent.LLMClient
+        agent.LLMClient = lambda backend: FakeClient(responses)
+        cluster_config.nodes.cache_clear()
+        try:
+            with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
+                with patch("builtins.input", return_value="y") as prompt:
+                    with patch.object(agent, "_exec_repair", return_value="restart ok"):
+                        with tempfile.TemporaryDirectory() as d:
+                            rec = agent.run_scenario(
+                                {
+                                    "id": "gate-prompt",
+                                    "root_cause": "etcd_member_unreachable",
+                                    "acceptable_repairs": ["restart_member"],
+                                    "forbidden_repairs": [],
+                                },
+                                FakeBackend(),
+                                "gate-prompt",
+                                "true",
+                                "true",
+                                trace_dir=d,
+                                approve="prompt",
+                                pause_reporter=pause,
+                                resume_reporter=resume,
+                            )
+                            with open(os.path.join(d, "gate-prompt.jsonl"), encoding="utf-8") as handle:
+                                trace_text = handle.read()
+        finally:
+            agent.LLMClient = original
+            cluster_config.nodes.cache_clear()
+
+        self.assertTrue(rec["approval_granted"])
+        self.assertEqual(rec["repair"], "restart_member")
+        self.assertIn("Approve repair", prompt.call_args.args[0])
+        self.assertNotIn("approved:", prompt.call_args.args[0])
+        self.assertNotIn("approved:gate-prompt", trace_text)
+        self.assertNotIn("approved:gate-prompt", json.dumps(rec))
+        pause.assert_called_once_with()
+        resume.assert_called_once_with()
+
+    def test_prompt_approval_can_be_declined(self):
+        responses = [
+            assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
+            assistant([tool_call("restart_member", {"approval_token": "approved:gate-decline"})]),
+            assistant([]),
+        ]
+        original = agent.LLMClient
+        agent.LLMClient = lambda backend: FakeClient(responses)
+        cluster_config.nodes.cache_clear()
+        try:
+            with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
+                with patch("builtins.input", return_value="n"):
+                    with patch.object(agent, "_exec_repair", return_value="restart ok") as repair:
+                        with tempfile.TemporaryDirectory() as d:
+                            rec = agent.run_scenario(
+                                {
+                                    "id": "gate-decline",
+                                    "root_cause": "etcd_member_unreachable",
+                                    "acceptable_repairs": ["restart_member"],
+                                    "forbidden_repairs": [],
+                                },
+                                FakeBackend(),
+                                "gate-decline",
+                                "true",
+                                "true",
+                                trace_dir=d,
+                                approve="prompt",
+                            )
+        finally:
+            agent.LLMClient = original
+            cluster_config.nodes.cache_clear()
+
+        self.assertFalse(rec["approval_granted"])
+        self.assertIsNone(rec["repair"])
+        repair.assert_not_called()
+        self.assertTrue(any("approval not granted" in v for v in rec["policy_violations"]))
 
 
 if __name__ == "__main__":

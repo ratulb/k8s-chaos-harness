@@ -8,5 +8,16 @@
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,
-  "max_tokens": 60000
+  "max_tokens": 60000,
+  "risk": "disruptive",
+  "menu": {
+    "label": "Etcd member down",
+    "summary": "Stop one etcd member while its data remains intact."
+  },
+  "min_etcd_members": 1,
+  "selector_requirements": {
+    "min_targets": 1,
+    "allowed": ["role", "index", "node"]
+  },
+  "impact_class": "single_member_fault"
 }

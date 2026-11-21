@@ -1,11 +1,16 @@
 # Project notes — k8s fault-healing agent
 
+`DESIGN.md` is the canonical, reconciled design. `PHASES.md` is the current
+status and action plan. This file keeps historical context and quick reminders.
+
 ## Goal
 Build an AI agent from scratch that diagnoses and fixes injected faults in a Kubernetes cluster.
 
 ## LLM strategy
-- Self-host a small LLM locally or on a Kaggle GPU box, tunneled to.
-- Also use free LLM endpoints as fallbacks (no paid subscriptions).
+- Use an Ollama-compatible endpoint as the self-hosted backend, local or tunneled.
+- A Kaggle GPU notebook is optional infrastructure for that endpoint.
+- Groq, OpenRouter, and Cloudflare are hosted baselines, not automatic fallbacks.
+- One backend is selected per run.
 
 ## Cluster
 - This repo spins up multi-node K8s clusters (kubeadm + Calico VXLAN).
@@ -46,15 +51,18 @@ Build an AI agent from scratch that diagnoses and fixes injected faults in a Kub
 
 ## SQLite checkpoint store
 - `SQLite.md` holds historical reviewer input; `DESIGN.md` is the reconciled source of truth.
-- SQLite is authoritative; `runs.jsonl` and `traces/*.jsonl` are regenerated exports.
-- Event log is append-only: messages, tool calls, LLM requests, trace events, artifacts.
+- SQLite is authoritative for the active epoch; `runs.jsonl` and `traces/*.jsonl` are regenerated exports.
+- Event log is append-only: messages, tool calls, LLM requests, trace events, artifacts, state snapshots, UI stream.
 - `runs.state_json` is a cache rebuilt from the log when its seq marker is stale.
 - Unknown mutating tool calls abort the original run and create a fresh retry linked by `resume_of`.
-- Resumed runs are excluded from headline rates unless `score.py --include-resumed` is used.
-- Kaggle is not required for SQLite work; only for live GPU-backed sweeps.
+- Resumed, interactive, pre-gate, and unsupported runs are excluded from headline rates by default.
+- There is no archive. `chaos state discard` removes stale operational state.
+- A normal new run auto-discards when live `topology_hash` differs from active SQLite.
+- Explicit resume refuses on topology mismatch and never discards.
+- A self-hosted endpoint is not required for SQLite work; live endpoints are needed only for model sweeps.
 
 ## Latest validation
-- 13/13 unit tests passed before SQLite integration.
-- Kaggle tunnel reached `qwen3.8:27b` and all four configured backends passed health/readiness.
-- Six-scenario Kaggle sweeps completed over seeds 401-403; infrastructure is stable (reset/inject/verify), but diagnosis accuracy is model-dependent.
-- `python3 score.py` is the source of truth for aggregate rates; current overall diagnosis rate is about 0.5 with no policy violations.
+- Historical: 13/13 unit tests passed before SQLite integration.
+- Historical: self-hosted endpoint and hosted backends passed health/readiness at the time.
+- Historical: six-scenario sweeps completed over seeds 401-403; infrastructure was stable, but diagnosis accuracy was model-dependent.
+- Machines are currently down for cost, so current live validation is incomplete.

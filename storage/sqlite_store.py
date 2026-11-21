@@ -8,14 +8,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import signal
 import sqlite3
 import subprocess
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-SCHEMA_VERSION = 2
+from tools.naming import normalize_backend
+
+SCHEMA_VERSION = 3
 
 DIAGNOSIS_TOOL = "submit_diagnosis"
 REPAIR_TOOLS = {
@@ -66,6 +72,10 @@ RUN_COLUMNS = {
     "finished_at": "REAL",
     "trace_path": "TEXT",
     "config_hash": "TEXT",
+    "topology_hash": "TEXT",
+    "interactive": "INTEGER NOT NULL DEFAULT 0",
+    "launch_id": "TEXT",
+    "pid": "INTEGER",
     "state_json": "TEXT",
     "state_seq": "INTEGER NOT NULL DEFAULT 0",
     "seq": "INTEGER NOT NULL DEFAULT 0",
@@ -81,6 +91,7 @@ RUN_BOOL_COLUMNS = {
     "baseline_ok",
     "inject_ok",
     "verify_ok",
+    "interactive",
 }
 
 RECORD_TO_COLUMN = {
@@ -106,12 +117,204 @@ RECORD_TO_COLUMN = {
 }
 
 
+def read_only_rows(path: str | Path, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+    target = Path(path)
+    if not target.exists():
+        return []
+    try:
+        conn = sqlite3.connect(f"{target.resolve().as_uri()}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error:
+        return []
+    conn.row_factory = sqlite3.Row
+    try:
+        return [dict(row) for row in conn.execute(sql, params).fetchall()]
+    except sqlite3.Error:
+        return []
+    finally:
+        conn.close()
+
+
+def active_topology_hash(db_path: str | Path) -> str | None:
+    rows = read_only_rows(
+        db_path,
+        """SELECT topology_hash, updated_at FROM (
+               SELECT topology_hash, updated_at FROM runs
+               WHERE topology_hash IS NOT NULL AND topology_hash != ''
+               UNION ALL
+               SELECT topology_hash, created_at AS updated_at FROM batches
+               WHERE topology_hash IS NOT NULL AND topology_hash != ''
+           ) ORDER BY updated_at DESC LIMIT 1""",
+    )
+    return rows[0]["topology_hash"] if rows else None
+
+
+def active_run_rows(db_path: str | Path) -> list[dict[str, Any]]:
+    now = time.time()
+    rows = read_only_rows(db_path, "SELECT * FROM runs")
+    return [
+        row for row in rows
+        if row.get("status") in {"pending", "running", "interrupted"}
+        or (row.get("lease_expires_at") is not None and row["lease_expires_at"] > now)
+    ]
+
+
+def read_only_counts(db_path: str | Path) -> dict[str, int]:
+    tables = [
+        "batches", "runs", "scenarios", "messages", "tool_calls", "llm_requests",
+        "trace_events", "run_artifacts", "state_snapshots", "ui_stream",
+        "diagnosis_attempts", "policy_violations", "scores", "score_reports",
+    ]
+    counts: dict[str, int] = {}
+    for table in tables:
+        rows = read_only_rows(db_path, f"SELECT COUNT(*) AS total FROM {table}")
+        counts[table] = int(rows[0]["total"]) if rows else 0
+    return counts
+
+
+def stale_topology_warning(db_path: str | Path, topology_hash: str) -> str | None:
+    active = active_topology_hash(db_path)
+    if active and active != topology_hash:
+        return (
+            f"active database topology {active} differs from discovered topology {topology_hash}; "
+            "normal runs will discard stale state and explicit resume is refused"
+        )
+    return None
+
+
+def _pid_alive(pid: int | None) -> bool:
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(int(pid), 0)
+    except (OSError, ValueError):
+        return False
+    return True
+
+
+def abort_runs(
+    db_path: str | Path,
+    run_ids: list[str] | None = None,
+    terminate: bool = True,
+    reason: str = "operator_abort",
+) -> dict[str, Any]:
+    if run_ids is None:
+        rows = active_run_rows(db_path)
+    else:
+        rows = []
+        for run_id in run_ids:
+            found = read_only_rows(db_path, "SELECT * FROM runs WHERE run_id=?", (run_id,))
+            rows.extend(found)
+    live_rows = [row for row in rows if _pid_alive(row.get("pid"))]
+    if live_rows and not terminate:
+        raise RuntimeError(
+            "refusing abort while active runs are alive: "
+            + ", ".join(str(row["run_id"]) for row in live_rows)
+        )
+    if live_rows:
+        for row in live_rows:
+            try:
+                os.kill(int(row["pid"]), signal.SIGTERM)
+            except (OSError, ValueError, TypeError):
+                pass
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            remaining = [row for row in live_rows if _pid_alive(row.get("pid"))]
+            if not remaining:
+                break
+            time.sleep(0.1)
+        still_live = [row for row in live_rows if _pid_alive(row.get("pid"))]
+        if still_live:
+            raise RuntimeError(
+                "failed to terminate active runs: "
+                + ", ".join(str(row["run_id"]) for row in still_live)
+            )
+    if not rows:
+        return {"aborted": [], "reason": reason}
+    store = SQLiteStore(db_path)
+    aborted: list[str] = []
+    try:
+        for row in rows:
+            run_id = row["run_id"]
+            store.add_event(run_id, "operator_abort", {"reason": reason})
+            store.finish_run(run_id, status="aborted", end_reason=reason)
+            aborted.append(run_id)
+    finally:
+        store.close()
+    return {"aborted": aborted, "reason": reason}
+
+
+def discard_state(
+    db_path: str | Path,
+    runs_jsonl: str | Path,
+    trace_dir: str | Path,
+    ip_cache_path: str | Path | None = None,
+) -> dict[str, Any]:
+    database = Path(db_path)
+    runs_file = Path(runs_jsonl)
+    traces = Path(trace_dir)
+    cache = Path(ip_cache_path) if ip_cache_path else None
+    summary: dict[str, Any] = {
+        "database": str(database),
+        "runs_aborted": [],
+        "files_removed": [],
+        "runs_jsonl_truncated": False,
+        "reinitialized": False,
+    }
+
+    active = active_run_rows(database)
+    live = [row for row in active if _pid_alive(row.get("pid"))]
+    if live:
+        raise RuntimeError(
+            "refusing state discard while active runs are alive: "
+            + ", ".join(str(row["run_id"]) for row in live)
+        )
+
+    if active and database.exists():
+        store = SQLiteStore(database)
+        try:
+            for row in active:
+                run_id = row["run_id"]
+                store.add_event(run_id, "state_discard_abort", {"reason": "state_discard"})
+                store.finish_run(run_id, status="aborted", end_reason="state_discard")
+                summary["runs_aborted"].append(run_id)
+            remaining = active_run_rows(database)
+            if remaining:
+                raise RuntimeError(f"failed to abort active runs: {remaining}")
+        finally:
+            store.close()
+
+    for suffix in ("", "-wal", "-shm"):
+        target = Path(f"{database}{suffix}")
+        if target.exists():
+            target.unlink()
+            summary["files_removed"].append(str(target))
+
+    if runs_file.exists():
+        runs_file.write_text("", encoding="utf-8")
+        summary["runs_jsonl_truncated"] = True
+
+    if traces.exists():
+        for target in sorted(traces.glob("*.jsonl")):
+            if target.is_file():
+                target.unlink()
+                summary["files_removed"].append(str(target))
+
+    if cache and cache.exists():
+        cache.unlink()
+        summary["files_removed"].append(str(cache))
+
+    SQLiteStore(database).close()
+    summary["reinitialized"] = True
+    return summary
+
+
 class SQLiteStore:
     """One-connection, append-first store used only by the harness writer."""
 
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.RLock()
         self.conn = sqlite3.connect(str(self.path), timeout=30, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA journal_mode=WAL")
@@ -127,10 +330,19 @@ class SQLiteStore:
         self.close()
 
     def close(self) -> None:
-        self.conn.close()
+        with self._lock:
+            self.conn.close()
 
-    def _connect(self) -> sqlite3.Connection:
-        return self.conn
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
+        with self._lock:
+            try:
+                yield self.conn
+            except Exception:
+                self.conn.rollback()
+                raise
+            else:
+                self.conn.commit()
 
     @staticmethod
     def _now() -> float:
@@ -205,6 +417,7 @@ class SQLiteStore:
                     runs_requested INTEGER NOT NULL DEFAULT 0,
                     reset_cmd TEXT NOT NULL DEFAULT '',
                     config_hash TEXT NOT NULL DEFAULT '',
+                    topology_hash TEXT,
                     status TEXT NOT NULL DEFAULT 'running',
                     finished_at REAL
                 );
@@ -248,6 +461,10 @@ class SQLiteStore:
                     finished_at REAL,
                     trace_path TEXT,
                     config_hash TEXT,
+                    topology_hash TEXT,
+                    interactive INTEGER NOT NULL DEFAULT 0,
+                    launch_id TEXT,
+                    pid INTEGER,
                     state_json TEXT,
                     state_seq INTEGER NOT NULL DEFAULT 0,
                     seq INTEGER NOT NULL DEFAULT 0,
@@ -326,6 +543,27 @@ class SQLiteStore:
                     FOREIGN KEY(run_id) REFERENCES runs(run_id)
                 );
 
+                CREATE TABLE IF NOT EXISTS state_snapshots (
+                    run_id TEXT NOT NULL,
+                    snapshot_seq INTEGER NOT NULL,
+                    event_seq INTEGER NOT NULL,
+                    ts REAL NOT NULL,
+                    source TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    PRIMARY KEY (run_id, snapshot_seq),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS ui_stream (
+                    run_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    ts REAL NOT NULL,
+                    kind TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    PRIMARY KEY (run_id, seq),
+                    FOREIGN KEY(run_id) REFERENCES runs(run_id)
+                );
+
                 CREATE TABLE IF NOT EXISTS diagnosis_attempts (
                     run_id TEXT NOT NULL,
                     seq INTEGER NOT NULL,
@@ -380,15 +618,24 @@ class SQLiteStore:
                 CREATE INDEX IF NOT EXISTS idx_tool_calls_run_status ON tool_calls(run_id, status);
                 CREATE INDEX IF NOT EXISTS idx_artifacts_run_kind ON run_artifacts(run_id, kind, seq);
                 CREATE INDEX IF NOT EXISTS idx_llm_requests_run ON llm_requests(run_id, req_id);
+                CREATE INDEX IF NOT EXISTS idx_state_snapshots_run ON state_snapshots(run_id, snapshot_seq);
+                CREATE INDEX IF NOT EXISTS idx_ui_stream_run ON ui_stream(run_id, seq);
                 """
             )
             existing = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
             for column, definition in RUN_COLUMNS.items():
                 if column not in existing:
                     conn.execute(f"ALTER TABLE runs ADD COLUMN {column} {definition}")
+            batch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+            if "topology_hash" not in batch_columns:
+                conn.execute("ALTER TABLE batches ADD COLUMN topology_hash TEXT")
+            conn.execute("UPDATE batches SET backend='ollama' WHERE backend='kaggle'")
+            conn.execute("UPDATE runs SET backend='ollama' WHERE backend='kaggle'")
+            conn.execute("UPDATE messages SET backend='ollama' WHERE backend='kaggle'")
+            conn.execute("UPDATE llm_requests SET backend='ollama' WHERE backend='kaggle'")
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(version, applied_at, notes) VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, self._now(), "event-log-first schema"),
+                (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, and UI stream"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -423,14 +670,15 @@ class SQLiteStore:
         runs_requested: int = 0,
         reset_cmd: str = "",
         config_hash: str = "",
+        topology_hash: str | None = None,
     ) -> str:
         batch_id = batch_id or f"batch-{uuid.uuid4().hex[:12]}"
         with self._connect() as conn:
             conn.execute(
                 """INSERT OR IGNORE INTO batches(
                        batch_id, created_at, command_json, scenario_ids_json, backend,
-                       seed_start, runs_requested, reset_cmd, config_hash, status
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')""",
+                       seed_start, runs_requested, reset_cmd, config_hash, topology_hash, status
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running')""",
                 (
                     batch_id,
                     self._now(),
@@ -441,6 +689,7 @@ class SQLiteStore:
                     runs_requested,
                     reset_cmd,
                     config_hash,
+                    topology_hash,
                 ),
             )
         return batch_id
@@ -481,6 +730,10 @@ class SQLiteStore:
             "started_at": fields.get("started_at", self._now()),
             "updated_at": self._now(),
             "config_hash": fields.get("config_hash"),
+            "topology_hash": fields.get("topology_hash"),
+            "interactive": fields.get("interactive", False),
+            "launch_id": fields.get("launch_id"),
+            "pid": fields.get("pid"),
         }
         columns = list(payload)
         values = [self._db_value(column, payload[column]) for column in columns]
@@ -907,19 +1160,79 @@ class SQLiteStore:
             cached.setdefault("trace_path", row.get("trace_path") or f"traces/{run_id}.jsonl")
             return cached
         rebuilt = self.rebuild_state(run_id)
-        self.set_state(run_id, rebuilt)
+        self.set_state(run_id, rebuilt, source="rebuild")
         return rebuilt
 
-    def set_state(self, run_id: str, state: dict[str, Any]) -> None:
+    def set_state(self, run_id: str, state: dict[str, Any], source: str = "checkpoint") -> None:
         cache = dict(state)
         cache.pop("messages", None)
-        seq = int(cache.get("seq") or self.get_run(run_id).get("seq") or 0)
-        cache["seq"] = seq
+        seq = int(cache.get("seq") or 0)
         with self._connect() as conn:
+            if not seq:
+                row = conn.execute("SELECT seq FROM runs WHERE run_id=?", (run_id,)).fetchone()
+                seq = int((row["seq"] if row else 0) or 0)
+            cache["seq"] = seq
+            now = self._now()
+            payload = self._dumps(cache)
             conn.execute(
                 "UPDATE runs SET state_json=?, state_seq=?, updated_at=? WHERE run_id=?",
-                (self._dumps(cache), seq, self._now(), run_id),
+                (payload, seq, now, run_id),
             )
+            snapshot_seq = conn.execute(
+                "SELECT COALESCE(MAX(snapshot_seq), 0) + 1 AS seq FROM state_snapshots WHERE run_id=?",
+                (run_id,),
+            ).fetchone()["seq"]
+            conn.execute(
+                """INSERT INTO state_snapshots(run_id, snapshot_seq, event_seq, ts, source, state_json)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (run_id, snapshot_seq, seq, now, source, payload),
+            )
+
+    def load_state_snapshots(self, run_id: str, limit: int | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM state_snapshots WHERE run_id=? ORDER BY snapshot_seq"
+        params: list[Any] = [run_id]
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(max(0, int(limit)))
+        with self._connect() as conn:
+            rows = conn.execute(sql, params).fetchall()
+        snapshots = []
+        for row in rows:
+            state = self._loads(row["state_json"], default={}) or {}
+            snapshot = dict(state)
+            snapshot.update({
+                "snapshot_seq": int(row["snapshot_seq"]),
+                "event_seq": int(row["event_seq"]),
+                "ts": float(row["ts"]),
+                "source": row["source"],
+            })
+            snapshots.append(snapshot)
+        return snapshots
+
+    def append_ui_chunk(self, run_id: str, kind: str, text: str) -> int:
+        with self._connect() as conn:
+            seq = conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM ui_stream WHERE run_id=?",
+                (run_id,),
+            ).fetchone()["seq"]
+            conn.execute(
+                "INSERT INTO ui_stream(run_id, seq, ts, kind, text) VALUES (?, ?, ?, ?, ?)",
+                (run_id, seq, self._now(), kind, text),
+            )
+        return int(seq)
+
+    def load_ui_stream(self, run_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM ui_stream WHERE run_id=? AND seq>? ORDER BY seq",
+                (run_id, after_seq),
+            ).fetchall()
+        return [{
+            "seq": int(row["seq"]),
+            "ts": float(row["ts"]),
+            "kind": row["kind"],
+            "text": row["text"],
+        } for row in rows]
 
     def record_from_row(self, row: dict[str, Any]) -> dict[str, Any]:
         record: dict[str, Any] = {}
@@ -933,9 +1246,12 @@ class SQLiteStore:
             else:
                 record[key] = value
         record["policy_violations"] = record.get("policy_violations") or []
-        for key in ("resume_count", "spec_hash", "scenario_version", "end_reason", "model", "backend"):
+        for key in ("resume_count", "spec_hash", "scenario_version", "end_reason", "model", "backend", "topology_hash", "launch_id", "pid"):
             if row.get(key) is not None:
                 record[key] = row[key]
+        if row.get("interactive") is not None:
+            record["interactive"] = bool(row["interactive"])
+        record["backend"] = normalize_backend(record.get("backend"))
         return record
 
     def finish_run(
@@ -1000,13 +1316,18 @@ class SQLiteStore:
         return self.get_run(run_id)
 
     def load_records(
-        self, include_resumed: bool = False, include_aborted: bool = False
+        self,
+        include_resumed: bool = False,
+        include_aborted: bool = False,
+        include_interactive: bool = False,
     ) -> list[dict[str, Any]]:
         clauses = ["status='finished'"]
         if not include_resumed:
             clauses.append("resume_count=0")
         if not include_aborted:
             clauses.append("(end_reason IS NULL OR end_reason != 'legacy_exploratory')")
+        if not include_interactive:
+            clauses.append("interactive=0")
         sql = "SELECT * FROM runs WHERE " + " AND ".join(clauses)
         sql += " ORDER BY COALESCE(started_at, 0), run_id"
         with self._connect() as conn:
@@ -1018,7 +1339,7 @@ class SQLiteStore:
         trace_dir = Path(trace_dir)
         runs_path.parent.mkdir(parents=True, exist_ok=True)
         trace_dir.mkdir(parents=True, exist_ok=True)
-        records = self.load_records(include_resumed=True)
+        records = self.load_records(include_resumed=True, include_interactive=True)
         runs_path.write_text(
             "".join(json.dumps(record, sort_keys=True) + "\n" for record in records),
             encoding="utf-8",
@@ -1026,17 +1347,39 @@ class SQLiteStore:
         with self._connect() as conn:
             run_ids = [row["run_id"] for row in conn.execute("SELECT run_id FROM runs")]
         trace_count = 0
+        snapshot_count = 0
+        stream_count = 0
         for run_id in run_ids:
             events = self.load_events(run_id)
-            if not events:
-                continue
-            target = trace_dir / f"{run_id}.jsonl"
-            target.write_text(
-                "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
-                encoding="utf-8",
-            )
-            trace_count += 1
-        return {"runs": len(records), "traces": trace_count}
+            if events:
+                target = trace_dir / f"{run_id}.jsonl"
+                target.write_text(
+                    "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+                    encoding="utf-8",
+                )
+                trace_count += 1
+            snapshots = self.load_state_snapshots(run_id)
+            if snapshots:
+                target = trace_dir / f"{run_id}.snapshots.jsonl"
+                target.write_text(
+                    "".join(json.dumps(snapshot, sort_keys=True) + "\n" for snapshot in snapshots),
+                    encoding="utf-8",
+                )
+                snapshot_count += len(snapshots)
+            chunks = self.load_ui_stream(run_id)
+            if chunks:
+                target = trace_dir / f"{run_id}.ui.jsonl"
+                target.write_text(
+                    "".join(json.dumps(chunk, sort_keys=True) + "\n" for chunk in chunks),
+                    encoding="utf-8",
+                )
+                stream_count += len(chunks)
+        return {
+            "runs": len(records),
+            "traces": trace_count,
+            "snapshots": snapshot_count,
+            "stream_chunks": stream_count,
+        }
 
     def import_legacy(
         self, runs_path: str | Path = "runs.jsonl", trace_dir: str | Path = "traces"
@@ -1088,6 +1431,7 @@ class SQLiteStore:
                     except ValueError:
                         continue
             timestamps = [float(event["ts"]) for event in events if isinstance(event.get("ts"), (int, float))]
+            backend = normalize_backend(record.get("backend", "unknown"))
 
             self.create_run(
                 str(run_id),
@@ -1095,7 +1439,7 @@ class SQLiteStore:
                 scenario_id=scenario_id,
                 scenario_version=version,
                 spec_hash="legacy",
-                backend=str(record.get("backend", "unknown")),
+                backend=backend,
                 seed=0,
                 status="aborted" if exploratory else "finished",
                 phase="legacy_import",
@@ -1109,6 +1453,7 @@ class SQLiteStore:
             }
             terminal_fields.update(
                 {
+                    "backend": backend,
                     "status": "aborted" if exploratory else "finished",
                     "phase": "legacy_import",
                     "end_reason": "legacy_exploratory" if exploratory else "imported",
@@ -1137,8 +1482,8 @@ class SQLiteStore:
         self.init_db()
         tables = [
             "scenarios", "batches", "runs", "messages", "tool_calls", "llm_requests",
-            "trace_events", "run_artifacts", "diagnosis_attempts", "policy_violations",
-            "scores", "score_reports",
+            "trace_events", "run_artifacts", "state_snapshots", "ui_stream",
+            "diagnosis_attempts", "policy_violations", "scores", "score_reports",
         ]
         counts: dict[str, int] = {}
         with self._connect() as conn:

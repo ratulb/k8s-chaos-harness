@@ -78,6 +78,8 @@ class TestBackends(unittest.TestCase):
         # Skip cleanly when no provider credentials are present; this keeps
         # offline development and CI without secrets green.
         cls.backends = configured_backends()
+        if os.environ.get("CHAOS_LIVE_BACKEND_TESTS") != "1":
+            raise unittest.SkipTest("Set CHAOS_LIVE_BACKEND_TESTS=1 for live backend smoke tests")
         if not cls.backends:
             raise unittest.SkipTest("No backends configured in .env")
 

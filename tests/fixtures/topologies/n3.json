@@ -1,0 +1,9 @@
+{
+  "nodes": ["node-1", "node-2", "node-3"],
+  "node_ips": {"node-1": "10.0.0.1", "node-2": "10.0.0.2", "node-3": "10.0.0.3"},
+  "etcd_members": [
+    {"id": "member-1", "name": "node-1", "node": "node-1", "peer_url": "https://10.0.0.1:2380"},
+    {"id": "member-2", "name": "node-2", "node": "node-2", "peer_url": "https://10.0.0.2:2380"},
+    {"id": "member-3", "name": "node-3", "node": "node-3", "peer_url": "https://10.0.0.3:2380"}
+  ]
+}

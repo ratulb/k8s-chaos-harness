@@ -13,11 +13,12 @@ import shlex
 import socket
 import subprocess
 import sys
-import time
 from functools import lru_cache
 from pathlib import Path
 
-ROLES = ("first", "second", "third")
+from tools import topology
+
+ROLES = topology.ORDINAL_ROLES
 CACHE_PATH = Path.home() / ".cache" / "k8s-chaos-harness" / "node_ips.json"
 
 
@@ -72,39 +73,16 @@ def _installer_node_ips() -> dict[str, str]:
 
 @lru_cache(maxsize=1)
 def nodes() -> list[str]:
-    """Return control-plane node names, from config or Kubernetes discovery."""
+    """Return control-plane node names from frozen topology, config, or discovery."""
+    frozen = topology.frozen_topology()
+    if frozen:
+        return list(frozen["control_planes"])
+
     configured = os.environ.get("K8S_NODES", "").strip()
     if configured:
-        found = [n for n in configured.replace(",", " ").split() if n]
-        if len(found) < 3:
-            raise RuntimeError("K8S_NODES must contain at least three node names")
-        return found[:3]
+        return [name for name in configured.replace(",", " ").split() if name]
 
-    last_error = "unknown error"
-    for _ in range(12):
-        try:
-            proc = subprocess.run(
-                ["kubectl", "get", "nodes", "-o", "json", "--request-timeout=10s"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            if proc.returncode == 0:
-                found = sorted(item["metadata"]["name"] for item in json.loads(proc.stdout)["items"])
-                if len(found) >= 3:
-                    return found[:3]
-                last_error = f"expected at least three nodes, discovered {found}"
-            else:
-                last_error = proc.stderr.strip()
-        except Exception as exc:
-            last_error = str(exc)
-        time.sleep(5)
-
-    installed = sorted(_installer_node_ips())
-    if len(installed) >= 3:
-        return installed[:3]
-    raise RuntimeError(f"cannot discover nodes: {last_error}")
+    return list(topology.discover_topology()["control_planes"])
 
 
 def node_by_role(role: str) -> str:
@@ -112,15 +90,19 @@ def node_by_role(role: str) -> str:
     all_nodes = nodes()
     if role in all_nodes:
         return role
-    if role.isdigit() and 1 <= int(role) <= len(all_nodes):
-        return all_nodes[int(role) - 1]
-    if role in ROLES:
-        return all_nodes[ROLES.index(role)]
+    index = topology.ordinal_index(role)
+    if index is not None:
+        if index <= len(all_nodes):
+            return all_nodes[index - 1]
+        raise RuntimeError(f"node role {role!r} exceeds {len(all_nodes)} discovered node(s)")
     raise RuntimeError(f"unknown node role {role!r}; expected one of {all_nodes} or {ROLES}")
 
 
 def default_node() -> str:
     """Return a stable probe node; operators may override with PROBE_NODE."""
+    frozen = topology.frozen_topology()
+    if frozen and not os.environ.get("PROBE_NODE", "").strip():
+        return frozen["probe_node"]
     override = os.environ.get("PROBE_NODE", "").strip()
     return node_by_role(override) if override else node_by_role("first")
 
@@ -162,6 +144,19 @@ def cache_node_ips() -> None:
     CACHE_PATH.write_text(json.dumps(mapping, indent=2) + "\n", encoding="utf-8")
 
 
+def clear_ip_cache(path: Path | None = None) -> bool:
+    target = path or CACHE_PATH
+    removed = False
+    try:
+        target.unlink()
+        removed = True
+    except FileNotFoundError:
+        pass
+    nodes.cache_clear()
+    _installer_node_ips.cache_clear()
+    return removed
+
+
 def node_ip(node: str) -> str:
     """Resolve a node's InternalIP via Kubernetes, env, or a saved cache."""
     try:
@@ -170,6 +165,12 @@ def node_ip(node: str) -> str:
         # During a fault kubectl discovery may fail; an explicit node name is
         # still usable with env/cache lookups.
         resolved = node
+
+    frozen = topology.frozen_topology()
+    if frozen:
+        for detail in frozen.get("node_details", []):
+            if detail.get("name") == resolved and detail.get("ip"):
+                return detail["ip"]
 
     overrides = {**_installer_node_ips(), **_cached_ip_map(), **_env_ip_map()}
     if resolved in overrides:
@@ -208,19 +209,35 @@ def ssh_cmd(node: str) -> list[str]:
 
 def shell_env() -> str:
     """Return shell assignments for bash scripts that need node metadata."""
-    all_nodes = nodes()
-    values = [f"NODES=({' '.join(shlex.quote(n) for n in all_nodes)})"]
+    frozen = topology.frozen_topology()
+    all_nodes = list(frozen["all_nodes"]) if frozen else nodes()
+    control_planes = list(frozen["control_planes"]) if frozen else nodes()
+    etcd_members = [member["name"] for member in frozen["etcd_members"]] if frozen else control_planes
+    quorum_loss_nodes = list(frozen["quorum_loss_nodes"]) if frozen else []
+    member_count = len(etcd_members)
+    values = [f"NODES=({' '.join(shlex.quote(n) for n in control_planes)})"]
+    values.append(f"ALL_NODES=({' '.join(shlex.quote(n) for n in all_nodes)})")
+    values.append(f"CONTROL_PLANES=({' '.join(shlex.quote(n) for n in control_planes)})")
+    values.append(f"ETCD_MEMBERS=({' '.join(shlex.quote(n) for n in etcd_members)})")
+    values.append(f"QUORUM_LOSS_NODES=({' '.join(shlex.quote(n) for n in quorum_loss_nodes)})")
+    values.append(f"NODE_COUNT={len(all_nodes)}")
+    values.append(f"CONTROL_PLANE_COUNT={len(control_planes)}")
+    values.append(f"ETCD_MEMBER_COUNT={member_count}")
+    values.append(f"QUORUM={topology.quorum_for(member_count) if member_count else 0}")
+    values.append(f"QUORUM_LOSS_TARGETS={topology.quorum_loss_target_count(member_count)}")
     values.append(f"SSH_USER={shlex.quote(ssh_user())}")
     values.append(f"SSH_KEY={shlex.quote(ssh_key())}")
-    for idx, role in enumerate(ROLES):
-        values.append(f"{role.upper()}_NODE={shlex.quote(all_nodes[idx])}")
+    for idx, node in enumerate(all_nodes):
+        role = ROLES[idx] if idx < len(ROLES) else topology.ordinal_name(idx + 1)
+        values.append(f"{role.upper()}_NODE={shlex.quote(node)}")
+        values.append(f"NODE_{idx + 1}={shlex.quote(node)}")
     values.append(f"PROBE_NODE={shlex.quote(default_node())}")
     return "\n".join(values) + "\n"
 
 
 def main() -> None:
     if len(sys.argv) < 2:
-        raise SystemExit("usage: cluster_config.py nodes|ip NODE|ssh-target NODE|first|second|third|probe|env|cache-ips")
+        raise SystemExit("usage: cluster_config.py nodes|ip NODE|ssh-target NODE|ROLE|probe|env|cache-ips|clear-cache")
     cmd = sys.argv[1]
     if cmd == "nodes":
         print("\n".join(nodes()))
@@ -237,6 +254,9 @@ def main() -> None:
     elif cmd == "cache-ips":
         cache_node_ips()
         print(f"cached node IPs in {CACHE_PATH}")
+    elif cmd == "clear-cache":
+        removed = clear_ip_cache()
+        print(f"cleared node IP cache {CACHE_PATH}" if removed else f"no node IP cache at {CACHE_PATH}")
     else:
         raise SystemExit(f"unknown command: {cmd}")
 

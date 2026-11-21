@@ -5,9 +5,19 @@
   "acceptable_repairs": ["member_remove_readd", "kube_etcd_switch_rebuild"],
   "forbidden_repairs": ["snapshot_restore_full"],
   "inject": "faults/etcd_member_wiped.sh $TARGET_NODE",
-
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,
-  "max_tokens": 60000
+  "max_tokens": 60000,
+  "risk": "destructive",
+  "menu": {
+    "label": "Etcd member wiped",
+    "summary": "Stop one etcd member and wipe its data directory."
+  },
+  "min_etcd_members": 1,
+  "selector_requirements": {
+    "min_targets": 1,
+    "allowed": ["role", "index", "node"]
+  },
+  "impact_class": "single_member_fault"
 }

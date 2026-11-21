@@ -2,7 +2,7 @@
 # Install/launch Ollama and pull a model.
 #
 # Usage:
-#   scripts/install_ollama.sh                 # default: Kaggle-sized qwen3.8:27b
+#   scripts/install_ollama.sh                 # default: qwen3.8:27b
 #   scripts/install_ollama.sh small            # local-friendly qwen3:8b
 #   scripts/install_ollama.sh qwen3:8b         # explicit model
 #   MODEL=qwen3:8b scripts/install_ollama.sh   # env override

@@ -13,7 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from storage.sqlite_store import SQLiteStore
 
 
-def load(path: str, include_resumed: bool = False) -> list[dict]:
+def load(
+    path: str,
+    include_resumed: bool = False,
+    include_interactive: bool = False,
+) -> list[dict]:
     p = Path(path)
     if not p.exists():
         return []
@@ -30,6 +34,10 @@ def load(path: str, include_resumed: bool = False) -> list[dict]:
             continue
         # Resumed runs contain interventions and are excluded from headline rates.
         if not include_resumed and rec.get("resume_count", 0):
+            continue
+        if not include_interactive and rec.get("interactive"):
+            continue
+        if rec.get("status") == "skipped_unsupported" or "unsupported" in str(rec.get("end_reason", "")):
             continue
         out.append(rec)
     return out
@@ -67,13 +75,21 @@ def main() -> None:
     ap.add_argument("--db", default=None)
     ap.add_argument("--format", choices=["json", "md"], default="md")
     ap.add_argument("--include-resumed", action="store_true")
+    ap.add_argument("--include-interactive", action="store_true")
     args = ap.parse_args()
 
     if args.db:
         with SQLiteStore(args.db) as store:
-            recs = store.load_records(include_resumed=args.include_resumed)
+            recs = store.load_records(
+                include_resumed=args.include_resumed,
+                include_interactive=args.include_interactive,
+            )
     else:
-        recs = load(args.runs, include_resumed=args.include_resumed)
+        recs = load(
+            args.runs,
+            include_resumed=args.include_resumed,
+            include_interactive=args.include_interactive,
+        )
 
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     by_backend: dict[str, list[dict]] = defaultdict(list)

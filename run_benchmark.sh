@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-command benchmark wrapper: DB init/import, run, then score.
+# One-command benchmark wrapper: DB init, run, then score.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -17,6 +17,5 @@ for arg in "$@"; do
 done
 
 python3 "$ROOT/db_cli.py" --db "$DB" init
-python3 "$ROOT/db_cli.py" --db "$DB" import-legacy
 python3 "$ROOT/run_benchmark.py" --db "$DB" "$@"
 python3 "$ROOT/score.py" --db "$DB" --format md

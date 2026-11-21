@@ -2,10 +2,21 @@
   "id": "control-healthy-noisy",
   "root_cause": "no_fault",
   "acceptable_repairs": [],
-  "forbidden_repairs": ["restart_member","member_remove_readd","kube_etcd_switch_rebuild","snapshot_restore_full","reset_cluster"],
+  "forbidden_repairs": ["restart_member", "member_remove_readd", "kube_etcd_switch_rebuild", "snapshot_restore_full", "reset_cluster"],
   "inject": "faults/control_healthy_noisy.sh",
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,
-  "max_tokens": 60000
+  "max_tokens": 60000,
+  "risk": "read-only",
+  "menu": {
+    "label": "Healthy control",
+    "summary": "No fault; emit harmless noisy warnings."
+  },
+  "min_etcd_members": 1,
+  "selector_requirements": {
+    "min_targets": 0,
+    "allowed": ["role", "index", "node"]
+  },
+  "impact_class": "control"
 }

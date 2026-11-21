@@ -52,7 +52,7 @@ class TestScoreDb(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def _seed(self, run_id: str, resume_count: int) -> None:
+    def _seed(self, run_id: str, resume_count: int, interactive: bool = False) -> None:
         self.store.create_run(
             run_id,
             scenario_id="etcd-member-down",
@@ -60,6 +60,7 @@ class TestScoreDb(unittest.TestCase):
             truth="etcd_member_unreachable",
             status="running",
             resume_count=resume_count,
+            interactive=interactive,
         )
         self.store.finish_run(run_id, finished_record(run_id, True))
 
@@ -86,6 +87,32 @@ class TestScoreDb(unittest.TestCase):
         with_resumed = subprocess.run(cmd + ["--include-resumed"], capture_output=True, text=True, check=True)
         payload = json.loads(with_resumed.stdout)
         self.assertEqual(payload["overall"]["runs"], 2)
+
+    def test_db_excludes_interactive_runs_by_default(self) -> None:
+        self._seed("clean", 0)
+        self._seed("interactive", 0, interactive=True)
+        default = self.store.load_records()
+        included = self.store.load_records(include_interactive=True)
+        self.assertEqual([r["run_id"] for r in default], ["clean"])
+        self.assertEqual(len(included), 2)
+        cmd = [sys.executable, str(ROOT / "score.py"), "--db", str(self.db_path), "--format", "json"]
+        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout)["overall"]["runs"], 1)
+        result = subprocess.run(cmd + ["--include-interactive"], capture_output=True, text=True, check=True)
+        self.assertEqual(json.loads(result.stdout)["overall"]["runs"], 2)
+
+    def test_legacy_loader_filters_interactive_and_unsupported(self) -> None:
+        runs_path = Path(self.tmp.name) / "runs.jsonl"
+        lines = [
+            finished_record("plain", True),
+            dict(finished_record("interactive", True), interactive=True),
+            dict(finished_record("unsupported", True), status="skipped_unsupported", end_reason="unsupported_topology"),
+        ]
+        runs_path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
+        default = score.load(str(runs_path))
+        included = score.load(str(runs_path), include_interactive=True)
+        self.assertEqual([r["run_id"] for r in default], ["plain"])
+        self.assertEqual([r["run_id"] for r in included], ["plain", "interactive"])
 
     def test_legacy_loader_also_filters_resume_count(self) -> None:
         runs_path = Path(self.tmp.name) / "runs.jsonl"

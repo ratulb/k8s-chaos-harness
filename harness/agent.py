@@ -9,6 +9,7 @@ from typing import Any
 
 from llm.client import LLMClient
 from tools import cluster_config
+from tools import topology as topology_tools
 from tools.schemas import build_tools, REPAIR_TOOLS, DIAGNOSIS_TOOL, ROOT_CAUSE_LABELS
 from storage.sqlite_store import DESTRUCTIVE_TOOLS
 from tools import k8s, node_etcd as netcd
@@ -97,10 +98,22 @@ def normalize_diagnosis(value: object) -> str | None:
     return text
 
 
-def system_prompt() -> str:
-    return f"""You are an etcd fault diagnosis and repair agent for a 3-control-plane Kubernetes cluster.
+def system_prompt(topology: dict | None = None) -> str:
+    control_planes = list(topology.get("control_planes") or []) if topology else cluster_config.nodes()
+    probe = topology.get("probe_node") if topology else None
+    probe = probe or cluster_config.default_node()
+    count = len(control_planes)
+    if topology and count:
+        quorum_line = (
+            f"Etcd quorum is {topology['quorum']} of {count}; stopping "
+            f"{topology['quorum_loss_targets']} member(s) removes write quorum."
+        )
+    else:
+        quorum_line = "Quorum depends on the live etcd member count; confirm it with etcdctl_member_list."
+    return f"""You are an etcd fault diagnosis and repair agent for a {count}-control-plane Kubernetes cluster.
 
-The discoverable node names are: {', '.join(cluster_config.nodes())}. Use only those exact names for node arguments.
+The discoverable node names are: {', '.join(control_planes)}. Use only those exact names for node arguments.
+The default probe node is {probe}.
 Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
 root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
 
@@ -109,9 +122,26 @@ If the diagnosis is rejected, do not repair and do not brute-force labels; gathe
 Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
 Investigate briefly: use at most four assistant turns of read-only tools, then call submit_diagnosis immediately. Do not keep investigating once the likely root cause is clear.
 A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
-A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. Two stopped members are etcd_quorum_loss.
+A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. {quorum_line}
 A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
 Choose only repairs allowed by the scenario. Keep steps efficient."""
+
+
+def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
+    redacted = json.loads(json.dumps(message))
+    for call in redacted.get("tool_calls") or []:
+        function = call.get("function") or {}
+        raw = function.get("arguments")
+        if not raw:
+            continue
+        try:
+            args = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        if isinstance(args, dict) and "approval_token" in args:
+            args.pop("approval_token", None)
+            function["arguments"] = json.dumps(args)
+    return redacted
 
 
 def run_scenario(
@@ -128,6 +158,11 @@ def run_scenario(
     setup_output: str = "",
     store: Any = None,
     resume: bool = False,
+    reporter: Any = None,
+    log_path: str | None = None,
+    approve: str = "policy",
+    pause_reporter: Any = None,
+    resume_reporter: Any = None,
 ) -> dict:
     """Run the agent loop with append-only checkpointing when a store is present."""
     Path(trace_dir).mkdir(parents=True, exist_ok=True)
@@ -139,9 +174,20 @@ def run_scenario(
         trace.append(event)
         with trace_path.open("a") as f:
             f.write(json.dumps(event) + "\n")
+        event_type = str(event.get("type", "unknown"))
+        if event_type == "assistant":
+            message = event.get("message", {}) or {}
+            ui_text = message.get("content") or message.get("reasoning") or ""
+        elif event_type == "tool":
+            ui_text = f"{event.get('name', '?')}: {event.get('status', '?')} {event.get('result', '')}"
+        elif event_type == "approval":
+            ui_text = f"diagnosis={event.get('diagnosis', '?')} granted={event.get('granted')}"
+        else:
+            ui_text = json.dumps(event, sort_keys=True, default=str)
+        emit(event_type, ui_text)
         if store is None:
             return 0
-        return int(store.add_event(run_id, str(event.get("type", "unknown")), event))
+        return int(store.add_event(run_id, event_type, event))
 
     def artifact(kind: str, payload: Any, content_type: str = "application/json") -> None:
         if store is None:
@@ -149,11 +195,19 @@ def run_scenario(
         content = payload if isinstance(payload, str) else (json.dumps(payload, sort_keys=True, default=str) or "null")
         store.add_artifact(run_id, kind, content, content_type)
 
+    def emit(kind: str, text: Any) -> None:
+        if reporter is None:
+            return
+        try:
+            reporter.emit(kind, text)
+        except Exception:
+            pass
+
     state = store.get_state(run_id) if (store is not None and resume) else {}
     messages: list[dict[str, Any]] = store.load_messages(run_id) if (store is not None and resume) else []
     if not messages:
         messages = [
-            {"role": "system", "content": system_prompt()},
+            {"role": "system", "content": system_prompt(topology_tools.frozen_topology())},
             {"role": "user", "content": "Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."},
         ]
         if store is not None:
@@ -164,6 +218,8 @@ def run_scenario(
     diagnosis_raw = state.get("diagnosis_raw")
     diagnosis_submitted = bool(state.get("diagnosis_submitted", diagnosis is not None))
     approval_token = state.get("approval_token")
+    diagnosis_correct = bool(state.get("diagnosis_correct", False))
+    approval_source = state.get("approval_source")
     repair = state.get("repair")
     repair_args = state.get("repair_args")
     policy_violations: list[str] = list(state.get("policy_violations") or [])
@@ -188,6 +244,8 @@ def run_scenario(
             "diagnosis_raw": diagnosis_raw,
             "diagnosis_submitted": diagnosis_submitted,
             "approval_token": approval_token,
+            "diagnosis_correct": diagnosis_correct,
+            "approval_source": approval_source,
             "repair": repair,
             "repair_args": repair_args,
             "policy_violations": policy_violations,
@@ -226,7 +284,13 @@ def run_scenario(
         steps += 1
         started = time.time()
         try:
-            resp = client.chat(messages, tools=build_tools(), temperature=0.2, max_tokens=2048)
+            resp = client.chat(
+                messages,
+                tools=build_tools(),
+                temperature=0.2,
+                max_tokens=2048,
+                on_chunk=(lambda text: emit("assistant_delta", text)) if reporter is not None else None,
+            )
         except Exception as e:
             llm_error = True
             end_reason = "error"
@@ -260,7 +324,7 @@ def run_scenario(
                 tokens=total_tokens,
                 backend=getattr(backend, "name", "unknown"),
             )
-        log({"type": "assistant", "message": msg})
+        log({"type": "assistant", "message": _redact_message(msg) if approve == "prompt" else msg})
         checkpoint()
 
         tool_calls = msg.get("tool_calls") or []
@@ -284,6 +348,11 @@ def run_scenario(
                 args = json.loads(tc["function"].get("arguments") or "{}")
             except Exception:
                 args = {}
+            log_args = (
+                {key: value for key, value in args.items() if key != "approval_token"}
+                if approve == "prompt" and isinstance(args, dict)
+                else args
+            )
             result = ""
             call_status = "finished"
             approved_by = None
@@ -292,19 +361,49 @@ def run_scenario(
             mutating = name in REPAIR_TOOLS
             destructive = name in DESTRUCTIVE_TOOLS
             if store is not None:
-                store.begin_tool_call(run_id, call_id, len(messages) - 1, name, args, mutating, destructive)
+                store.begin_tool_call(run_id, call_id, len(messages) - 1, name, log_args, mutating, destructive)
 
             if name == DIAGNOSIS_TOOL:
                 diagnosis_raw = args.get("root_cause")
                 diagnosis = normalize_diagnosis(diagnosis_raw)
                 diagnosis_submitted = True
-                accepted = diagnosis == scenario["root_cause"]
-                approval_token = f"approved:{run_id}" if accepted else None
-                result = f"diagnosis accepted; approval_token={approval_token}" if accepted else "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
-                approved_by = "policy" if accepted else None
-                log({"type": "approval", "granted": accepted, "diagnosis": diagnosis, "raw": diagnosis_raw, "approval_token": approval_token})
+                diagnosis_correct = diagnosis == scenario["root_cause"]
+                approved = diagnosis_correct
+                if approved and approve == "prompt":
+                    if pause_reporter is not None:
+                        pause_reporter()
+                    try:
+                        try:
+                            answer = input(f"Approve repair for {diagnosis}? [y/N] ").strip().lower()
+                        except EOFError:
+                            answer = ""
+                    finally:
+                        if resume_reporter is not None:
+                            resume_reporter()
+                    approved = answer in {"y", "yes"}
+                    approval_source = "operator"
+                elif approved:
+                    approval_source = "policy"
+                approval_token = f"approved:{run_id}" if approved else None
+                if not diagnosis_correct:
+                    result = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
+                elif approve == "prompt" and not approved:
+                    result = "diagnosis correct; operator declined repair approval"
+                elif approve == "prompt":
+                    result = "diagnosis accepted; approval_token suppressed (prompt mode)"
+                else:
+                    result = f"diagnosis accepted; approval_token={approval_token}"
+                approved_by = approval_source if approved else None
+                log({
+                    "type": "approval",
+                    "granted": approved,
+                    "diagnosis": diagnosis,
+                    "diagnosis_correct": diagnosis_correct,
+                    "mode": approve,
+                    "raw": diagnosis_raw,
+                })
                 if store is not None:
-                    store.add_diagnosis_attempt(run_id, diagnosis_raw, diagnosis, accepted)
+                    store.add_diagnosis_attempt(run_id, diagnosis_raw, diagnosis, diagnosis_correct)
                     store.update_tool_call_status(run_id, call_id, "started")
             elif name in REPAIR_TOOLS:
                 safe_args = {k: v for k, v in args.items() if k != "approval_token"}
@@ -312,7 +411,11 @@ def run_scenario(
                 if not diagnosis_submitted:
                     reason = "BLOCKED: diagnosis required first"
                 elif approval_token is None:
-                    reason = "BLOCKED: diagnosis rejected; no approval token"
+                    reason = (
+                        "BLOCKED: approval not granted"
+                        if diagnosis_correct
+                        else "BLOCKED: diagnosis rejected; no approval token"
+                    )
                 elif args.get("approval_token") != approval_token:
                     reason = "BLOCKED: missing or invalid approval_token"
                 elif name in forbidden:
@@ -329,7 +432,7 @@ def run_scenario(
                     if store is not None:
                         store.add_policy_violation(run_id, name, reason)
                 else:
-                    approved_by = "policy"
+                    approved_by = approval_source or ("operator" if approve == "prompt" else "policy")
                     if store is not None:
                         store.update_tool_call_status(run_id, call_id, "started")
                     checkpoint()
@@ -361,7 +464,7 @@ def run_scenario(
             messages.append(tool_msg)
             if store is not None:
                 store.append_message(run_id, "tool", result, tool_call_id=tc["id"], backend=getattr(backend, "name", "unknown"))
-            log({"type": "tool", "name": name, "args": args, "result": result, "status": call_status, "mutating": mutating})
+            log({"type": "tool", "name": name, "args": log_args, "result": result, "status": call_status, "mutating": mutating})
             checkpoint()
 
         if not diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
@@ -390,6 +493,17 @@ def run_scenario(
         verify_output = str(e)
     artifact("verify_output_full", {"output": verify_output})
     log({"type": "verify", "ok": verify_ok, "output": truncate(verify_output, 2000)})
+    if log_path:
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps({
+                    "ts": time.time(),
+                    "cmd": verify_cmd,
+                    "ok": verify_ok,
+                    "output": verify_output,
+                }, sort_keys=True) + "\n")
+        except OSError:
+            pass
 
     record = {
         "run_id": run_id,

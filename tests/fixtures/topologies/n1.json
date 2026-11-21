@@ -1,0 +1,7 @@
+{
+  "nodes": ["node-1"],
+  "node_ips": {"node-1": "10.0.0.1"},
+  "etcd_members": [
+    {"id": "member-1", "name": "node-1", "node": "node-1", "peer_url": "https://10.0.0.1:2380"}
+  ]
+}

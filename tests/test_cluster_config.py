@@ -12,15 +12,16 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from tools import cluster_config
+from tools import topology
 
 
 class TestClusterConfig(unittest.TestCase):
     def setUp(self):
-        # nodes() is cached; clear it so each test can install its own env.
+        topology.clear_frozen_topology()
         cluster_config.nodes.cache_clear()
 
     def tearDown(self):
-        # Avoid leaking synthetic node names into later tests in the same run.
+        topology.clear_frozen_topology()
         cluster_config.nodes.cache_clear()
 
     def test_env_overrides_discovery(self):
@@ -40,6 +41,17 @@ class TestClusterConfig(unittest.TestCase):
             self.assertEqual(cluster_config.node_by_role("2"), "node-b")
             self.assertEqual(cluster_config.node_by_role("node-c"), "node-c")
 
+    def test_env_accepts_arbitrary_member_counts(self):
+        names = [f"node-{index}" for index in range(1, 8)]
+        with patch.dict(os.environ, {"K8S_NODES": ",".join(names)}):
+            self.assertEqual(cluster_config.nodes(), names)
+            self.assertEqual(cluster_config.node_by_role("seventh"), "node-7")
+            self.assertEqual(cluster_config.node_by_role("7"), "node-7")
+        cluster_config.nodes.cache_clear()
+        with patch.dict(os.environ, {"K8S_NODES": "single-node"}):
+            self.assertEqual(cluster_config.nodes(), ["single-node"])
+            self.assertEqual(cluster_config.node_by_role("first"), "single-node")
+
     def test_ssh_user_override(self):
         # SSH_USER may be empty (use current account) or explicitly overridden;
         # neither case should bake in an Azure-specific login name.
@@ -58,6 +70,10 @@ class TestClusterConfig(unittest.TestCase):
         self.assertIn('FIRST_NODE=node-a', out)
         self.assertIn('SECOND_NODE=node-b', out)
         self.assertIn('THIRD_NODE=node-c', out)
+        self.assertIn('NODE_COUNT=3', out)
+        self.assertIn('ETCD_MEMBER_COUNT=3', out)
+        self.assertIn('QUORUM=2', out)
+        self.assertIn('QUORUM_LOSS_TARGETS=2', out)
         self.assertIn('SSH_USER=operator', out)
 
 

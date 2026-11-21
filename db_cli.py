@@ -70,7 +70,8 @@ def main() -> None:
         with store._connect() as conn:
             recent = [dict(row) for row in conn.execute(
                 """SELECT run_id, scenario_id, backend, status, phase, end_reason,
-                          resume_count, steps, tokens_used, updated_at
+                          resume_count, steps, tokens_used, updated_at,
+                          topology_hash, interactive, launch_id, pid
                    FROM runs ORDER BY updated_at DESC LIMIT ?""",
                 (args.limit,),
             )]

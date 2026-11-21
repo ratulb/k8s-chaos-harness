@@ -11,14 +11,16 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from storage.sqlite_store import SQLiteStore
+from storage.sqlite_store import RUN_COLUMNS, SQLiteStore, active_topology_hash, discard_state
 
 
 class TestSQLiteStore(unittest.TestCase):
@@ -69,8 +71,66 @@ class TestSQLiteStore(unittest.TestCase):
 
         report = self.store.doctor()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 2)
+        self.assertEqual(report["schema_version"], 3)
         self.assertEqual(report["counts"]["scenarios"], 2)
+
+    def test_v2_database_migrates_to_v3(self) -> None:
+        self.store.close()
+        self.db_path.unlink()
+        conn = sqlite3.connect(self.db_path)
+        conn.executescript(
+            """
+            CREATE TABLE schema_meta (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL,
+                notes TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE batches (
+                batch_id TEXT PRIMARY KEY,
+                created_at REAL NOT NULL,
+                command_json TEXT NOT NULL DEFAULT '{}',
+                scenario_ids_json TEXT NOT NULL DEFAULT '[]',
+                backend TEXT NOT NULL DEFAULT '',
+                seed_start INTEGER NOT NULL DEFAULT 0,
+                runs_requested INTEGER NOT NULL DEFAULT 0,
+                reset_cmd TEXT NOT NULL DEFAULT '',
+                config_hash TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                finished_at REAL
+            );
+            """
+        )
+        v3_columns = {"topology_hash", "interactive", "launch_id", "pid"}
+        run_columns = ", ".join(
+            f"{name} {definition}"
+            for name, definition in RUN_COLUMNS.items()
+            if name not in v3_columns
+        )
+        conn.execute(
+            f"CREATE TABLE runs ({run_columns}, FOREIGN KEY(batch_id) REFERENCES batches(batch_id))"
+        )
+        conn.execute(
+            "INSERT INTO schema_meta(version, applied_at, notes) VALUES (2, ?, 'v2')",
+            (SQLiteStore._now(),),
+        )
+        conn.execute("PRAGMA user_version=2")
+        conn.commit()
+        conn.close()
+
+        self.store = SQLiteStore(self.db_path)
+        with self.store._connect() as conn:
+            run_columns_after = {row["name"] for row in conn.execute("PRAGMA table_info(runs)")}
+            batch_columns_after = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
+            table_names = {row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        self.assertTrue(v3_columns.issubset(run_columns_after))
+        self.assertIn("topology_hash", batch_columns_after)
+        self.assertIn("state_snapshots", table_names)
+        self.assertIn("ui_stream", table_names)
+        report = self.store.doctor()
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["schema_version"], 3)
+        self.assertIn("state_snapshots", report["counts"])
+        self.assertIn("ui_stream", report["counts"])
 
     def test_append_only_messages_events_and_artifacts(self) -> None:
         self._make_run()
@@ -150,6 +210,45 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertEqual(state["diagnosis"], "etcd_member_unreachable")
         self.assertEqual(state["approval_token"], "approved:run-1")
 
+    def test_state_snapshots_and_ui_stream(self) -> None:
+        self._make_run()
+        self.store.add_event("run-1", "assistant", {"message": {"role": "assistant"}})
+        self.store.set_state("run-1", {"seq": 1, "diagnosis": "first"}, source="checkpoint")
+        self.store.set_state("run-1", {"seq": 1, "diagnosis": "second"}, source="final")
+        snapshots = self.store.load_state_snapshots("run-1")
+        self.assertEqual([item["source"] for item in snapshots], ["checkpoint", "final"])
+        self.assertEqual([item["snapshot_seq"] for item in snapshots], [1, 2])
+        self.assertEqual(snapshots[0]["event_seq"], 1)
+        self.assertEqual(snapshots[-1]["diagnosis"], "second")
+        self.assertEqual(len(self.store.load_state_snapshots("run-1", limit=1)), 1)
+
+        first = self.store.append_ui_chunk("run-1", "assistant_delta", "partial")
+        second = self.store.append_ui_chunk("run-1", "progress", "verifying")
+        self.assertEqual((first, second), (1, 2))
+        self.assertEqual(
+            [item["kind"] for item in self.store.load_ui_stream("run-1")],
+            ["assistant_delta", "progress"],
+        )
+        self.assertEqual([item["seq"] for item in self.store.load_ui_stream("run-1", after_seq=1)], [2])
+
+    def test_concurrent_writers_are_serialized(self) -> None:
+        self._make_run()
+
+        def write(worker: int) -> None:
+            for index in range(25):
+                self.store.append_ui_chunk("run-1", "worker", f"{worker}-{index}")
+                self.store.add_event("run-1", "worker", {"worker": worker, "index": index})
+
+        threads = [threading.Thread(target=write, args=(worker,)) for worker in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len(self.store.load_ui_stream("run-1")), 100)
+        self.assertEqual(len(self.store.load_events("run-1")), 100)
+        self.assertEqual(self.store.get_run("run-1")["seq"], 100)
+        self.assertTrue(self.store.doctor()["ok"])
+
     def test_finish_run_writes_terminal_fields_score_and_artifact(self) -> None:
         self._make_run()
         record = {
@@ -185,6 +284,50 @@ class TestSQLiteStore(unittest.TestCase):
             saved_score = conn.execute("SELECT * FROM scores WHERE run_id='run-1'").fetchone()
         self.assertEqual(saved_score["recovered"], 1)
         self.assertEqual(saved_score["repair_action"], "restart_member")
+
+    def test_discard_state_clears_epoch(self) -> None:
+        self._make_run()
+        self.store.update_run("run-1", topology_hash="old-topology", pid=-1)
+        self.store.add_event("run-1", "topology", {"topology_hash": "old-topology"})
+        self.store.close()
+        self.assertEqual(active_topology_hash(self.db_path), "old-topology")
+
+        runs_file = Path(self.tmp.name) / "runs.jsonl"
+        runs_file.write_text('{"run_id":"run-1"}\n', encoding="utf-8")
+        trace_dir = Path(self.tmp.name) / "traces"
+        trace_dir.mkdir()
+        trace = trace_dir / "run-1.jsonl"
+        trace.write_text('{}\n', encoding="utf-8")
+        ui_trace = trace_dir / "run-1.ui.jsonl"
+        ui_trace.write_text('{}\n', encoding="utf-8")
+        cache = Path(self.tmp.name) / "cache" / "node_ips.json"
+        cache.parent.mkdir()
+        cache.write_text("{}\n", encoding="utf-8")
+
+        summary = discard_state(self.db_path, runs_file, trace_dir, cache)
+        self.assertIn("run-1", summary["runs_aborted"])
+        self.assertTrue(summary["runs_jsonl_truncated"])
+        self.assertTrue(summary["reinitialized"])
+        self.assertEqual(runs_file.read_text(encoding="utf-8"), "")
+        self.assertFalse(trace.exists())
+        self.assertFalse(ui_trace.exists())
+        self.assertFalse(cache.exists())
+        self.assertIsNone(active_topology_hash(self.db_path))
+        reinitialized = SQLiteStore(self.db_path)
+        try:
+            self.assertEqual(reinitialized.doctor()["counts"]["runs"], 0)
+        finally:
+            reinitialized.close()
+
+    def test_discard_state_refuses_live_pid(self) -> None:
+        self._make_run()
+        self.store.update_run("run-1", topology_hash="old-topology", pid=os.getpid())
+        trace_dir = Path(self.tmp.name) / "traces"
+        trace_dir.mkdir()
+        with self.assertRaisesRegex(RuntimeError, "active runs are alive"):
+            discard_state(self.db_path, Path(self.tmp.name) / "runs.jsonl", trace_dir)
+        self.assertTrue(self.db_path.exists())
+        self.assertEqual(active_topology_hash(self.db_path), "old-topology")
 
 
 if __name__ == "__main__":

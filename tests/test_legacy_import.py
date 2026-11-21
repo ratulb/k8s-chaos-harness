@@ -19,11 +19,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from storage.sqlite_store import SQLiteStore
 
 
-def record(run_id: str, *, pre_gate: bool = False) -> dict:
+def record(run_id: str, *, pre_gate: bool = False, backend: str = "groq") -> dict:
     rec = {
         "run_id": run_id,
         "scenario": "etcd-member-down",
-        "backend": "groq",
+        "backend": backend,
         "truth": "etcd_member_unreachable",
         "diagnosis": "etcd_member_unreachable",
         "diagnosis_correct": True,
@@ -87,6 +87,23 @@ class TestLegacyImport(unittest.TestCase):
         second = self.store.import_legacy(self.runs_path, self.trace_dir)
         self.assertEqual(second["imported"], 0)
         self.assertEqual(second["skipped"], 4)
+
+    def test_legacy_kaggle_backend_normalizes_to_ollama(self) -> None:
+        legacy = record("legacy-kaggle", backend="kaggle")
+        self.runs_path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+        source_before = self.runs_path.read_text(encoding="utf-8")
+
+        self.store.import_legacy(self.runs_path, self.trace_dir)
+
+        with self.store._connect() as conn:
+            row = conn.execute(
+                "SELECT backend FROM runs WHERE run_id='legacy-kaggle'"
+            ).fetchone()
+        self.assertEqual(row["backend"], "ollama")
+        self.assertEqual(self.runs_path.read_text(encoding="utf-8"), source_before)
+
+        exported = self.store.load_records()
+        self.assertEqual(exported[0]["backend"], "ollama")
 
     def test_export_regenerates_jsonl_from_database(self) -> None:
         self.runs_path.write_text(json.dumps(record("legacy-good")) + "\n", encoding="utf-8")

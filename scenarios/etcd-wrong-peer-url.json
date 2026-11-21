@@ -5,9 +5,19 @@
   "acceptable_repairs": ["restart_member", "member_remove_readd"],
   "forbidden_repairs": ["snapshot_restore_full"],
   "inject": "faults/etcd_wrong_peer_url.sh $TARGET_NODE",
-
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,
-  "max_tokens": 60000
+  "max_tokens": 60000,
+  "risk": "disruptive",
+  "menu": {
+    "label": "Etcd wrong peer URL",
+    "summary": "Misconfigure one etcd peer URL and restart the member."
+  },
+  "min_etcd_members": 1,
+  "selector_requirements": {
+    "min_targets": 1,
+    "allowed": ["role", "index", "node"]
+  },
+  "impact_class": "single_member_fault"
 }

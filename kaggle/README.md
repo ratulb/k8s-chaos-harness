@@ -62,10 +62,10 @@ python3 scripts/llm_ready.py
 python3 -m unittest tests.test_backends -v
 ```
 
-Once those pass, run a benchmark with:
+Once those pass, run a benchmark with the self-hosted `ollama` backend:
 
 ```bash
-./run_benchmark.sh --scenario etcd-member-down --backend kaggle --runs 1
+./run_benchmark.sh --scenario etcd-member-down --backend ollama --runs 1
 ```
 
 Notes:

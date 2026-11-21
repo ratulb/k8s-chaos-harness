@@ -4,28 +4,30 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
-EXPECTED="${EXPECTED_ETCD_MEMBERS:-${#NODES[@]}}"
+EXPECTED="${EXPECTED_ETCD_MEMBERS:-${ETCD_MEMBER_COUNT:-${#NODES[@]}}}"
+EXPECTED_NODES="${EXPECTED_CONTROL_PLANES:-${CONTROL_PLANE_COUNT:-${#NODES[@]}}}"
+QUORUM=$((EXPECTED / 2 + 1))
 
 nodes_out=""
 for i in $(seq 1 12); do
   nodes_out=$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null || true)
-  [[ "$(echo "$nodes_out" | wc -l)" -ge "$EXPECTED" ]] && break
+  [[ "$(echo "$nodes_out" | wc -l)" -ge "$EXPECTED_NODES" ]] && break
   sleep 5
 done
-if [[ "$(echo "$nodes_out" | wc -l)" -lt "$EXPECTED" ]]; then
-  echo "Expected at least $EXPECTED nodes" >&2
+if [[ "$(echo "$nodes_out" | wc -l)" -lt "$EXPECTED_NODES" ]]; then
+  echo "Expected at least $EXPECTED_NODES nodes" >&2
   exit 1
 fi
 
 ready_nodes=0
 for i in $(seq 1 24); do
   ready_nodes=$(echo "$nodes_out" | awk '$2=="Ready"{c++} END{print c+0}')
-  [[ "$ready_nodes" -ge "$EXPECTED" ]] && break
+  [[ "$ready_nodes" -ge "$EXPECTED_NODES" ]] && break
   sleep 5
   nodes_out=$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null || echo "$nodes_out")
 done
-if [[ "$ready_nodes" -lt "$EXPECTED" ]]; then
-  echo "Expected $EXPECTED Ready nodes, got $ready_nodes" >&2
+if [[ "$ready_nodes" -lt "$EXPECTED_NODES" ]]; then
+  echo "Expected $EXPECTED_NODES Ready nodes, got $ready_nodes" >&2
   exit 1
 fi
 
@@ -82,4 +84,4 @@ for pod in $etcd_pods; do
   fi
 done
 
-echo "etcd healthy: $EXPECTED/$EXPECTED members"
+echo "etcd healthy: $EXPECTED/$EXPECTED members, quorum $QUORUM"

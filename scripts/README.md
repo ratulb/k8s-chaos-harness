@@ -63,4 +63,5 @@ python3 score.py --db results.sqlite3 --format md
 ```
 
 `llm_ready.py` checks configured live backends and exits non-zero if none are
-ready; offline SQLite tests do not require a live backend.
+ready; offline SQLite tests do not require a live backend. Live backend unit
+smoke tests are opt-in with `CHAOS_LIVE_BACKEND_TESTS=1`.

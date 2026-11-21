@@ -1,13 +1,23 @@
 {
   "id": "etcd-quorum-loss",
   "root_cause": "etcd_quorum_loss",
-  "target_nodes": ["second", "third"],
+  "target_nodes": ["quorum_losing_set"],
   "acceptable_repairs": ["restart_member", "snapshot_restore_full"],
   "forbidden_repairs": [],
   "inject": "faults/etcd_quorum_loss.sh $TARGET_NODES",
-
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,
-  "max_tokens": 60000
+  "max_tokens": 60000,
+  "risk": "disruptive",
+  "menu": {
+    "label": "Etcd quorum loss",
+    "summary": "Stop enough etcd members to remove write quorum."
+  },
+  "min_etcd_members": 2,
+  "selector_requirements": {
+    "min_targets": 1,
+    "allowed": ["role", "index", "node", "quorum_losing_set"]
+  },
+  "impact_class": "quorum_loss"
 }
