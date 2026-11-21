@@ -134,7 +134,7 @@ def _run_fresh(
 
     store.update_run(run_id, status="running", phase="resetting")
     if reset_cmd:
-        reset_ok, reset_out = _run(reset_cmd, 300, run_env, log_path)
+        reset_ok, reset_out = _run(reset_cmd, 900, run_env, log_path)
         setup_parts.append(f"RESET: {reset_out}")
         _artifact(store, run_id, "reset_output_full", reset_out)
         store.add_event(run_id, "reset", {"ok": reset_ok, "output": reset_out[:2000]})
@@ -363,7 +363,11 @@ def main() -> None:
         topology_tools.freeze_topology(topology_data)
         capability = topology_tools.capability_check(scenario, topology_data, args.mode)
         targets = scenario.get("target_nodes", [])
-        resolved = topology_tools.resolve_targets(topology_data, targets)
+        resolved = topology_tools.resolve_targets(
+            topology_data,
+            targets,
+            avoid_local=bool(scenario.get("avoid_local_target")),
+        )
         min_targets = int(scenario.get("selector_requirements", {}).get("min_targets", 0))
         if len(resolved) < min_targets:
             raise RuntimeError(f"scenario requires at least {min_targets} target node(s); resolved {resolved}")

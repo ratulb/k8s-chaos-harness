@@ -5,23 +5,22 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 Canonical design: `DESIGN.md`. Historical inputs: `SQLite.md`, `chaos_ui.txt`,
 `feedback.md`, `harness-cli.tgz`.
 
-Machines were down during offline implementation. `vm1` is back in the cluster
-as of 2026-11-21; live validation has not yet been rerun after this commit.
+Machines were down during offline implementation. All three control planes are
+back as of 2026-11-21; live topology and rebuild acceptance passed after the
+Phase 9 hardening commit.
 
 ## Skipped or deferred live work
-- `vm1` is back; live topology and rebuild acceptance were skipped during offline
-  work and are now unblocked pending validation.
-- Phase 9F (rebuild flow) remains unchecked until rebuild acceptance is run.
-- Live backend smoke (`CHAOS_LIVE_BACKEND_TESTS=1`) remains skipped; GPU/Ollama is up,
-  but no live endpoint validation has been run from this workspace.
-- Benchmark, repair, and fault-injection sweeps remain skipped; no live cluster or
+- `vm1` is back; live topology discovery and `chaos cluster nuke` rebuild
+  acceptance passed on the three-member cluster.
+- Live backend smoke (`CHAOS_LIVE_BACKEND_TESTS=1`) passed from this workspace.
+- Benchmark, repair, and fault-injection sweeps are the active live work; no
   authoritative `/data/k8s-chaos-harness` database has been touched.
 - The operator started a manual `--ui live` run from `vm2`; that run is owned by the
   operator and was not inspected, aborted, or modified from this session.
 - Prompt approval is covered offline only; no live interactive repair run has been
   attempted.
-- Static replay is covered by offline fixtures only; no publishable artifact has
-  been generated from live run data.
+- Static replay is covered by offline fixtures only; a publishable artifact from
+  fresh live run data is still pending.
 
 ## Phase 0 — Foundations
 - [x] Ollama-compatible bootstrap script
@@ -100,7 +99,7 @@ as of 2026-11-21; live validation has not yet been rerun after this commit.
   on Azure
 - Deliverable: current cross-backend results
 - Acceptance: rates, not anecdotes, from the active post-redesign epoch
-- Blocked: live machines required
+- Live machines are up; fresh cross-backend sweep is the active acceptance step
 
 ## Phase 8 — Publish
 - [x] Initial README
@@ -180,18 +179,19 @@ as of 2026-11-21; live validation has not yet been rerun after this commit.
   from read-only commands
 
 ### Phase 9F — Rebuild flow
-- [ ] Implement `chaos cluster nuke [--yes]`
-- [ ] Validate `setup.conf` and SSH preflight listed masters
-- [ ] Rebuild through `k8s-easy-install`
-- [ ] Discover post-rebuild live topology
-- [ ] Warn on `setup.conf` vs live topology difference and accept live topology
-- [ ] Refresh node/IP cache from live cluster
-- [ ] Discard stale state only after successful rebuild
-- [ ] Preserve SQLite and report clearly on failed rebuild
+- [x] Implement `chaos cluster nuke [--yes]`
+- [x] Validate `setup.conf` and SSH preflight listed masters
+- [x] Rebuild through `k8s-easy-install`
+- [x] Discover post-rebuild live topology
+- [x] Warn on `setup.conf` vs live topology difference and accept live topology
+- [x] Refresh node/IP cache from live cluster
+- [x] Discard stale state only after successful rebuild
+- [x] Preserve SQLite and report clearly on failed rebuild
 - Deliverable: one-command rebuild with clean operational state
 - Acceptance: failure keeps old DB; success produces fresh DB and live topology
   report
-- Blocked: live machines required for final acceptance
+- Live acceptance passed on 2026-11-21; all three nodes returned Ready and the
+  fresh DB reported zero runs
 
 ### Phase 9G — Streaming and live terminal view
 - [x] Add `on_chunk` streaming to `LLMClient` with non-stream fallback

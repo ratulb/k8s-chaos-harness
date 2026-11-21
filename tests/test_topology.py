@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -87,6 +88,44 @@ class TestTopology(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             topology.resolve_targets(discovered, ["ninth"])
 
+    def test_resolve_targets_avoids_local_harness_host(self) -> None:
+        discovered = self._discover("n3")
+        resolved = topology.resolve_targets(
+            discovered,
+            ["second"],
+            local_node="node-2",
+            avoid_local=True,
+        )
+        self.assertEqual(resolved, ["node-3"])
+        with self.assertRaises(RuntimeError):
+            topology.resolve_targets(
+                discovered,
+                ["node-2"],
+                local_node="node-2",
+                avoid_local=True,
+            )
+
+    def test_capability_avoids_local_harness_host(self) -> None:
+        scenario = load_scenario(ROOT, "etcd-disk-full")
+        discovered = self._discover("n3")
+        result = topology.capability_check(
+            scenario,
+            discovered,
+            "benchmark",
+            local_node="node-2",
+        )
+        self.assertTrue(result["eligible"])
+        self.assertTrue(any("avoids local harness host" in item for item in result["warning"]))
+        single = self._discover("n1")
+        blocked = topology.capability_check(
+            scenario,
+            single,
+            "benchmark",
+            local_node="node-1",
+        )
+        self.assertFalse(blocked["eligible"])
+        self.assertIn("local harness host", blocked["unsupported_reason"])
+
     def test_capability_single_member_quorum_loss(self) -> None:
         discovered = self._discover("n1")
         scenario = load_scenario(ROOT, "etcd-quorum-loss")
@@ -118,6 +157,20 @@ class TestTopology(unittest.TestCase):
         self.assertIn("QUORUM=3", env)
         self.assertIn("QUORUM_LOSS_TARGETS=2", env)
         self.assertIn("NODES=(node-1 node-2 node-3 node-4)", env)
+
+    def test_setup_conf_summary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            install = Path(tmp)
+            (install / "setup.conf").write_text(
+                "masters=10.1.0.4 10.2.0.4\nworkers=\nloadbalancer=10.3.0.4\n",
+                encoding="utf-8",
+            )
+            with patch.dict(os.environ, {"K8S_EASY_INSTALL": str(install)}):
+                summary = topology.setup_conf_summary()
+        self.assertTrue(summary["exists"])
+        self.assertEqual(summary["masters"], ["10.1.0.4", "10.2.0.4"])
+        self.assertEqual(summary["loadbalancer"], ["10.3.0.4"])
+        self.assertEqual(len(summary["hash"]), 64)
 
 
 if __name__ == "__main__":

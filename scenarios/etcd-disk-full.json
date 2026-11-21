@@ -15,6 +15,7 @@
     "summary": "Fill one etcd data directory filesystem."
   },
   "min_etcd_members": 1,
+  "avoid_local_target": true,
   "selector_requirements": {
     "min_targets": 1,
     "allowed": ["role", "index", "node"]

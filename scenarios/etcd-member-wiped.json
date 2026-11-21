@@ -2,6 +2,7 @@
   "id": "etcd-member-wiped",
   "root_cause": "etcd_member_data_loss",
   "target_nodes": ["second"],
+  "avoid_local_target": true,
   "acceptable_repairs": ["member_remove_readd", "kube_etcd_switch_rebuild"],
   "forbidden_repairs": ["snapshot_restore_full"],
   "inject": "faults/etcd_member_wiped.sh $TARGET_NODE",

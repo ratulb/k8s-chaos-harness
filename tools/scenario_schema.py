@@ -115,6 +115,10 @@ def validate_scenario(
     if isinstance(min_members, int) and not isinstance(min_members, bool) and min_members < 1:
         errors.append("min_etcd_members: must be at least 1")
 
+    avoid_local = scenario.get("avoid_local_target")
+    if avoid_local is not None and not isinstance(avoid_local, bool):
+        errors.append("avoid_local_target: expected bool")
+
     menu = scenario.get("menu")
     if isinstance(menu, dict):
         for field in ("label", "summary"):

@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shlex
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -89,6 +90,26 @@ def _setup_conf_hosts() -> dict[str, list[str]]:
         except ValueError:
             result[key.strip()] = value.split()
     return result
+
+
+def setup_conf_summary() -> dict[str, Any]:
+    conf = _setup_conf_hosts()
+    install_dir = Path(os.environ.get("K8S_EASY_INSTALL", Path.home() / "k8s-easy-install"))
+    path = install_dir / "setup.conf"
+    normalized = {
+        "masters": sorted(conf.get("masters") or []),
+        "workers": sorted(conf.get("workers") or []),
+        "loadbalancer": sorted(conf.get("loadbalancer") or []),
+    }
+    digest = hashlib.sha256(json.dumps(normalized, sort_keys=True).encode("utf-8")).hexdigest()
+    return {
+        "path": str(path),
+        "exists": path.exists(),
+        "masters": list(conf.get("masters") or []),
+        "workers": list(conf.get("workers") or []),
+        "loadbalancer": list(conf.get("loadbalancer") or []),
+        "hash": digest,
+    }
 
 
 def _cache_map() -> dict[str, str]:
@@ -521,7 +542,51 @@ def clear_frozen_topology() -> None:
         pass
 
 
-def resolve_targets(topology: dict[str, Any], selectors: Any) -> list[str]:
+def local_node_names(topology: dict[str, Any], local_node: str | None = None) -> set[str]:
+    identifiers: set[str] = set()
+    if local_node:
+        identifiers.add(str(local_node).strip())
+    else:
+        override = os.environ.get("CHAOS_LOCAL_NODE", "").strip()
+        if override:
+            identifiers.add(override)
+        try:
+            hostname = socket.gethostname()
+            identifiers.update({hostname, hostname.split(".")[0]})
+        except OSError:
+            pass
+        try:
+            identifiers.update(item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None))
+        except OSError:
+            pass
+        try:
+            output = subprocess.check_output(["hostname", "-I"], text=True, timeout=5)
+            identifiers.update(output.split())
+        except Exception:
+            pass
+    identifiers.discard("")
+    names: set[str] = set()
+    control_planes = list(topology.get("control_planes") or [])
+    all_nodes = list(topology.get("all_nodes") or control_planes)
+    for detail in topology.get("node_details") or []:
+        name = str(detail.get("name") or "").strip()
+        ip = str(detail.get("ip") or "").strip()
+        if (name and name in identifiers) or (ip and ip in identifiers):
+            if name:
+                names.add(name)
+    for identifier in identifiers:
+        if identifier in all_nodes:
+            names.add(identifier)
+    return names
+
+
+def resolve_targets(
+    topology: dict[str, Any],
+    selectors: Any,
+    *,
+    local_node: str | None = None,
+    avoid_local: bool = False,
+) -> list[str]:
     if selectors is None:
         selectors = []
     if isinstance(selectors, str):
@@ -529,19 +594,31 @@ def resolve_targets(topology: dict[str, Any], selectors: Any) -> list[str]:
     control_planes = list(topology.get("control_planes") or [])
     all_nodes = list(topology.get("all_nodes") or control_planes)
     loss_nodes = list(topology.get("quorum_loss_nodes") or [])
+    local_names = local_node_names(topology, local_node) if avoid_local else set()
+    if avoid_local:
+        candidate_planes = [name for name in control_planes if name not in local_names]
+        loss_nodes = [name for name in loss_nodes if name not in local_names]
+        if not candidate_planes and any(ordinal_index(item) is not None for item in selectors):
+            raise RuntimeError("no non-local control-plane target; refusing to target local harness host")
+    else:
+        candidate_planes = control_planes
     targets: list[str] = []
     for selector in selectors:
         text = str(selector).strip()
         if text == "quorum_losing_set":
+            if not loss_nodes:
+                raise RuntimeError("quorum_losing_set has no non-local target node")
             targets.extend(loss_nodes)
             continue
         index = ordinal_index(text)
         if index is not None:
-            if index > len(control_planes):
-                raise RuntimeError(f"selector {text!r} exceeds {len(control_planes)} control-plane node(s)")
-            targets.append(control_planes[index - 1])
+            if index > len(candidate_planes):
+                raise RuntimeError(f"selector {text!r} exceeds {len(candidate_planes)} control-plane node(s)")
+            targets.append(candidate_planes[index - 1])
             continue
         if text in all_nodes:
+            if avoid_local and text in local_names:
+                raise RuntimeError(f"target {text!r} is the local harness host")
             targets.append(text)
             continue
         raise RuntimeError(f"unknown target selector {text!r}; expected a node name, role, index, or quorum_losing_set")
@@ -552,6 +629,7 @@ def capability_check(
     scenario: dict[str, Any],
     topology: dict[str, Any],
     mode: str = "benchmark",
+    local_node: str | None = None,
 ) -> dict[str, Any]:
     if mode not in {"benchmark", "repair"}:
         raise RuntimeError(f"unknown mode {mode!r}")
@@ -563,6 +641,7 @@ def capability_check(
     if isinstance(selectors, str):
         selectors = [selectors]
     dynamic_quorum = any(str(item) == "quorum_losing_set" for item in selectors)
+    avoid_local = bool(scenario.get("avoid_local_target"))
 
     if member_count != RECOMMENDED_MEMBERS:
         warnings.append(
@@ -597,6 +676,26 @@ def capability_check(
     if member_count < 1:
         eligible = False
         reason = reason or "topology has no etcd members"
+
+    if avoid_local:
+        local_names = local_node_names(topology, local_node)
+        try:
+            resolved = resolve_targets(
+                topology,
+                selectors,
+                local_node=local_node,
+                avoid_local=True,
+            )
+        except RuntimeError as exc:
+            if eligible and mode == "benchmark":
+                eligible = False
+                reason = reason or str(exc)
+            else:
+                warnings.append(str(exc))
+        else:
+            joined = ", ".join(sorted(local_names)) or "detected host"
+            warnings.append(f"target selection avoids local harness host: {joined}")
+            warnings.append(f"resolved target(s): {', '.join(resolved)}")
 
     return {
         "eligible": eligible,

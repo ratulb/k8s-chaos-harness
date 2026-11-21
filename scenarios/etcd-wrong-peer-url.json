@@ -2,6 +2,7 @@
   "id": "etcd-wrong-peer-url",
   "root_cause": "etcd_config_error",
   "target_nodes": ["second"],
+  "avoid_local_target": true,
   "acceptable_repairs": ["restart_member", "member_remove_readd"],
   "forbidden_repairs": ["snapshot_restore_full"],
   "inject": "faults/etcd_wrong_peer_url.sh $TARGET_NODE",

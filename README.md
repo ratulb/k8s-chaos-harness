@@ -108,7 +108,7 @@ Important behavior:
   is no archive.
 - `chaos cluster nuke` rebuilds from `setup.conf`, accepts whatever live
   topology results, and discards stale state only after a successful rebuild.
-  Phase 9F is currently skipped until live machines are stable.
+  Live acceptance passed on 2026-11-21.
 
 ## Current lower-level commands
 

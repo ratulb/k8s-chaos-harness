@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import fcntl
 import os
 import shlex
+import socket
 import subprocess
 import sys
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -35,6 +38,7 @@ def _summary(scenario: dict[str, Any]) -> dict[str, Any]:
         "risk": scenario.get("risk"),
         "impact_class": scenario.get("impact_class"),
         "min_etcd_members": scenario.get("min_etcd_members"),
+        "avoid_local_target": bool(scenario.get("avoid_local_target")),
         "target_nodes": scenario.get("target_nodes", []),
     }
 
@@ -94,6 +98,77 @@ def _print_attach_items(events: list[dict[str, Any]], chunks: list[dict[str, Any
             print(f"ui {chunk['seq']:>6}  {chunk['kind']}: {chunk['text']}")
 
 
+def _local_addresses() -> set[str]:
+    addresses = {cluster_config.current_node(), socket.gethostname()}
+    try:
+        addresses.update(item[4][0] for item in socket.getaddrinfo(socket.gethostname(), None))
+    except OSError:
+        pass
+    try:
+        output = subprocess.check_output(["hostname", "-I"], text=True, timeout=5)
+        addresses.update(output.split())
+    except Exception:
+        pass
+    return addresses
+
+
+def _ssh_preflight(hosts: list[str]) -> list[dict[str, Any]]:
+    results: list[dict[str, Any]] = []
+    local = _local_addresses()
+    for host in hosts:
+        if host in local:
+            results.append({"host": host, "ok": True, "detail": "local host", "local": True})
+            continue
+        cmd = [
+            "ssh", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10", f"{cluster_config.ssh_user()}@{host}", "true",
+        ]
+        key = cluster_config.ssh_key()
+        if key:
+            cmd[1:1] = ["-i", key]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            ok = proc.returncode == 0
+            detail = proc.stderr.strip() or proc.stdout.strip()
+        except Exception as exc:
+            ok = False
+            detail = str(exc)
+        results.append({"host": host, "ok": ok, "detail": detail[:500]})
+    return results
+
+
+@contextmanager
+def _rebuild_lock(conf_hash: str):
+    cache_dir = Path.home() / ".cache" / "k8s-chaos-harness"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    path = cache_dir / f"rebuild-{conf_hash[:16]}.lock"
+    with path.open("a+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            yield path
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _setup_topology_warnings(setup: dict[str, Any], topology_data: dict[str, Any]) -> list[str]:
+    configured = set(setup.get("masters") or [])
+    live = {
+        str(detail.get("ip"))
+        for detail in topology_data.get("node_details", [])
+        if detail.get("ip")
+    }
+    if not configured or not live:
+        return []
+    missing = sorted(configured - live)
+    extra = sorted(live - configured)
+    warnings: list[str] = []
+    if missing:
+        warnings.append("setup.conf masters absent from live topology: " + ", ".join(missing))
+    if extra:
+        warnings.append("live control-plane IPs absent from setup.conf: " + ", ".join(extra))
+    return warnings
+
+
 def _menu_script(summaries: list[dict[str, Any]]) -> str:
     ids = " ".join(shlex.quote(str(item["id"])) for item in summaries)
     labels = " ".join(shlex.quote(str(item["label"])) for item in summaries)
@@ -133,6 +208,11 @@ def main(argv: list[str] | None = None) -> int:
     state_sub = state.add_subparsers(dest="state_command", required=True)
     state_discard = state_sub.add_parser("discard")
     state_discard.add_argument("--yes", action="store_true")
+
+    cluster = sub.add_parser("cluster")
+    cluster_sub = cluster.add_subparsers(dest="cluster_command", required=True)
+    cluster_nuke = cluster_sub.add_parser("nuke")
+    cluster_nuke.add_argument("--yes", action="store_true")
 
     status = sub.add_parser("status")
     status.add_argument("--limit", type=int, default=10)
@@ -263,6 +343,83 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         _print_json(summary)
         return 0
+
+    if args.command == "cluster" and args.cluster_command == "nuke":
+        if not args.yes:
+            try:
+                answer = input("Full rebuild from setup.conf destroys the current cluster. Continue? [y/N] ").strip().lower()
+            except EOFError:
+                answer = ""
+            if answer not in {"y", "yes"}:
+                print("cluster nuke cancelled", file=sys.stderr)
+                return 1
+        setup = topology_tools.setup_conf_summary()
+        if not setup["masters"]:
+            print(f"no masters configured in {setup['path']}", file=sys.stderr)
+            return 2
+        try:
+            with _rebuild_lock(setup["hash"]):
+                preflight = _ssh_preflight(setup["masters"])
+                failed = [item for item in preflight if not item["ok"]]
+                if failed:
+                    _print_json({
+                        "status": "preflight_failed",
+                        "setup_conf": setup,
+                        "preflight": preflight,
+                    })
+                    return 2
+                abort_summary = store_tools.abort_runs(
+                    args.db, None, terminate=True, reason="cluster_nuke"
+                )
+                proc = subprocess.run(
+                    ["bash", str(ROOT / "cluster" / "reset_cluster.sh")],
+                    cwd=ROOT,
+                    timeout=1800,
+                    check=False,
+                )
+                if proc.returncode != 0:
+                    _print_json({
+                        "status": "rebuild_failed",
+                        "returncode": proc.returncode,
+                        "setup_conf": setup,
+                        "preflight": preflight,
+                        "runs_aborted": abort_summary["aborted"],
+                        "state": "preserved",
+                    })
+                    return 1
+                topology_tools.clear_frozen_topology()
+                fixture = os.environ.pop("CHAOS_TOPOLOGY_JSON", None)
+                try:
+                    topology_data = topology_tools.discover_topology()
+                finally:
+                    if fixture is not None:
+                        os.environ["CHAOS_TOPOLOGY_JSON"] = fixture
+                warnings = _setup_topology_warnings(setup, topology_data)
+                try:
+                    cluster_config.cache_node_ips()
+                except Exception as exc:
+                    warnings.append(f"cannot refresh node IP cache after rebuild: {exc}")
+                discard = store_tools.discard_state(
+                    args.db, args.runs_file, args.trace_dir, cluster_config.CACHE_PATH
+                )
+                cluster_config.clear_ip_cache()
+                try:
+                    cluster_config.cache_node_ips()
+                except Exception as exc:
+                    warnings.append(f"cannot refresh node IP cache after discard: {exc}")
+                _print_json({
+                    "status": "ok",
+                    "setup_conf": setup,
+                    "preflight": preflight,
+                    "runs_aborted": abort_summary["aborted"],
+                    "topology": topology_tools.summary(topology_data),
+                    "warnings": warnings,
+                    "state": discard,
+                })
+                return 0
+        except Exception as exc:
+            print(f"cluster nuke failed: {exc}", file=sys.stderr)
+            return 1
 
     if args.command == "state" and args.state_command == "discard":
         if not args.yes:

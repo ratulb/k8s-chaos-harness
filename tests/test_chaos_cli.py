@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -255,6 +255,84 @@ class TestChaosCli(unittest.TestCase):
             self.assertIn("--launch-id", payload["command"])
             self.assertTrue(payload["command"][-1].startswith("launch-"))
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
+
+    def test_ssh_preflight_skips_local_host(self) -> None:
+        with patch("chaos_cli._local_addresses", return_value={"10.2.0.4"}), \
+             patch("chaos_cli.cluster_config.ssh_user", return_value="azureuser"), \
+             patch("chaos_cli.cluster_config.ssh_key", return_value=""), \
+             patch("chaos_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as runner:
+            results = chaos_cli._ssh_preflight(["10.2.0.4", "10.1.0.4"])
+        self.assertTrue(results[0]["local"])
+        self.assertTrue(results[0]["ok"])
+        self.assertFalse(results[1].get("local", False))
+        runner.assert_called_once()
+
+    def test_cluster_nuke_success_discards_only_after_rebuild(self) -> None:
+        setup = {"path": "/tmp/setup.conf", "masters": ["10.1.0.4"], "hash": "abc123"}
+        topology_data = {"node_details": [{"name": "vm1", "ip": "10.1.0.4"}]}
+        output = io.StringIO()
+        with patch("chaos_cli.topology_tools.setup_conf_summary", return_value=setup), \
+             patch("chaos_cli._rebuild_lock", return_value=nullcontext(Path("rebuild.lock"))), \
+             patch("chaos_cli._ssh_preflight", return_value=[{"host": "10.1.0.4", "ok": True, "detail": ""}]), \
+             patch("chaos_cli.store_tools.abort_runs", return_value={"aborted": []}), \
+             patch("chaos_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 0)) as rebuild, \
+             patch("chaos_cli.topology_tools.clear_frozen_topology"), \
+             patch("chaos_cli.topology_tools.discover_topology", return_value=topology_data), \
+             patch("chaos_cli.topology_tools.summary", return_value={"topology_hash": "live"}), \
+             patch("chaos_cli.cluster_config.cache_node_ips"), \
+             patch("chaos_cli.cluster_config.clear_ip_cache"), \
+             patch("chaos_cli.store_tools.discard_state", return_value={"reinitialized": True}) as discard:
+            with redirect_stdout(output):
+                code = chaos_cli.main([
+                    "--db", "/tmp/results.sqlite3",
+                    "cluster", "nuke", "--yes",
+                ])
+        self.assertEqual(code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["topology"], {"topology_hash": "live"})
+        self.assertTrue(payload["state"]["reinitialized"])
+        rebuild.assert_called_once()
+        discard.assert_called_once()
+
+    def test_cluster_nuke_preflight_failure_skips_rebuild(self) -> None:
+        setup = {"path": "/tmp/setup.conf", "masters": ["10.1.0.4"], "hash": "abc123"}
+        output = io.StringIO()
+        with patch("chaos_cli.topology_tools.setup_conf_summary", return_value=setup), \
+             patch("chaos_cli._rebuild_lock", return_value=nullcontext(Path("rebuild.lock"))), \
+             patch("chaos_cli._ssh_preflight", return_value=[{"host": "10.1.0.4", "ok": False, "detail": "timeout"}]), \
+             patch("chaos_cli.subprocess.run") as rebuild, \
+             patch("chaos_cli.store_tools.discard_state") as discard:
+            with redirect_stdout(output):
+                code = chaos_cli.main([
+                    "--db", "/tmp/results.sqlite3",
+                    "cluster", "nuke", "--yes",
+                ])
+        self.assertEqual(code, 2)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "preflight_failed")
+        rebuild.assert_not_called()
+        discard.assert_not_called()
+
+    def test_cluster_nuke_rebuild_failure_preserves_state(self) -> None:
+        setup = {"path": "/tmp/setup.conf", "masters": ["10.1.0.4"], "hash": "abc123"}
+        output = io.StringIO()
+        with patch("chaos_cli.topology_tools.setup_conf_summary", return_value=setup), \
+             patch("chaos_cli._rebuild_lock", return_value=nullcontext(Path("rebuild.lock"))), \
+             patch("chaos_cli._ssh_preflight", return_value=[{"host": "10.1.0.4", "ok": True, "detail": ""}]), \
+             patch("chaos_cli.store_tools.abort_runs", return_value={"aborted": []}), \
+             patch("chaos_cli.subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+             patch("chaos_cli.store_tools.discard_state") as discard:
+            with redirect_stdout(output):
+                code = chaos_cli.main([
+                    "--db", "/tmp/results.sqlite3",
+                    "cluster", "nuke", "--yes",
+                ])
+        self.assertEqual(code, 1)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["status"], "rebuild_failed")
+        self.assertEqual(payload["state"], "preserved")
+        discard.assert_not_called()
 
 
 if __name__ == "__main__":

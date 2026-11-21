@@ -74,6 +74,19 @@ if verify_or_repair 12; then
   exit 0
 fi
 
+echo "member-level repair failed; rebuilding cluster from setup.conf" >&2
+if ! bash "$SCRIPT_DIR/reset_cluster.sh" >&2; then
+  echo "failed to restore clean etcd state" >&2
+  bash "$SCRIPT_DIR/verify_etcd_healthy.sh" >&2 || true
+  exit 1
+fi
+
+if verify_or_repair 12; then
+  cluster_config cache-ips >/dev/null 2>&1 || true
+  echo "clean etcd state restored"
+  exit 0
+fi
+
 echo "failed to restore clean etcd state" >&2
 bash "$SCRIPT_DIR/verify_etcd_healthy.sh" >&2 || true
 exit 1

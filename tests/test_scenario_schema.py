@@ -41,6 +41,12 @@ class TestScenarioSchema(unittest.TestCase):
         errors = validate_scenario(scenario, ROOT, expected_id="etcd-member-down")
         self.assertTrue(any("risk: missing" in error for error in errors))
 
+    def test_invalid_avoid_local_target_is_reported(self) -> None:
+        scenario = copy.deepcopy(load_scenario(ROOT, "etcd-disk-full"))
+        scenario["avoid_local_target"] = "yes"
+        errors = validate_scenario(scenario, ROOT, expected_id="etcd-disk-full")
+        self.assertTrue(any("avoid_local_target" in error for error in errors))
+
     def test_disallowed_selector_is_reported(self) -> None:
         scenario = copy.deepcopy(load_scenario(ROOT, "etcd-member-down"))
         scenario["target_nodes"] = ["quorum_losing_set"]
