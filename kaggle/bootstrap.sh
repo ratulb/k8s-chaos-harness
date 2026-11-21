@@ -9,7 +9,7 @@ export PATH=/opt/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}
 
 export PUBLIC_KEY_URL="${PUBLIC_KEY_URL:-https://raw.githubusercontent.com/ratulb/tenmo/refs/heads/main/pub_id}"
-export ZROK_TOKEN="${ZROK_TOKEN:-bGp9siRWVlq0}"
+export ZROK_TOKEN="${ZROK_TOKEN:-[ZROK_TOKEN]}"
 export MODEL="${MODEL:-qwen3.8:27b}"
 export KERNEL_PID="${KERNEL_PID:-$PPID}"
 
