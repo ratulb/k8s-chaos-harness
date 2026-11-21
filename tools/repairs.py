@@ -3,6 +3,9 @@ from __future__ import annotations
 import subprocess
 import time
 
+from pathlib import Path
+
+from . import cluster_config
 from .ssh import run_on_node, node_ip
 
 
@@ -42,7 +45,8 @@ def restart_member(node: str) -> str:
 
 def member_remove_readd(node: str) -> str:
     ip = node_ip(node)
-    healthy = "vm1" if node != "vm1" else "vm2"
+    resolved = cluster_config.node_by_role(node)
+    healthy = next(n for n in cluster_config.nodes() if n != resolved)
 
     # find member id
     proc = _kubectl(["kubectl", "exec", "-n", "kube-system", f"etcd-{healthy}", "--", "etcdctl",
@@ -110,8 +114,8 @@ def kube_etcd_switch_rebuild(node: str) -> str:
 
 
 def snapshot_restore_full() -> str:
-    import subprocess
-    subprocess.run(["/home/azureuser/k8s-chaos-harness/cluster/reset_cluster.sh"], check=True, timeout=1800)
+    reset_script = Path(__file__).resolve().parent.parent / "cluster" / "reset_cluster.sh"
+    subprocess.run([str(reset_script)], check=True, timeout=1800)
     return "cluster reset"
 
 

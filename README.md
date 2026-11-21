@@ -6,11 +6,14 @@ See `DESIGN.md` for the full plan and `PHASES.md` for current status.
 
 ## Cluster
 
-The cluster is built from `/home/azureuser/k8s-easy-install`:
+The harness discovers control-plane nodes with `kubectl` and never assumes fixed
+hostnames, IP addresses, or SSH users. Set `K8S_NODES=node-a,node-b,node-c` and
+`SSH_USER=...` in `.env` when discovery or the default login user is unsuitable.
+Scenarios refer to abstract roles (`first`, `second`, `third`) which are resolved
+at runtime.
 
-- `vm1` / `10.1.0.4`, `vm2` / `10.2.0.4`, `vm3` / `10.3.0.4`
-- HAProxy load balancer at `10.3.0.4:8080`
-- Kubernetes v1.36.6, stacked etcd, Calico CNI
+The full rebuild script expects `k8s-easy-install` in `$HOME` by default; override
+it with `K8S_EASY_INSTALL=/path/to/k8s-easy-install`.
 
 Useful commands:
 

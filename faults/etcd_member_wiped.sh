@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
+# Wipe the data directory of one etcd member.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/../cluster/config.sh"
+
 NODE=${1:?node required}
-IP=$(kubectl get node "$NODE" -o jsonpath='{.status.addresses[?(@.type=="InternalIP")].address}')
 
-run_node() {
-  if [[ "$NODE" == "$(hostname)" ]]; then bash; else ssh -o StrictHostKeyChecking=no "$IP" bash; fi
-}
-
-run_node <<'REMOTE'
+run_on_node "$NODE" <<'REMOTE'
 set -e
 MAN=/etc/kubernetes/manifests/etcd.yaml
 if [ -f /tmp/etcd.yaml.clean ]; then
@@ -22,7 +21,7 @@ REMOTE
 kubectl delete pod "etcd-${NODE}" -n kube-system --ignore-not-found=true >/dev/null 2>&1 || true
 
 for i in $(seq 1 60); do
-  if ! kubectl exec -n kube-system etcd-vm1 -- etcdctl \
+  if ! kubectl exec -n kube-system "$(etcd_probe_pod)" -- etcdctl \
       --endpoints=https://127.0.0.1:2379 \
       --cacert=/etc/kubernetes/pki/etcd/ca.crt \
       --cert=/etc/kubernetes/pki/etcd/server.crt \

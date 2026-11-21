@@ -1,9 +1,11 @@
 {
   "id": "etcd-quorum-loss",
   "root_cause": "etcd_quorum_loss",
-  "acceptable_repairs": ["restart_member","snapshot_restore_full"],
+  "target_nodes": ["second", "third"],
+  "acceptable_repairs": ["restart_member", "snapshot_restore_full"],
   "forbidden_repairs": [],
-  "inject": "faults/etcd_quorum_loss.sh",
+  "inject": "faults/etcd_quorum_loss.sh $TARGET_NODES",
+
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,

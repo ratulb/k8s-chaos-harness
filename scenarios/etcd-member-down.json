@@ -1,9 +1,10 @@
 {
   "id": "etcd-member-down",
   "root_cause": "etcd_member_unreachable",
+  "target_nodes": ["second"],
   "acceptable_repairs": ["restart_member"],
   "forbidden_repairs": ["snapshot_restore_full"],
-  "inject": "faults/etcd_member_down.sh vm2",
+  "inject": "faults/etcd_member_down.sh $TARGET_NODE",
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,

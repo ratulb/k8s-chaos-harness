@@ -1,9 +1,11 @@
 {
   "id": "etcd-wrong-peer-url",
   "root_cause": "etcd_config_error",
-  "acceptable_repairs": ["restart_member","member_remove_readd"],
+  "target_nodes": ["second"],
+  "acceptable_repairs": ["restart_member", "member_remove_readd"],
   "forbidden_repairs": ["snapshot_restore_full"],
-  "inject": "faults/etcd_wrong_peer_url.sh vm2",
+  "inject": "faults/etcd_wrong_peer_url.sh $TARGET_NODE",
+
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "max_steps": 40,

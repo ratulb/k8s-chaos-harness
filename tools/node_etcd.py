@@ -4,6 +4,7 @@ import subprocess
 
 from .truncate import truncate
 from .ssh import run_on_node
+from . import cluster_config
 
 
 ETCD_CERT = "/etc/kubernetes/pki/etcd"
@@ -24,19 +25,19 @@ def _etcdctl(node: str, args: list[str]) -> str:
 
 
 def etcdctl_endpoint_health(endpoints: str = "") -> str:
-    return _etcdctl("vm1", ["endpoint", "health", "--cluster"])
+    return _etcdctl(cluster_config.default_node(), ["endpoint", "health", "--cluster"])
 
 
-def etcdctl_endpoint_status(node: str = "vm1") -> str:
-    return _etcdctl(node, ["endpoint", "status", "-w", "table"])
+def etcdctl_endpoint_status(node: str = "") -> str:
+    return _etcdctl(node or cluster_config.default_node(), ["endpoint", "status", "-w", "table"])
 
 
-def etcdctl_member_list(node: str = "vm1") -> str:
-    return _etcdctl(node, ["member", "list", "-w", "table"])
+def etcdctl_member_list(node: str = "") -> str:
+    return _etcdctl(node or cluster_config.default_node(), ["member", "list", "-w", "table"])
 
 
-def etcdctl_alarm_list(node: str = "vm1") -> str:
-    return _etcdctl(node, ["alarm", "list"])
+def etcdctl_alarm_list(node: str = "") -> str:
+    return _etcdctl(node or cluster_config.default_node(), ["alarm", "list"])
 
 
 def journalctl_tail(node: str, unit: str, lines: int = 100) -> str:

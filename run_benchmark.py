@@ -12,6 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm.env import load_env
 load_env()
 from llm.client import Backend, LLMClient
+from tools import cluster_config
 from harness.agent import run_scenario
 from tools.truncate import truncate
 
@@ -23,9 +24,9 @@ BACKENDS = {
 }
 
 
-def _run(cmd: str, timeout: int) -> tuple[bool, str]:
+def _run(cmd: str, timeout: int, env: dict[str, str] | None = None) -> tuple[bool, str]:
     try:
-        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, env=env)
         return p.returncode == 0, (p.stdout + p.stderr).strip()
     except Exception as e:
         return False, str(e)
@@ -53,6 +54,14 @@ def main() -> None:
         reset_cmd = os.path.join(root, reset_cmd)
     timeout = int(scenario.get("timeout_seconds", 300))
 
+    run_env = os.environ.copy()
+    targets = scenario.get("target_nodes", ["second"])
+    if isinstance(targets, str):
+        targets = [targets]
+    resolved = [cluster_config.node_by_role(role) for role in targets]
+    run_env["TARGET_NODE"] = resolved[0]
+    run_env["TARGET_NODES"] = " ".join(resolved)
+
     backend = BACKENDS[args.backend]()
     if not LLMClient(backend).health():
         print(f"Backend {backend.name} not healthy", file=sys.stderr)
@@ -67,12 +76,12 @@ def main() -> None:
         reset_ok = True
         baseline_ok = True
         if reset_cmd:
-            reset_ok, reset_out = _run(reset_cmd, 300)
+            reset_ok, reset_out = _run(reset_cmd, 300, run_env)
             setup_output += f"RESET: {reset_out}\n"
             if not reset_ok:
                 baseline_ok = False
         if reset_ok:
-            baseline_ok, base_out = _run(verify_cmd, timeout)
+            baseline_ok, base_out = _run(verify_cmd, timeout, run_env)
             setup_output += f"BASELINE: {base_out}\n"
 
         if not reset_ok or not baseline_ok:
@@ -103,7 +112,7 @@ def main() -> None:
             print(json.dumps(rec), flush=True)
             continue
 
-        inject_ok, inject_out = _run(inject_cmd, 120)
+        inject_ok, inject_out = _run(inject_cmd, 120, run_env)
         setup_output += f"INJECT: {inject_out}\n"
         rec = run_scenario(
             scenario,

@@ -7,7 +7,8 @@ import time
 from pathlib import Path
 
 from llm.client import LLMClient
-from tools.schemas import TOOLS, REPAIR_TOOLS, DIAGNOSIS_TOOL, ROOT_CAUSE_LABELS, NODES
+from tools import cluster_config
+from tools.schemas import build_tools, REPAIR_TOOLS, DIAGNOSIS_TOOL, ROOT_CAUSE_LABELS
 from tools import k8s, node_etcd as netcd
 from tools.repairs import (
     restart_member, member_remove_readd, kube_etcd_switch_rebuild,
@@ -16,10 +17,11 @@ from tools.repairs import (
 from tools.truncate import truncate
 
 
-def _check_node(value: str, default: str = "vm1") -> tuple[str | None, str]:
-    node = value or default
-    if node not in NODES:
-        return None, f"invalid node {value!r}; expected one of {', '.join(NODES)}"
+def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:
+    nodes = cluster_config.nodes()
+    node = value or default or cluster_config.default_node()
+    if node not in nodes:
+        return None, f"invalid node {value!r}; expected one of {', '.join(nodes)}"
     return node, ""
 
 
@@ -35,7 +37,7 @@ def _exec_diagnostic(name: str, args: dict) -> str:
     if name == "etcdctl_endpoint_health":
         return netcd.etcdctl_endpoint_health()
     if name in {"etcdctl_endpoint_status", "etcdctl_member_list", "etcdctl_alarm_list"}:
-        node, err = _check_node(args.get("node", ""), "vm1")
+        node, err = _check_node(args.get("node", ""))
         if err:
             return err
         if name == "etcdctl_endpoint_status":
@@ -93,14 +95,16 @@ def normalize_diagnosis(value: object) -> str | None:
     return text
 
 
-SYSTEM_PROMPT = """You are an etcd fault diagnosis and repair agent for a 3-control-plane Kubernetes cluster (vm1, vm2, vm3).
+def system_prompt() -> str:
+    return f"""You are an etcd fault diagnosis and repair agent for a 3-control-plane Kubernetes cluster.
 
+The discoverable node names are: {', '.join(cluster_config.nodes())}. Use only those exact names for node arguments.
 Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
-root_cause MUST be exactly one of: """ + ", ".join(ROOT_CAUSE_LABELS) + """. Do not write a sentence, a node name, or an explanation in root_cause.
+root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
 
 If the diagnosis is accepted, submit_diagnosis returns an approval_token. Every repair call MUST include that exact approval_token.
 If the diagnosis is rejected, do not repair; investigate again and submit a corrected diagnosis.
-Use etcdctl_member_list and etcdctl_endpoint_health from vm1, plus pod status and logs, to identify the affected node.
+Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
 A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
 A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. Two stopped members are etcd_quorum_loss.
 A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
@@ -134,7 +138,7 @@ def run_scenario(
 
     client = LLMClient(backend)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt()},
         {"role": "user", "content": "Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."},
     ]
     diagnosis = None
@@ -155,7 +159,7 @@ def run_scenario(
     while steps < max_steps and tokens_used < max_tokens:
         steps += 1
         try:
-            resp = client.chat(messages, tools=TOOLS, temperature=0.2, max_tokens=2048)
+            resp = client.chat(messages, tools=build_tools(), temperature=0.2, max_tokens=2048)
         except Exception as e:
             log({"type": "llm_error", "error": str(e)})
             break
