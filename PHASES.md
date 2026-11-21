@@ -104,7 +104,7 @@ Phase 9 hardening commit.
 
 ## Phase 8 — Publish
 - [x] Initial README
-- [ ] Updated README for dynamic topology, `ollama`, and `./chaos`
+- [x] Updated README as the main guide for dynamic topology, `ollama`, and `./chaos`
 - [ ] Blog post
 - [ ] Demo notes
 - Deliverable: publishable artifact
