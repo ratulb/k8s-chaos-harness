@@ -41,7 +41,11 @@ for member in payload.get("members", []):
     if isinstance(client, list):
         client = " ".join(str(item) for item in client)
     if node == str(member.get("name", "")) or address in str(peer) or address in str(client):
-        print(member.get("id") or member.get("ID"))
+        raw = str(member.get("id") or member.get("ID"))
+        try:
+            print(format(int(raw), "x"))
+        except ValueError:
+            print(raw)
         break
 else:
     raise SystemExit(f"cannot find etcd member for {node} ({address})")
