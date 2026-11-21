@@ -5,11 +5,13 @@ The environment variables are patched in-process so these tests work on any
 machine and never depend on a live Kubernetes cluster or specific hostnames.
 """
 import os
+import subprocess
 import sys
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
 
 from tools import cluster_config
 from tools import topology
@@ -75,6 +77,22 @@ class TestClusterConfig(unittest.TestCase):
         self.assertIn('QUORUM=2', out)
         self.assertIn('QUORUM_LOSS_TARGETS=2', out)
         self.assertIn('SSH_USER=operator', out)
+
+    def test_run_on_node_preserves_heredoc_stdin(self):
+        script = f"""
+set -e
+export K8S_NODES=node-a
+source "{ROOT}/cluster/config.sh"
+cluster_config() {{ printf ''; }}
+out="$(run_on_node node-a <<'BODY'
+printf '%s' 'hello-from-heredoc'
+BODY
+)"
+printf '%s' "$out"
+"""
+        result = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("hello-from-heredoc", result.stdout)
 
 
 if __name__ == "__main__":

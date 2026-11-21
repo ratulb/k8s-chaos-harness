@@ -47,11 +47,11 @@ else:
     raise SystemExit(f"cannot find etcd member for {node} ({address})")
 ' "$NODE" "$TARGET_IP" <<<"$MEMBERS")"
 
-kubectl --request-timeout=10s exec -n kube-system "etcd-$PROBE" -- sh -c \
-  "ETCDCTL_API=3 etcdctl --endpoints=https://127.0.0.1:2379 \
-   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-   --cert=/etc/kubernetes/pki/etcd/server.crt \
-   --key=/etc/kubernetes/pki/etcd/server.key \
-   member update $MEMBER_ID --peer-urls=https://$TARGET_IP:2399"
+kubectl --request-timeout=10s exec -n kube-system "etcd-$PROBE" -- \
+  etcdctl --endpoints=https://127.0.0.1:2379 \
+  --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+  --cert=/etc/kubernetes/pki/etcd/server.crt \
+  --key=/etc/kubernetes/pki/etcd/server.key \
+  member update "$MEMBER_ID" --peer-urls="https://$TARGET_IP:2399"
 
 echo "injected etcd-wrong-peer-url on $NODE (registered peer https://$TARGET_IP:2399)"

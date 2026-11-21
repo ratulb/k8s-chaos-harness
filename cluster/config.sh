@@ -59,7 +59,7 @@ fi
 run_on_node() {
   local node="$1"
   local target
-  target="$(cluster_config ssh-target "$node")"
+  target="$(cluster_config ssh-target "$node" </dev/null)"
   if [[ -z "$target" ]]; then
     bash
   else
