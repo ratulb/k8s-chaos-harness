@@ -41,23 +41,42 @@ if [[ "$running" -lt "$EXPECTED" ]]; then
   exit 1
 fi
 
+member_count_ok=false
 for pod in $etcd_pods; do
-  members=$(kubectl exec -n kube-system "$pod" -- etcdctl \
-    --endpoints=https://127.0.0.1:2379 \
-    --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-    --cert=/etc/kubernetes/pki/etcd/server.crt \
-    --key=/etc/kubernetes/pki/etcd/server.key \
-    member list 2>/dev/null | wc -l || true)
-  if [[ "$members" -ne "$EXPECTED" ]]; then
-    echo "$pod: expected $EXPECTED members, got $members" >&2
-    exit 1
-  fi
-  if ! kubectl exec -n kube-system "$pod" -- etcdctl \
+  for attempt in 1 2 3; do
+    members=$(kubectl --request-timeout=10s exec -n kube-system "$pod" -- etcdctl \
       --endpoints=https://127.0.0.1:2379 \
       --cacert=/etc/kubernetes/pki/etcd/ca.crt \
       --cert=/etc/kubernetes/pki/etcd/server.crt \
       --key=/etc/kubernetes/pki/etcd/server.key \
-      endpoint health >/dev/null 2>&1; then
+      member list 2>/dev/null | wc -l || true)
+    if [[ "$members" -eq "$EXPECTED" ]]; then
+      member_count_ok=true
+      break 2
+    fi
+    sleep 2
+  done
+done
+if [[ "$member_count_ok" != "true" ]]; then
+  echo "could not confirm $EXPECTED etcd members from any pod" >&2
+  exit 1
+fi
+
+for pod in $etcd_pods; do
+  endpoint_ok=false
+  for attempt in 1 2 3; do
+    if kubectl --request-timeout=10s exec -n kube-system "$pod" -- etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert=/etc/kubernetes/pki/etcd/ca.crt \
+        --cert=/etc/kubernetes/pki/etcd/server.crt \
+        --key=/etc/kubernetes/pki/etcd/server.key \
+        endpoint health >/dev/null 2>&1; then
+      endpoint_ok=true
+      break
+    fi
+    sleep 2
+  done
+  if [[ "$endpoint_ok" != "true" ]]; then
     echo "$pod: etcd endpoint unhealthy" >&2
     exit 1
   fi

@@ -19,20 +19,6 @@ sudo sed -i 's#--listen-peer-urls=https://\([^:]*\):2380#--listen-peer-urls=http
 sudo systemctl restart kubelet
 REMOTE
 
-kubectl delete pod "etcd-${NODE}" -n kube-system --ignore-not-found=true >/dev/null 2>&1 || true
-
-for i in $(seq 1 60); do
-  if ! kubectl exec -n kube-system "$(etcd_probe_pod)" -- etcdctl \
-      --endpoints=https://127.0.0.1:2379 \
-      --cacert=/etc/kubernetes/pki/etcd/ca.crt \
-      --cert=/etc/kubernetes/pki/etcd/server.crt \
-      --key=/etc/kubernetes/pki/etcd/server.key \
-      endpoint health --cluster >/dev/null 2>&1; then
-    echo "injected etcd-wrong-peer-url on $NODE"
-    exit 0
-  fi
-  sleep 2
-done
-
-echo "failed to inject etcd-wrong-peer-url on $NODE: cluster still healthy" >&2
-exit 1
+delete_etcd_pod "$NODE"
+sleep 5
+echo "injected etcd-wrong-peer-url on $NODE"

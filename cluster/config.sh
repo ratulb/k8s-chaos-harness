@@ -43,3 +43,10 @@ run_on_node() {
 etcd_probe_pod() {
   echo "etcd-${PROBE_NODE}"
 }
+
+delete_etcd_pod() {
+  local node="$1"
+  timeout 30s kubectl delete pod "etcd-${node}" -n kube-system \
+    --ignore-not-found=true --grace-period=0 --force --request-timeout=10s \
+    >/dev/null 2>&1 || true
+}

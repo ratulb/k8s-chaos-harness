@@ -38,7 +38,14 @@ Build an AI agent from scratch that diagnoses and fixes injected faults in a Kub
 - All expose OpenAI-compatible chat completions; differences: base_url, api_key, model name, tool support.
 
 ## Kaggle GPU tunneling (zrok)
-- Run myzrok.txt in Kaggle notebook cell to install sshd + zrok2 and share SSH (port 22) as private tunnel.
-- Get token from notebook output, then locally: `zrok access private <token>` (one terminal).
-- Then SSH: `ssh -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p 9191 root@127.0.0.1`.
-- Need consolidate into smooth scripts.
+- Run `kaggle/bootstrap.sh` in a Kaggle notebook cell to install sshd + Ollama and share SSH as a private zrok tunnel.
+- The Kaggle `authorized_keys` must contain the public key matching the local private key; otherwise SSH asks for a password.
+- Locally: `zrok2 access private <token>` (defaults to `127.0.0.1:9191`).
+- Then: `ssh -N -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p 9191 root@127.0.0.1 -L 11435:127.0.0.1:11434`.
+- Set `OLLAMA_BASE_URL=http://127.0.0.1:11435`; full steps are in `kaggle/README.md`.
+
+## Latest validation
+- 13/13 unit tests pass.
+- Kaggle tunnel reached `qwen3.8:27b` and all four configured backends passed health/readiness.
+- Six-scenario Kaggle sweeps completed over seeds 401-403; infrastructure is stable (reset/inject/verify), but diagnosis accuracy is model-dependent.
+- `python3 score.py` is the source of truth for aggregate rates; current overall diagnosis rate is about 0.5 with no policy violations.

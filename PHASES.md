@@ -5,7 +5,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 ## Phase 0 — Foundations
 - [x] Kaggle LLM bootstrap script
 - [x] Ollama health check
-- [ ] zrok tunnel automation
+- [x] zrok tunnel workflow documented (Kaggle bootstrap + local port-forward)
 - [x] Hosted backend smoke tests
 - Deliverable: one-command LLM readiness check
 - Acceptance: local wrapper can reach Kaggle and one hosted backend
@@ -25,7 +25,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - [x] `faults/etcd_disk_full.sh`
 - [x] `faults/etcd_wrong_peer_url.sh`
 - [x] `faults/control_healthy_noisy.sh`
-- [~] Determinism check for each (`etcd-member-down` verified; others implemented)
+- [~] Determinism check for each (all six inject successfully; repeatability varies)
 - Deliverable: deterministic inject + verify
 - Acceptance: same symptom on two runs
 
@@ -47,7 +47,7 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - Acceptance: forbidden repairs blocked and logged
 
 ## Phase 5 — Full loop
-- [x] One scenario end to end (`etcd-member-down`, Groq, seed 101)
+- [x] One scenario end to end (`etcd-member-down`, Groq seed 101; Kaggle seed 403)
 - [x] Wrong-repair trial (unit-tested gate)
 - [x] Recovery verification
 - Deliverable: complete benchmark loop
@@ -61,9 +61,9 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - Acceptance: killed session resumes
 
 ## Phase 7 — Sweep
-- [ ] 5 scenarios x 2 backends x N runs
+- [~] 6 scenarios x 1 backend x multiple runs (Kaggle); Groq smoke only
 - [x] Score aggregation (`score.py`)
-- [ ] Comparison table from full sweep
+- [x] Comparison table from Kaggle sweeps (`python3 score.py`)
 - Deliverable: cross-backend results
 - Acceptance: rates, not anecdotes
 

@@ -11,4 +11,11 @@ fi
 for node in "${NODES[@]}"; do
   "$SCRIPT_DIR/etcd_member_down.sh" "$node"
 done
+for i in $(seq 1 60); do
+  ready=$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{c++} END{print c+0}')
+  if [[ "$ready" -le 1 ]]; then
+    break
+  fi
+  sleep 1
+done
 echo "injected etcd-quorum-loss on ${NODES[*]}"

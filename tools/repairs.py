@@ -9,11 +9,13 @@ from . import cluster_config
 from .ssh import run_on_node, node_ip
 
 
-def _kubectl(args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
+def _kubectl(args: list[str], timeout: int = 45) -> subprocess.CompletedProcess:
+    if args and args[0] == "kubectl" and not any(a.startswith("--request-timeout") for a in args):
+        args = [args[0], "--request-timeout=15s", *args[1:]]
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
 
 
-def _wait_for_etcd(node: str, timeout: int = 180) -> str:
+def _wait_for_etcd(node: str, timeout: int = 90) -> str:
     deadline = time.time() + timeout
     while time.time() < deadline:
         proc = _kubectl(["kubectl", "get", "pod", f"etcd-{node}", "-n", "kube-system", "-o", "jsonpath={.status.containerStatuses[0].ready}"])
@@ -39,7 +41,10 @@ sudo systemctl restart kubelet
 
 def restart_member(node: str) -> str:
     _restore_manifest(node)
-    _kubectl(["kubectl", "delete", "pod", f"etcd-{node}", "-n", "kube-system", "--ignore-not-found=true"], timeout=60)
+    try:
+        _kubectl(["kubectl", "delete", "pod", f"etcd-{node}", "-n", "kube-system", "--ignore-not-found=true", "--grace-period=0", "--force"], timeout=30)
+    except Exception:
+        pass
     return _wait_for_etcd(node)
 
 
@@ -105,7 +110,10 @@ open(p,'w').write(s)
 PY
 """
     run_on_node(node, script)
-    _kubectl(["kubectl", "delete", "pod", f"etcd-{node}", "-n", "kube-system", "--ignore-not-found=true"], timeout=60)
+    try:
+        _kubectl(["kubectl", "delete", "pod", f"etcd-{node}", "-n", "kube-system", "--ignore-not-found=true", "--grace-period=0", "--force"], timeout=30)
+    except Exception:
+        pass
     return _wait_for_etcd(node)
 
 

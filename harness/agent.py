@@ -103,8 +103,9 @@ Read-only investigation tools are safe to call at any time. Submit a diagnosis w
 root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
 
 If the diagnosis is accepted, submit_diagnosis returns an approval_token. Every repair call MUST include that exact approval_token.
-If the diagnosis is rejected, do not repair; investigate again and submit a corrected diagnosis.
+If the diagnosis is rejected, do not repair and do not brute-force labels; gather one new decisive observation before submitting again.
 Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
+Investigate briefly: use at most four assistant turns of read-only tools, then call submit_diagnosis immediately. Do not keep investigating once the likely root cause is clear.
 A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
 A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. Two stopped members are etcd_quorum_loss.
 A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
@@ -153,6 +154,8 @@ def run_scenario(
     tokens_used = 0
     max_steps = scenario.get("max_steps", 40)
     max_tokens = scenario.get("max_tokens", 60000)
+    diagnosis_deadline = scenario.get("diagnosis_deadline_steps", 4)
+    diagnosis_nudged = False
     acceptable = set(scenario.get("acceptable_repairs", []))
     forbidden = set(scenario.get("forbidden_repairs", []))
 
@@ -194,7 +197,7 @@ def run_scenario(
                     result = f"diagnosis accepted; approval_token={approval_token}"
                 else:
                     approval_token = None
-                    result = f"diagnosis rejected: expected one of {ROOT_CAUSE_LABELS}"
+                    result = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
                 log({"type": "approval", "granted": approval_token is not None, "diagnosis": diagnosis, "raw": diagnosis_raw})
             elif name in REPAIR_TOOLS:
                 reason = None
@@ -229,6 +232,11 @@ def run_scenario(
             tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
             messages.append(tool_msg)
             log({"type": "tool", "name": name, "args": args, "result": result})
+
+        if not diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
+            messages.append({"role": "user", "content": "Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response."})
+            diagnosis_nudged = True
+            log({"type": "nudge", "step": steps})
 
     try:
         v = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=verify_timeout)

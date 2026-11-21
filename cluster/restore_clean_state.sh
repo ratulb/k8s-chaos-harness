@@ -10,6 +10,7 @@ from tools.ssh import run_on_node
 
 cleanup = """
 set -e
+sudo pkill -f 'dd.*etcd/filler' 2>/dev/null || true
 sudo rm -f /etc/kubernetes/manifests/etcd.yaml.disabled /var/lib/etcd/filler
 if [ -f /tmp/etcd.yaml.clean ]; then
   sudo cp /tmp/etcd.yaml.clean /etc/kubernetes/manifests/etcd.yaml
@@ -37,7 +38,7 @@ verify_or_repair() {
   return 1
 }
 
-if verify_or_repair 36; then
+if verify_or_repair 12; then
   cluster_config cache-ips >/dev/null 2>&1 || true
   echo "clean etcd state restored"
   exit 0
@@ -67,7 +68,7 @@ for node in cluster_config.nodes():
         print(member_remove_readd(node), flush=True)
 PY
 
-if verify_or_repair 36; then
+if verify_or_repair 12; then
   cluster_config cache-ips >/dev/null 2>&1 || true
   echo "clean etcd state restored"
   exit 0
