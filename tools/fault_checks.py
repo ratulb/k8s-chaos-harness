@@ -130,15 +130,23 @@ def _disk_full(target: str) -> tuple[bool, str]:
 
 
 def _wiped(target: str) -> tuple[bool, str]:
-    script = "sudo grep -c -- '--version' /etc/kubernetes/manifests/etcd.yaml || true"
+    script = (
+        "sudo test ! -f /var/lib/etcd/member/snap/db; echo DB_MISSING:$?; "
+        "sudo grep -c -- '--version' /etc/kubernetes/manifests/etcd.yaml || true"
+    )
     try:
         code, out, err = run_on_node(target, script, timeout=30)
     except Exception as exc:
-        return False, f"manifest probe failed: {exc}"
-    count = out.strip().splitlines()[-1] if out.strip() else "0"
-    if count.isdigit() and int(count) > 0 and not _pod_ready(target):
-        return True, out.strip() or err.strip()
-    return False, out.strip() or err.strip() or f"manifest probe exited {code}"
+        return False, f"wipe probe failed: {exc}"
+    text = (out + "\n" + err).strip()
+    if not _pod_ready(target):
+        if "DB_MISSING:0" in text:
+            return True, text
+        lines = out.strip().splitlines()
+        count = lines[-1] if lines else "0"
+        if count.isdigit() and int(count) > 0:
+            return True, text
+    return False, text or f"wipe probe exited {code}"
 
 
 def _quorum_lost(targets: list[str]) -> tuple[bool, str]:

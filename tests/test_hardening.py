@@ -146,6 +146,12 @@ class TestHardening(unittest.TestCase):
         self.assertIn("--write-out=json", args)
         self.assertNotIn("-o", args)
 
+    def test_wiped_fault_detects_missing_data_dir(self) -> None:
+        with patch("tools.fault_checks.run_on_node", return_value=(0, "DB_MISSING:0\n0", "")), \
+             patch("tools.fault_checks._pod_ready", return_value=False):
+            present, _ = fault_checks.check_fault_present({"id": "etcd-member-wiped"}, ["node-b"])
+        self.assertTrue(present)
+
     def test_fault_timeout_and_bounded_wait(self) -> None:
         scenario = {"id": "etcd-member-down", "fault_present_timeout_seconds": 7}
         self.assertEqual(fault_checks.timeout_for(scenario), 7.0)
