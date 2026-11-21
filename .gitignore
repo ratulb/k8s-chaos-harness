@@ -11,3 +11,7 @@ __pycache__/
 *.db-shm
 chaos_ui.txt
 harness-cli.tgz
+runs.jsonl
+traces/
+logs/
+replay.html

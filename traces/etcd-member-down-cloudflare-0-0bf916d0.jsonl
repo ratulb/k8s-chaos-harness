@@ -1,6 +1,0 @@
-{"type": "inject", "cmd": "/home/azureuser/k8s-chaos-harness/faults/etcd_member_down.sh vm2", "ts": 1795201899.9448123}
-{"type": "assistant", "message": {"role": "assistant", "content": null, "tool_calls": [{"id": "call_1795201909714", "type": "function", "function": {"name": "etcdctl_endpoint_health", "arguments": "{}"}}], "refusal": null}, "ts": 1795201909.740297}
-{"type": "tool", "name": "etcdctl_endpoint_health", "args": {}, "result": "https://127.0.0.1:2379 is healthy: successfully committed proposal: took = 41.050035ms\n", "ts": 1795201910.3971326}
-{"type": "llm_error", "error": "HTTP Error 400: Bad Request", "ts": 1795201910.4915779}
-{"type": "verify", "ok": false, "output": "Expected 3 Ready nodes, got 2", "ts": 1795201969.8373272}
-{"type": "record", "record": {"run_id": "etcd-member-down-cloudflare-0-0bf916d0", "scenario": "etcd-member-down", "backend": "cloudflare", "diagnosis": null, "truth": "etcd_member_unreachable", "diagnosis_correct": false, "verify_ok": false, "steps": 2, "tokens_used": 2020, "trace": "traces/etcd-member-down-cloudflare-0-0bf916d0.jsonl"}, "ts": 1795201969.8374898}
