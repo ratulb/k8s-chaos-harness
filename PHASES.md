@@ -54,16 +54,20 @@ Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 - Acceptance: score record written
 
 ## Phase 6 — Checkpointer
-- [ ] SQLite schema
-- [ ] Save/resume state
-- [ ] Crash recovery test
+- [x] SQLite schema (append-only event log + state cache)
+- [x] Tool intent/result write-ahead lifecycle
+- [x] Scenario spec versioning and resume lineage
+- [x] Save/resume state
+- [x] Legacy JSONL import and derived exports
+- [x] Crash recovery test coverage (offline unit tests)
+- [x] One-command wrapper and DB CLI
 - Deliverable: mid-run resume
-- Acceptance: killed session resumes
+- Acceptance: killed session resumes; unknown repair aborts and retries fresh
 
 ## Phase 7 — Sweep
 - [~] 6 scenarios x 1 backend x multiple runs (Kaggle); Groq smoke only
-- [x] Score aggregation (`score.py`)
-- [x] Comparison table from Kaggle sweeps (`python3 score.py`)
+- [x] Score aggregation (`score.py`, now with `--db`)
+- [x] Comparison table from Kaggle sweeps (`python3 score.py --db results.sqlite3`)
 - Deliverable: cross-backend results
 - Acceptance: rates, not anecdotes
 

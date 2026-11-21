@@ -50,3 +50,17 @@ scripts/install_ollama.sh small     # qwen3:8b
 scripts/install_ollama.sh qwen3:8b  # explicit model
 MODEL=qwen3:8b scripts/install_ollama.sh
 ```
+
+## Run-store helpers
+
+The authoritative run store and score table live at the repository root:
+
+```bash
+python3 db_cli.py init
+python3 db_cli.py import-legacy
+python3 db_cli.py doctor --strict
+python3 score.py --db results.sqlite3 --format md
+```
+
+`llm_ready.py` checks configured live backends and exits non-zero if none are
+ready; offline SQLite tests do not require a live backend.

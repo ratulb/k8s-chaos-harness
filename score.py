@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-"""Aggregate runs.jsonl into comparison tables."""
+"""Aggregate authoritative SQLite runs, or legacy JSONL, into comparison tables."""
 from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 from collections import defaultdict
 from pathlib import Path
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from storage.sqlite_store import SQLiteStore
 
-def load(path: str) -> list[dict]:
+
+def load(path: str, include_resumed: bool = False) -> list[dict]:
     p = Path(path)
     if not p.exists():
         return []
@@ -20,11 +25,14 @@ def load(path: str) -> list[dict]:
             rec = json.loads(line)
         except Exception:
             continue
-        # Ignore pre-gate exploratory records.
+        # Pre-gate exploratory records predate approval_granted.
         if "approval_granted" not in rec:
             continue
+        # Resumed runs contain interventions and are excluded from headline rates.
+        if not include_resumed and rec.get("resume_count", 0):
+            continue
         out.append(rec)
-    return [] if not out else out
+    return out
 
 
 def summarize(recs: list[dict]) -> dict:
@@ -56,9 +64,17 @@ def summarize(recs: list[dict]) -> dict:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--runs", default="runs.jsonl")
+    ap.add_argument("--db", default=None)
     ap.add_argument("--format", choices=["json", "md"], default="md")
+    ap.add_argument("--include-resumed", action="store_true")
     args = ap.parse_args()
-    recs = load(args.runs)
+
+    if args.db:
+        with SQLiteStore(args.db) as store:
+            recs = store.load_records(include_resumed=args.include_resumed)
+    else:
+        recs = load(args.runs, include_resumed=args.include_resumed)
+
     groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
     by_backend: dict[str, list[dict]] = defaultdict(list)
     for r in recs:

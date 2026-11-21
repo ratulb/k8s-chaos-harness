@@ -65,5 +65,15 @@ python3 -m unittest tests.test_backends -v
 Once those pass, run a benchmark with:
 
 ```bash
-python3 run_benchmark.py --scenario etcd-member-down --backend kaggle --runs 1
+./run_benchmark.sh --scenario etcd-member-down --backend kaggle --runs 1
 ```
+
+Notes:
+
+- The final hint printed by `kaggle/bootstrap.sh` omits the `-L
+  11435:127.0.0.1:11434` port forward; use the full command above.
+- The zrok supervisor is tied to `KERNEL_PID`. If the notebook kernel cell exits,
+  the tunnel closes and the token must be re-read/re-created.
+- `PUBLIC_KEY_URL` must serve the public key matching the local private key used
+  with `-i`; otherwise SSH asks for a password.
+- Kaggle is not needed for SQLite/checkpointer development or offline tests.

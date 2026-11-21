@@ -1,5 +1,8 @@
 # Skeleton roadmap — K8s fault-healing agent
 
+> Historical roadmap. Superseded by `DESIGN.md`; Docker Compose/Multipass and
+> MCP-first options below are no longer the selected substrate/transport.
+
 ## Vision
 An agent that observes a Kubernetes cluster, diagnoses injected faults, and
 proposes/executes fixes via tools, using an LLM (self-hosted small model or

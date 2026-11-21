@@ -44,8 +44,17 @@ Build an AI agent from scratch that diagnoses and fixes injected faults in a Kub
 - Then: `ssh -N -o UserKnownHostsFile=/dev/null -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa -p 9191 root@127.0.0.1 -L 11435:127.0.0.1:11434`.
 - Set `OLLAMA_BASE_URL=http://127.0.0.1:11435`; full steps are in `kaggle/README.md`.
 
+## SQLite checkpoint store
+- `SQLite.md` holds historical reviewer input; `DESIGN.md` is the reconciled source of truth.
+- SQLite is authoritative; `runs.jsonl` and `traces/*.jsonl` are regenerated exports.
+- Event log is append-only: messages, tool calls, LLM requests, trace events, artifacts.
+- `runs.state_json` is a cache rebuilt from the log when its seq marker is stale.
+- Unknown mutating tool calls abort the original run and create a fresh retry linked by `resume_of`.
+- Resumed runs are excluded from headline rates unless `score.py --include-resumed` is used.
+- Kaggle is not required for SQLite work; only for live GPU-backed sweeps.
+
 ## Latest validation
-- 13/13 unit tests pass.
+- 13/13 unit tests passed before SQLite integration.
 - Kaggle tunnel reached `qwen3.8:27b` and all four configured backends passed health/readiness.
 - Six-scenario Kaggle sweeps completed over seeds 401-403; infrastructure is stable (reset/inject/verify), but diagnosis accuracy is model-dependent.
 - `python3 score.py` is the source of truth for aggregate rates; current overall diagnosis rate is about 0.5 with no policy violations.
