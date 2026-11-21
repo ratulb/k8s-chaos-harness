@@ -108,7 +108,8 @@ Important behavior:
   is no archive.
 - `chaos cluster nuke` rebuilds from `setup.conf`, accepts whatever live
   topology results, and discards stale state only after a successful rebuild.
-  Live acceptance passed on 2026-11-21.
+  Live acceptance passed on 2026-11-21. A reduced 13-run cross-backend sweep
+  also completed; the cluster was rebuilt clean afterwards.
 
 ## Current lower-level commands
 

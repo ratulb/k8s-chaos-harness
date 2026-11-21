@@ -13,14 +13,15 @@ Phase 9 hardening commit.
 - `vm1` is back; live topology discovery and `chaos cluster nuke` rebuild
   acceptance passed on the three-member cluster.
 - Live backend smoke (`CHAOS_LIVE_BACKEND_TESTS=1`) passed from this workspace.
-- Benchmark, repair, and fault-injection sweeps are the active live work; no
+- Reduced live sweep completed: 13 runs across the four backends and four
+  scenarios. Destructive expansion was stopped by operator decision; no
   authoritative `/data/k8s-chaos-harness` database has been touched.
 - The operator started a manual `--ui live` run from `vm2`; that run is owned by the
   operator and was not inspected, aborted, or modified from this session.
 - Prompt approval is covered offline only; no live interactive repair run has been
   attempted.
-- Static replay is covered by offline fixtures only; a publishable artifact from
-  fresh live run data is still pending.
+- Static replay was generated from the final sweep database and saved under
+  `/tmp/opencode/final-replay.html` with score reports alongside it.
 
 ## Phase 0 — Foundations
 - [x] Ollama-compatible bootstrap script
@@ -99,7 +100,8 @@ Phase 9 hardening commit.
   on Azure
 - Deliverable: current cross-backend results
 - Acceptance: rates, not anecdotes, from the active post-redesign epoch
-- Live machines are up; fresh cross-backend sweep is the active acceptance step
+- Reduced cross-backend sweep completed: 13 runs, diagnosis 0.538, verify 0.923,
+  ollama diagnosis 1.0; destructive expansion stopped by operator decision
 
 ## Phase 8 — Publish
 - [x] Initial README
