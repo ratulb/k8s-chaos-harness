@@ -636,7 +636,7 @@ unreadable DB.
 
 ## 17. Current status and limitations
 
-Live status as of 2026-11-21, verified at commit `704b43e`; later commits may
+Live status as of 2026-11-21, verified against this branch; later commits may
 change behavior.
 
 - live topology discovery and `chaos cluster nuke` acceptance passed
@@ -645,8 +645,9 @@ change behavior.
 - a reduced 13-run cross-backend sweep completed
 - the cluster and local DB were rebuilt clean afterwards
 - prompt approval is validated offline only
+- non-destructive live smoke passed after calibration
+- all five fault-present observers were calibrated live and passed
 - the full fresh cross-backend sweep remains pending
-- fault repeatability now fails closed via bounded fault-present checks, but live calibration is pending
 - `--seed` is metadata, not sampling control
 - `--ui plain` and `--ui live` use the same renderer
 - streamed usage capture is implemented, but live token accounting is pending verification

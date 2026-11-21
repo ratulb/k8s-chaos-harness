@@ -260,10 +260,13 @@ or destructive validation.
 - [x] Request and consume streamed usage payloads
 - [x] Archive historical reviewer documents
 - [x] Run full offline suite after changes
-- [ ] Calibrate fault-present timeouts on the rebuilt cluster
-- [ ] Run non-destructive live smoke after cluster/GPU are ready
-- [ ] Run destructive calibration and model pilots only after explicit approval
+- [x] Calibrate fault-present timeouts on the rebuilt cluster
+- [x] Run non-destructive live smoke after cluster/GPU are ready
+- [x] Run destructive fault calibration after explicit approval
+- [ ] Run model pilots after explicit approval
 - [ ] Run full public sweep and publish refreshed replay/score artifacts
+- Live calibration passed for all five injected scenarios; observed delays were
+  under 16 seconds, well inside the 15-second disk and 60-second disruptive limits
 - Deliverable: benchmark results that prove the faults existed and separate
   model failures from harness/provider failures
 - Acceptance: every scored run has an observed fault, no provider failure, and
