@@ -77,7 +77,7 @@ def _probe_node(target: str) -> str:
 def _members(probe: str) -> list[dict[str, Any]]:
     ok, output = _kubectl([
         "--request-timeout=10s", "exec", "-n", "kube-system", f"etcd-{probe}",
-        "--", "etcdctl", *ETCDCTL_ARGS, "member", "list", "-o", "json",
+        "--", "etcdctl", *ETCDCTL_ARGS, "--write-out=json", "member", "list",
     ])
     if not ok:
         ok, output = _kubectl([

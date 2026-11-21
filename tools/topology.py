@@ -226,23 +226,21 @@ def _parse_etcd_members(text: str) -> list[dict[str, Any]]:
 
 
 def _etcdctl_member_list(pod: str) -> list[dict[str, Any]]:
-    cmd = [
+    base = [
         "kubectl", "--request-timeout=10s", "exec", "-n", "kube-system", pod,
         "--", "etcdctl",
         "--endpoints=https://127.0.0.1:2379",
         "--cacert=/etc/kubernetes/pki/etcd/ca.crt",
         "--cert=/etc/kubernetes/pki/etcd/server.crt",
         "--key=/etc/kubernetes/pki/etcd/server.key",
-        "member", "list", "-o", "json",
     ]
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+        proc = subprocess.run([*base, "--write-out=json", "member", "list"], capture_output=True, text=True, check=False, timeout=30)
     except Exception:
         return []
     if proc.returncode != 0:
-        cmd[-1] = "list"
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=30)
+            proc = subprocess.run([*base, "member", "list"], capture_output=True, text=True, check=False, timeout=30)
         except Exception:
             return []
     return _parse_etcd_members(proc.stdout or "")

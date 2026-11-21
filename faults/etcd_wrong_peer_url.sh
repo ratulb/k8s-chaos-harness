@@ -25,7 +25,7 @@ MEMBERS="$(kubectl --request-timeout=10s exec -n kube-system "etcd-$PROBE" -- \
   --cacert=/etc/kubernetes/pki/etcd/ca.crt \
   --cert=/etc/kubernetes/pki/etcd/server.crt \
   --key=/etc/kubernetes/pki/etcd/server.key \
-  member list -o json)"
+  --write-out=json member list)"
 MEMBER_ID="$(python3 -c '
 import json
 import sys

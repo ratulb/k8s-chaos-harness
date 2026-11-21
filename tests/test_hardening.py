@@ -135,6 +135,17 @@ class TestHardening(unittest.TestCase):
             allowed = safety.require_destructive_guard({"source": "fixture", "topology_hash": "abc"})
         self.assertTrue(allowed["enforced"])
 
+    def test_etcd_member_list_uses_supported_write_out_flag(self) -> None:
+        payload = json.dumps({"members": [{"name": "node-b", "peerURLs": ["https://10.0.0.2:2399"]}]})
+        with patch("tools.fault_checks._probe_node", return_value="node-a"), \
+             patch("tools.fault_checks.cluster_config.node_ip", return_value="10.0.0.2"), \
+             patch("tools.fault_checks._kubectl", return_value=(True, payload)) as mock_kubectl:
+            present, _ = fault_checks.check_fault_present({"id": "etcd-wrong-peer-url"}, ["node-b"])
+        self.assertTrue(present)
+        args = mock_kubectl.call_args.args[0]
+        self.assertIn("--write-out=json", args)
+        self.assertNotIn("-o", args)
+
     def test_fault_timeout_and_bounded_wait(self) -> None:
         scenario = {"id": "etcd-member-down", "fault_present_timeout_seconds": 7}
         self.assertEqual(fault_checks.timeout_for(scenario), 7.0)
