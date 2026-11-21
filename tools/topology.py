@@ -429,9 +429,13 @@ def _from_live() -> dict[str, Any] | None:
         if live_members:
             break
     if live_members:
-        by_name = {member["name"]: member for member in members}
+        by_key: dict[str, dict[str, Any]] = {}
+        for member in members:
+            for key in (member.get("name"), member.get("node")):
+                if key:
+                    by_key[str(key)] = member
         for member in live_members:
-            existing = by_name.get(member["name"])
+            existing = by_key.get(str(member["name"])) or by_key.get(str(member.get("node", "")))
             if existing:
                 existing.update(member)
                 existing["confidence"] = "confirmed"

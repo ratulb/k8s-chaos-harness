@@ -58,6 +58,27 @@ class TestTopology(unittest.TestCase):
             [{"id": "9347646635025838355", "name": "node-1", "peer_url": "https://10.0.0.1:2380"}],
         )
 
+    def test_live_members_merge_with_pods_by_node(self) -> None:
+        nodes = {"items": [{
+            "metadata": {"name": "node-1", "labels": {"node-role.kubernetes.io/control-plane": ""}},
+            "status": {
+                "addresses": [{"type": "InternalIP", "address": "10.0.0.1"}],
+                "conditions": [{"type": "Ready", "status": "True"}],
+            },
+        }]}
+        pods = {"items": [{
+            "metadata": {"name": "etcd-node-1"},
+            "spec": {"nodeName": "node-1"},
+            "status": {"phase": "Running", "containerStatuses": [{"ready": True}]},
+        }]}
+        live = [{"id": "abc123", "name": "node-1", "node": "node-1", "peer_url": "https://10.0.0.1:2380"}]
+        with patch("tools.topology._run_json", side_effect=[nodes, pods]), \
+             patch("tools.topology._etcdctl_member_list", return_value=live), \
+             patch("tools.topology._setup_conf_hosts", return_value={"masters": ["node-1"]}):
+            discovered = topology._from_live()
+        self.assertEqual(len(discovered["etcd_members"]), 1)
+        self.assertEqual(discovered["etcd_members"][0]["id"], "abc123")
+
     def test_fixture_topologies(self) -> None:
         expected = {
             "n1": (1, 1, 1),
