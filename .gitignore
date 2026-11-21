@@ -9,3 +9,5 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+chaos_ui.txt
+harness-cli.tgz

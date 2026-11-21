@@ -5,8 +5,7 @@ clusters.
 
 - `DESIGN.md`: canonical design and locked decisions.
 - `PHASES.md`: current status and action items.
-- `SQLite.md`, `chaos_ui.txt`, `feedback.md`, `harness-cli.tgz`: historical
-  reviewer input.
+- `SQLite.md`, `feedback.md`: historical reviewer input.
 
 ## Cluster model
 

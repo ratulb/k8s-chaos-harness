@@ -663,5 +663,5 @@ The redesign is complete when:
   predictable, and never applied to explicit resume or read-only commands.
 - SQLite DB can grow; `db_cli.py prune` may be used for report snapshots, but
   full-epoch cleanup is `chaos state discard`.
-- `SQLite.md`, `chaos_ui.txt`, `feedback.md`, and `harness-cli.tgz` are
-  historical reviewer inputs. This document is the reconciled source of truth.
+- `SQLite.md` and `feedback.md` are historical reviewer inputs. This document is
+  the reconciled source of truth.

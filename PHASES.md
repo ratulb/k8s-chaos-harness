@@ -2,8 +2,7 @@
 
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
-Canonical design: `DESIGN.md`. Historical inputs: `SQLite.md`, `chaos_ui.txt`,
-`feedback.md`, `harness-cli.tgz`.
+Canonical design: `DESIGN.md`. Historical inputs: `SQLite.md`, `feedback.md`.
 
 Machines were down during offline implementation. All three control planes are
 back as of 2026-11-21; live topology and rebuild acceptance passed after the
