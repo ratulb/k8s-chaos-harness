@@ -144,7 +144,7 @@ class TestRepairGate(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
                 with patch("builtins.input", return_value="y") as prompt:
-                    with patch.object(agent, "_exec_repair", return_value="restart ok"):
+                    with patch("tools.tool.repairs.restart_member", return_value="restart ok"):
                         with tempfile.TemporaryDirectory() as d:
                             rec = agent.run_scenario(
                                 {
@@ -189,7 +189,7 @@ class TestRepairGate(unittest.TestCase):
         try:
             with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
                 with patch("builtins.input", return_value="n"):
-                    with patch.object(agent, "_exec_repair", return_value="restart ok") as repair:
+                    with patch("tools.tool.repairs.restart_member", return_value="restart ok") as repair:
                         with tempfile.TemporaryDirectory() as d:
                             rec = agent.run_scenario(
                                 {
@@ -225,7 +225,7 @@ class TestRepairGate(unittest.TestCase):
         cluster_config.nodes.cache_clear()
         try:
             with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
-                with patch.object(agent, "_exec_repair", return_value="timeout waiting for etcd-node-a"):
+                with patch("tools.tool.repairs.restart_member", return_value="timeout waiting for etcd-node-a"):
                     with tempfile.TemporaryDirectory() as d:
                         rec = agent.run_scenario(
                             {

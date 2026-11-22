@@ -120,7 +120,7 @@ class TestResume(unittest.TestCase):
         with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
             cluster_config.nodes.cache_clear()
             with patch.object(agent, "LLMClient", lambda backend: FakeClient(responses)), \
-                 patch.object(agent, "_exec_repair", return_value="restarted node-b"):
+                 patch("tools.tool.repairs.restart_member", return_value="restarted node-b"):
                 record = agent.run_scenario(
                     scenario,
                     FakeBackend(),

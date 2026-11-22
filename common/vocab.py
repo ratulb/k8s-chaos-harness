@@ -1,20 +1,41 @@
 from __future__ import annotations
 
+KUBECTL_GET = "kubectl_get"
+KUBECTL_DESCRIBE = "kubectl_describe"
+KUBECTL_LOGS = "kubectl_logs"
+KUBECTL_EVENTS = "kubectl_events"
+ETCDCTL_ENDPOINT_HEALTH = "etcdctl_endpoint_health"
+ETCDCTL_ENDPOINT_STATUS = "etcdctl_endpoint_status"
+ETCDCTL_MEMBER_LIST = "etcdctl_member_list"
+ETCDCTL_ALARM_LIST = "etcdctl_alarm_list"
+JOURNALCTL_TAIL = "journalctl_tail"
+CRICTL_PS = "crictl_ps"
+CRICTL_LOGS = "crictl_logs"
+SYSTEMCTL_STATUS = "systemctl_status"
+DF_PATH = "df_path"
+LS_PATH = "ls_path"
+
 DIAGNOSIS_TOOL = "submit_diagnosis"
 
+RESTART_MEMBER = "restart_member"
+MEMBER_REMOVE_READD = "member_remove_readd"
+KUBE_ETCD_SWITCH_REBUILD = "kube_etcd_switch_rebuild"
+SNAPSHOT_RESTORE_FULL = "snapshot_restore_full"
+RESET_CLUSTER = "reset_cluster"
+
 REPAIR_TOOLS = frozenset({
-    "restart_member",
-    "member_remove_readd",
-    "kube_etcd_switch_rebuild",
-    "snapshot_restore_full",
-    "reset_cluster",
+    RESTART_MEMBER,
+    MEMBER_REMOVE_READD,
+    KUBE_ETCD_SWITCH_REBUILD,
+    SNAPSHOT_RESTORE_FULL,
+    RESET_CLUSTER,
 })
 
 DESTRUCTIVE_TOOLS = frozenset({
-    "member_remove_readd",
-    "kube_etcd_switch_rebuild",
-    "snapshot_restore_full",
-    "reset_cluster",
+    MEMBER_REMOVE_READD,
+    KUBE_ETCD_SWITCH_REBUILD,
+    SNAPSHOT_RESTORE_FULL,
+    RESET_CLUSTER,
 })
 
 ROOT_CAUSE_LABELS = [

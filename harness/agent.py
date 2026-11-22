@@ -8,96 +8,12 @@ from pathlib import Path
 from typing import Any
 
 from common.errors import LLMError
-from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS, ROOT_CAUSE_LABELS
 from harness.prompt import SystemPrompt
+from harness.tooling import AgentState, Diagnosis, Repair, normalize_diagnosis
 from llm.client import LLMClient
-from tools import cluster_config
 from tools import topology as topology_tools
-from tools.schemas import build_tools
-from tools import k8s, node_etcd as netcd
-from tools.repairs import (
-    restart_member, member_remove_readd, kube_etcd_switch_rebuild,
-    snapshot_restore_full, reset_cluster,
-)
+from tools.tool import ToolContext, ToolOutcome, build_tool_registry
 from tools.truncate import truncate
-
-
-def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:
-    nodes = cluster_config.nodes()
-    node = value or default or cluster_config.default_node()
-    if node not in nodes:
-        return None, f"invalid node {value!r}; expected one of {', '.join(nodes)}"
-    return node, ""
-
-
-def _exec_diagnostic(name: str, args: dict) -> str:
-    if name == "kubectl_get":
-        return k8s.kubectl_get(args.get("resource", ""), args.get("namespace", ""))
-    if name == "kubectl_describe":
-        return k8s.kubectl_describe(args.get("resource", ""), args.get("name", ""), args.get("namespace", ""))
-    if name == "kubectl_logs":
-        return k8s.kubectl_logs(args.get("pod", ""), args.get("container", ""), args.get("tail_lines", 100), args.get("namespace", "default"))
-    if name == "kubectl_events":
-        return k8s.kubectl_events(args.get("namespace", "default"))
-    if name == "etcdctl_endpoint_health":
-        return netcd.etcdctl_endpoint_health()
-    if name in {"etcdctl_endpoint_status", "etcdctl_member_list", "etcdctl_alarm_list"}:
-        node, err = _check_node(args.get("node", ""))
-        if err:
-            return err
-        if name == "etcdctl_endpoint_status":
-            return netcd.etcdctl_endpoint_status(node)
-        if name == "etcdctl_member_list":
-            return netcd.etcdctl_member_list(node)
-        return netcd.etcdctl_alarm_list(node)
-    if name in {"journalctl_tail", "crictl_ps", "crictl_logs", "systemctl_status", "df_path", "ls_path"}:
-        node, err = _check_node(args.get("node", ""))
-        if err:
-            return err
-        if name == "journalctl_tail":
-            return netcd.journalctl_tail(node, args.get("unit", ""), args.get("lines", 100))
-        if name == "crictl_ps":
-            return netcd.crictl_ps(node)
-        if name == "crictl_logs":
-            return netcd.crictl_logs(node, args.get("container_id", ""), args.get("tail", 100))
-        if name == "systemctl_status":
-            return netcd.systemctl_status(node, args.get("unit", ""))
-        if name == "df_path":
-            return netcd.df_path(node, args.get("path", ""))
-        return netcd.ls_path(node, args.get("path", ""))
-    return f"unknown tool: {name}"
-
-
-def _exec_repair(name: str, args: dict) -> str:
-    node, err = _check_node(args.get("node", ""))
-    if err:
-        return err
-    if name == "restart_member":
-        return restart_member(node)
-    if name == "member_remove_readd":
-        return member_remove_readd(node)
-    if name == "kube_etcd_switch_rebuild":
-        return kube_etcd_switch_rebuild(node)
-    if name == "snapshot_restore_full":
-        return snapshot_restore_full()
-    if name == "reset_cluster":
-        return reset_cluster()
-    return f"unknown repair: {name}"
-
-
-def normalize_diagnosis(value: object) -> str | None:
-    if not isinstance(value, str) or not value.strip():
-        return None
-    text = value.strip()
-    lowered = text.lower()
-    if lowered in ROOT_CAUSE_LABELS:
-        return lowered
-    for label in ROOT_CAUSE_LABELS:
-        if label in lowered or label.replace("_", " ") in lowered:
-            return label
-    if "no fault" in lowered or "cluster healthy" in lowered or "healthy" in lowered:
-        return "no_fault"
-    return text
 
 
 def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -177,7 +93,8 @@ def run_scenario(
         except Exception:
             pass
 
-    state = store.get_state(run_id) if (store is not None and resume) else {}
+    snapshot = store.get_state(run_id) if (store is not None and resume) else {}
+    state = AgentState.from_snapshot(snapshot, scenario, run_id, approve)
     messages: list[dict[str, Any]] = store.load_messages(run_id) if (store is not None and resume) else []
     if not messages:
         prompt = SystemPrompt(topology_tools.frozen_topology())
@@ -189,67 +106,57 @@ def run_scenario(
             for message in messages:
                 store.append_message(run_id, message["role"], message["content"], backend=getattr(backend, "name", "harness"))
 
-    diagnosis = state.get("diagnosis")
-    diagnosis_raw = state.get("diagnosis_raw")
-    diagnosis_submitted = bool(state.get("diagnosis_submitted", diagnosis is not None))
-    approval_token = state.get("approval_token")
-    diagnosis_correct = bool(state.get("diagnosis_correct", False))
-    approval_source = state.get("approval_source")
-    repair = state.get("repair")
-    repair_args = state.get("repair_args")
-    policy_violations: list[str] = list(state.get("policy_violations") or [])
-    forbidden_reason = state.get("forbidden_reason")
-    steps = int(state.get("steps", 0))
-    tokens_used = int(state.get("tokens_used", 0))
-    diagnosis_nudged = bool(state.get("diagnosis_nudged", False))
+    steps = int(snapshot.get("steps", 0))
+    tokens_used = int(snapshot.get("tokens_used", 0))
+    diagnosis_nudged = bool(snapshot.get("diagnosis_nudged", False))
     max_steps = scenario.get("max_steps", 40)
     max_tokens = scenario.get("max_tokens", 60000)
     diagnosis_deadline = scenario.get("diagnosis_deadline_steps", 4)
     acceptable = set(scenario.get("acceptable_repairs", []))
     forbidden = set(scenario.get("forbidden_repairs", []))
     llm_error = False
-    end_reason = "submitted" if diagnosis_submitted else "agent_stopped"
+    end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
 
     if store is not None:
         store.update_run(run_id, status="running", phase="agent_running", end_reason=None)
 
     def checkpoint() -> dict[str, Any]:
-        snapshot = {
-            "diagnosis": diagnosis,
-            "diagnosis_raw": diagnosis_raw,
-            "diagnosis_submitted": diagnosis_submitted,
-            "approval_token": approval_token,
-            "diagnosis_correct": diagnosis_correct,
-            "approval_source": approval_source,
-            "repair": repair,
-            "repair_args": repair_args,
-            "policy_violations": policy_violations,
-            "forbidden_reason": forbidden_reason,
-            "steps": steps,
-            "tokens_used": tokens_used,
-            "diagnosis_nudged": diagnosis_nudged,
-            "trace_path": str(trace_path),
-            "seq": int(store.get_run(run_id)["seq"]) if store is not None else 0,
-        }
+        current = state.snapshot(
+            trace_path=str(trace_path),
+            seq=int(store.get_run(run_id)["seq"]) if store is not None else 0,
+            steps=steps,
+            tokens_used=tokens_used,
+            diagnosis_nudged=diagnosis_nudged,
+        )
         if store is not None:
-            store.set_state(run_id, snapshot)
+            store.set_state(run_id, current)
             store.update_run(
                 run_id,
-                diagnosis=diagnosis,
-                diagnosis_raw=diagnosis_raw,
-                diagnosis_correct=(diagnosis == scenario["root_cause"]) if diagnosis is not None else None,
-                approval_granted=approval_token is not None,
-                repair=repair,
-                repair_args_json=repair_args,
-                policy_violations_json=policy_violations,
-                forbidden_reason=forbidden_reason,
+                diagnosis=state.diagnosis,
+                diagnosis_raw=state.diagnosis_raw,
+                diagnosis_correct=(state.diagnosis == scenario["root_cause"]) if state.diagnosis is not None else None,
+                approval_granted=state.approval_token is not None,
+                repair=state.repair,
+                repair_args_json=state.repair_args,
+                policy_violations_json=state.policy_violations,
+                forbidden_reason=state.forbidden_reason,
                 steps=steps,
                 tokens_used=tokens_used,
                 trace_path=str(trace_path),
             )
-        return snapshot
+        return current
 
-    log({"type": "resume_started", "from_seq": state.get("seq", 0)} if resume else {"type": "setup", "reset_ok": reset_ok, "baseline_ok": baseline_ok, "inject_ok": inject_ok, "fault_present": fault_present, "output": truncate(setup_output, 2000)})
+    registry = build_tool_registry()
+    diagnosis_executor = Diagnosis(
+        state,
+        store=store,
+        log=log,
+        pause_reporter=pause_reporter,
+        resume_reporter=resume_reporter,
+    )
+    repair_executor = Repair(state, registry, store=store, log=log, checkpoint=checkpoint)
+
+    log({"type": "resume_started", "from_seq": snapshot.get("seq", 0)} if resume else {"type": "setup", "reset_ok": reset_ok, "baseline_ok": baseline_ok, "inject_ok": inject_ok, "fault_present": fault_present, "output": truncate(setup_output, 2000)})
     if not resume:
         artifact("setup_output_full", {"output": setup_output})
     checkpoint()
@@ -261,7 +168,7 @@ def run_scenario(
         try:
             resp = client.chat(
                 messages,
-                tools=build_tools(),
+                tools=registry.schemas(),
                 temperature=0.2,
                 max_tokens=2048,
                 on_chunk=(lambda text: emit("assistant_delta", text)) if reporter is not None else None,
@@ -305,7 +212,7 @@ def run_scenario(
         checkpoint()
 
         tool_calls = msg.get("tool_calls") or []
-        if not tool_calls and not diagnosis_submitted:
+        if not tool_calls and not state.diagnosis_submitted:
             if steps < max_steps:
                 nudge = {"role": "user", "content": "You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label."}
                 messages.append(nudge)
@@ -316,9 +223,10 @@ def run_scenario(
             end_reason = "agent_stopped"
             break
         if not tool_calls:
-            end_reason = "submitted" if diagnosis_submitted else "agent_stopped"
+            end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
             break
 
+        context = ToolContext(call_id="", diagnosis=diagnosis_executor, repair=repair_executor)
         for tc in tool_calls:
             name = tc["function"]["name"]
             try:
@@ -330,108 +238,27 @@ def run_scenario(
                 if approve == "prompt" and isinstance(args, dict)
                 else args
             )
-            result = ""
-            call_status = "finished"
-            approved_by = None
-            call_error = None
             call_id = f"{tc.get('id', 'call')}-{steps}-{len(messages)}"
-            mutating = name in REPAIR_TOOLS
-            destructive = name in DESTRUCTIVE_TOOLS
+            tool = registry.get(name)
+            mutating = bool(tool and tool.mutating)
+            destructive = bool(tool and tool.destructive)
             if store is not None:
                 store.begin_tool_call(run_id, call_id, len(messages) - 1, name, log_args, mutating, destructive)
-
-            if name == DIAGNOSIS_TOOL:
-                diagnosis_raw = args.get("root_cause")
-                diagnosis = normalize_diagnosis(diagnosis_raw)
-                diagnosis_submitted = True
-                diagnosis_correct = diagnosis == scenario["root_cause"]
-                approved = diagnosis_correct
-                if approved and approve == "prompt":
-                    if pause_reporter is not None:
-                        pause_reporter()
-                    try:
-                        try:
-                            answer = input(f"Approve repair for {diagnosis}? [y/N] ").strip().lower()
-                        except EOFError:
-                            answer = ""
-                    finally:
-                        if resume_reporter is not None:
-                            resume_reporter()
-                    approved = answer in {"y", "yes"}
-                    approval_source = "operator"
-                elif approved:
-                    approval_source = "policy"
-                approval_token = f"approved:{run_id}" if approved else None
-                if not diagnosis_correct:
-                    result = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
-                elif approve == "prompt" and not approved:
-                    result = "diagnosis correct; operator declined repair approval"
-                elif approve == "prompt":
-                    result = "diagnosis accepted; approval_token suppressed (prompt mode)"
-                else:
-                    result = f"diagnosis accepted; approval_token={approval_token}"
-                approved_by = approval_source if approved else None
-                log({
-                    "type": "approval",
-                    "granted": approved,
-                    "diagnosis": diagnosis,
-                    "diagnosis_correct": diagnosis_correct,
-                    "mode": approve,
-                    "raw": diagnosis_raw,
-                })
-                if store is not None:
-                    store.add_diagnosis_attempt(run_id, diagnosis_raw, diagnosis, diagnosis_correct)
-                    store.update_tool_call_status(run_id, call_id, "started")
-            elif name in REPAIR_TOOLS:
-                safe_args = {k: v for k, v in args.items() if k != "approval_token"}
-                reason = None
-                if not diagnosis_submitted:
-                    reason = "BLOCKED: diagnosis required first"
-                elif approval_token is None:
-                    reason = (
-                        "BLOCKED: approval not granted"
-                        if diagnosis_correct
-                        else "BLOCKED: diagnosis rejected; no approval token"
-                    )
-                elif args.get("approval_token") != approval_token:
-                    reason = "BLOCKED: missing or invalid approval_token"
-                elif name in forbidden:
-                    reason = "BLOCKED: forbidden repair for this scenario"
-                elif name not in acceptable:
-                    reason = "BLOCKED: repair not acceptable for this scenario"
-                if reason:
-                    result = reason + SystemPrompt.BLOCKED_REPAIR_FOLLOWUP
-                    call_status = "denied"
-                    call_error = reason
-                    policy_violations.append(f"{name}: {reason}")
-                    if "forbidden" in reason:
-                        forbidden_reason = reason
-                    if store is not None:
-                        store.add_policy_violation(run_id, name, reason)
-                else:
-                    approved_by = approval_source or ("operator" if approve == "prompt" else "policy")
-                    if store is not None:
-                        store.update_tool_call_status(run_id, call_id, "started")
-                    checkpoint()
-                    try:
-                        result = _exec_repair(name, args)
-                        if result.startswith("timeout waiting for"):
-                            result += SystemPrompt.REPAIR_TIMEOUT_FOLLOWUP
-                        repair = name
-                        repair_args = safe_args
-                    except Exception as e:
-                        result = f"ERROR: {e}"
-                    call_status = "finished" if not result.startswith("ERROR:") else "failed"
-                    if store is not None:
-                        artifact("repair_output_full", {"tool": name, "args": safe_args, "result": result})
+            if tool is None:
+                outcome = ToolOutcome(message=f"unknown tool: {name}", status="failed", call_error=f"unknown tool: {name}")
             else:
-                if store is not None:
+                if tool.kind == "diagnostic" and store is not None:
                     store.update_tool_call_status(run_id, call_id, "started")
-                try:
-                    result = _exec_diagnostic(name, args)
-                except Exception as e:
-                    result = f"ERROR: {e}"
-                call_status = "finished" if not result.startswith("ERROR:") else "failed"
+                context.call_id = call_id
+                outcome = tool.run(args, context)
+            state.apply(outcome)
+            result = outcome.message
+            call_status = outcome.status
+            approved_by = outcome.approved_by
+            call_error = outcome.call_error
+            if outcome.artifact_kind:
+                artifact(outcome.artifact_kind, outcome.artifact_payload)
+            elif tool is not None and tool.kind == "diagnostic":
                 artifact("tool_output_full", {"tool": name, "args": args, "result": result})
 
             raw_result = result
@@ -446,7 +273,7 @@ def run_scenario(
             log({"type": "tool", "name": name, "args": log_args, "result": result, "status": call_status, "mutating": mutating})
             checkpoint()
 
-        if not diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
+        if not state.diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
             nudge = {"role": "user", "content": "Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response."}
             messages.append(nudge)
             if store is not None:
@@ -492,15 +319,15 @@ def run_scenario(
         "baseline_ok": baseline_ok,
         "inject_ok": inject_ok,
         "fault_present": fault_present,
-        "diagnosis": diagnosis,
-        "diagnosis_raw": diagnosis_raw,
+        "diagnosis": state.diagnosis,
+        "diagnosis_raw": state.diagnosis_raw,
         "truth": scenario["root_cause"],
-        "diagnosis_correct": diagnosis == scenario["root_cause"],
-        "approval_granted": approval_token is not None,
-        "repair": repair,
-        "repair_args": repair_args,
-        "policy_violations": policy_violations,
-        "forbidden_reason": forbidden_reason,
+        "diagnosis_correct": state.diagnosis == scenario["root_cause"],
+        "approval_granted": state.approval_token is not None,
+        "repair": state.repair,
+        "repair_args": state.repair_args,
+        "policy_violations": state.policy_violations,
+        "forbidden_reason": state.forbidden_reason,
         "verify_ok": verify_ok,
         "verify_output": truncate(verify_output, 1000),
         "steps": steps,
@@ -514,23 +341,23 @@ def run_scenario(
     loop_success = bool(
         record["diagnosis_correct"]
         and verify_ok
-        and (bool(repair) != no_fault)
+        and (bool(state.repair) != no_fault)
     )
     if no_fault:
-        repair_acceptable = repair is None
+        repair_acceptable = state.repair is None
     else:
-        repair_acceptable = bool(repair and repair in acceptable)
+        repair_acceptable = bool(state.repair and state.repair in acceptable)
     score = {
         "scorer_version": "legacy-record-v1",
         "fault_present": fault_present,
         "end_reason": end_reason,
-        "diagnosis": diagnosis,
+        "diagnosis": state.diagnosis,
         "diagnosis_correct": record["diagnosis_correct"],
-        "repair_action": repair,
+        "repair_action": state.repair,
         "repair_acceptable": repair_acceptable,
-        "repair_forbidden": bool(repair and repair in forbidden),
+        "repair_forbidden": bool(state.repair and state.repair in forbidden),
         "recovered": verify_ok,
-        "policy_violations": len(policy_violations),
+        "policy_violations": len(state.policy_violations),
         "loop_success": loop_success,
     }
     if store is not None:
