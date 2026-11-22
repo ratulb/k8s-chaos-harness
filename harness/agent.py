@@ -4,9 +4,11 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from harness.engine import run_scenario as _run_scenario
+from harness.engine import run_scenario as _legacy_run_scenario
+from harness.loop import AgentLoop, RunResult
 from harness.message import Message
 from harness.prompt import SystemPrompt
+from harness.spec import ExperimentSpec, RunContext
 from harness.tooling import AgentState, Diagnosis, Repair, normalize_diagnosis
 from llm.client import LLMClient
 from tools.tool import TOOL_REGISTRY, ToolContext, ToolOutcome, build_tool_registry
@@ -19,15 +21,14 @@ class Agent:
     diagnosis_class: Any
     repair_class: Any
 
-    def run(self, *args: Any, **kwargs: Any) -> dict:
-        return _run_scenario(
-            *args,
+    def run(self, spec: ExperimentSpec, ctx: RunContext) -> RunResult:
+        loop = AgentLoop(
             client_factory=self.client_factory,
             tool_registry=self.tool_registry,
             diagnosis_class=self.diagnosis_class,
             repair_class=self.repair_class,
-            **kwargs,
         )
+        return loop.run(spec, ctx)
 
 
 def build_agent() -> Agent:
@@ -40,8 +41,8 @@ def build_agent() -> Agent:
 
 
 def run_scenario(
-    scenario: dict,
-    backend,
+    scenario: Any,
+    backend: Any,
     run_id: str,
     inject_cmd: str,
     verify_cmd: str,
@@ -61,7 +62,8 @@ def run_scenario(
     resume_reporter: Any = None,
     run_env: dict[str, str] | None = None,
 ) -> dict:
-    return build_agent().run(
+    agent = build_agent()
+    return _legacy_run_scenario(
         scenario,
         backend,
         run_id,
@@ -82,16 +84,24 @@ def run_scenario(
         pause_reporter=pause_reporter,
         resume_reporter=resume_reporter,
         run_env=run_env,
+        client_factory=agent.client_factory,
+        tool_registry=agent.tool_registry,
+        diagnosis_class=agent.diagnosis_class,
+        repair_class=agent.repair_class,
     )
 
 
 __all__ = [
     "Agent",
+    "AgentLoop",
     "AgentState",
     "Diagnosis",
+    "ExperimentSpec",
     "LLMClient",
     "Message",
     "Repair",
+    "RunContext",
+    "RunResult",
     "SystemPrompt",
     "TOOL_REGISTRY",
     "ToolContext",

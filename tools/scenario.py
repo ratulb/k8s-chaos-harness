@@ -49,6 +49,15 @@ class ValidationReport:
         return list(self.errors)
 
 
+ScenarioLike = "Scenario | dict[str, Any]"
+
+
+def as_scenario(value: ScenarioLike) -> "Scenario":
+    if isinstance(value, Scenario):
+        return value
+    return Scenario.from_dict(value)
+
+
 @dataclass(frozen=True)
 class Scenario:
     raw: dict[str, Any]
@@ -127,6 +136,27 @@ class Scenario:
     @property
     def min_etcd_members(self) -> int:
         return int(self.raw.get("min_etcd_members", 0))
+
+    @property
+    def min_targets(self) -> int:
+        requirements = self.raw.get("selector_requirements") or {}
+        return int(requirements.get("min_targets", 0) if isinstance(requirements, dict) else 0)
+
+    @property
+    def step_limit(self) -> int:
+        return int(self.raw.get("max_steps", 40))
+
+    @property
+    def token_limit(self) -> int:
+        return int(self.raw.get("max_tokens", 60000))
+
+    @property
+    def diagnosis_deadline_steps(self) -> int:
+        return int(self.raw.get("diagnosis_deadline_steps", 4))
+
+    @property
+    def verification_timeout(self) -> int:
+        return int(self.raw.get("timeout_seconds", 300))
 
     @property
     def menu_label(self) -> str:

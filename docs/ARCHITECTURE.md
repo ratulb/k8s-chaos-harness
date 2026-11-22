@@ -41,32 +41,41 @@ EXPERIMENT SETUP / RESUME
             |
             v
 AGENT COMPOSITION
-  harness/agent.py:15  Agent
-  harness/agent.py:32  build_agent()
-    wires: LLMClient + TOOL_REGISTRY + Diagnosis + Repair
-  harness/agent.py:42  run_scenario() facade
+  harness/agent.py  Agent / build_agent()
+    wires: ChatClient adapter + TOOL_REGISTRY + Diagnosis + Repair
+  harness/agent.py  run_scenario() legacy dict facade
+            |
+            v
+TYPED BOUNDARY
+  ExperimentSpec + RunContext
+  Budget + Call + LLMResponse + Result/Approval/Refusal
             |
             v
 AGENT ORCHESTRATION
-  harness/engine.py:19  run_scenario()
-    - trace/artifact/event logging
+  harness/loop.py  AgentLoop.run(spec, ctx) -> RunResult
+    - event/artifact logging through RunStore
     - AgentState restore/checkpoint
     - Message[] conversation
     - LLM loop
     - tool dispatch
     - verification
-    - record + score + finish_run
+    - record + Score + finish_run
             |
             v
 DOMAIN / POLICY OBJECTS
-  Scenario              tools/scenario.py:51
-  LLMError              common/errors.py:7
-  SystemPrompt          harness/prompt.py:9
-  Message               harness/message.py:10
-  Tool / Registry       tools/tool.py:61 / :124
-  ToolOutcome           tools/tool.py:34
-  AgentState            harness/tooling.py:26
-  Diagnosis / Repair    harness/tooling.py:104 / :173
+  Scenario              tools/scenario.py
+  ExperimentSpec        harness/spec.py
+  RunContext            harness/spec.py
+  Budget / Call         harness/budget.py / harness/call.py
+  LLMResponse           llm/response.py
+  Result/Approval/Refusal common/results.py
+  LLMError / Score      common/errors.py / common/scoring.py
+  SystemPrompt          harness/prompt.py
+  Message               harness/message.py
+  Tool / Registry       tools/tool.py
+  ToolOutcome           tools/tool.py
+  AgentState            harness/tooling.py
+  Diagnosis / Repair    harness/tooling.py
             |
             v
 INFRASTRUCTURE / ADAPTERS
@@ -84,14 +93,14 @@ OUTPUTS
 ```
 
 The honest description: the repository is mid-migration from procedural scripts
-to OO. We have useful value objects at the edges, but the central loop still
-coordinates mostly through dicts, globals, and `Any`.
+to OO. The central loop now has typed boundaries and ports, while runner helpers,
+some CLI code, and tool handlers still accept raw dicts for compatibility.
 
 ## 2. Main ownership map
 
 | Concern | Current owner | Comment |
 | --- | --- | --- |
-| Scenario definition + validation | `tools/scenario.py:51` | Good object, but the runner converts it back to `dict` at `run_benchmark.py:396`. |
+| Scenario definition + validation | `tools/scenario.py` | Authoritative in runner, loop, and gate policy; dicts coerced at compatibility edges. |
 | Cluster identity / topology | `tools/topology.py:516` | Discovers, freezes, hashes, resolves targets; still returns raw dicts. |
 | Destructive safety | `tools/safety.py:29` | Enforces context/cluster/topology allow-lists. |
 | Backend config | `llm/client.py:17` | `Backend` is typed, but engine receives it untyped. |
@@ -99,9 +108,9 @@ coordinates mostly through dicts, globals, and `Any`.
 | Prompt policy | `harness/prompt.py:9` | `SystemPrompt` renders topology-aware prompt. |
 | Tool catalog | `tools/tool.py:235` | Singleton `TOOL_REGISTRY`; dynamic schemas; late-bound repair handlers. |
 | Diagnosis/repair gates | `harness/tooling.py:104`, `harness/tooling.py:173` | Real domain policy; good seam. |
-| Agent wiring | `harness/agent.py:32` | `build_agent()` is now a real mini composition root. |
-| Orchestration loop | `harness/engine.py:19` | Still large; owns logging, loop, tools, verify, scoring handoff. |
-| Persistence | `storage/sqlite_store.py:305` | Authoritative, event-log-first. |
+| Agent wiring | `harness/agent.py` | `build_agent()` is a mini composition root; `Agent.run` delegates to `AgentLoop`. |
+| Orchestration loop | `harness/loop.py` | Owns budget, LLM responses, tool calls, verify, and `RunResult`. |
+| Persistence | `storage/sqlite_store.py` | Authoritative, event-log-first; sole writer of derived traces/exports. |
 | Scoring | `common/scoring.py` | One `Score` used by engine, `score.py`, and `replay.py`. |
 
 ### Layering assessment
@@ -109,7 +118,7 @@ coordinates mostly through dicts, globals, and `Any`.
 ```text
 root CLIs / scripts
   -> harness/agent.py
-  -> harness/engine.py
+  -> harness/spec.py -> harness/loop.py
   -> harness/tooling.py, harness/prompt.py, harness/message.py
   -> llm/client.py, tools/tool.py, tools/topology.py, storage/sqlite_store.py
   -> common.*, tools/{cluster_config,ssh,k8s,node_etcd,repairs,truncate}
@@ -139,7 +148,7 @@ run_benchmark.main()
   parse args/paths
   load_scenario_object()
   validate scenario
-  scenario_obj.to_dict()          <-- typed object downgraded here
+  keep Scenario as the authoritative object
         |
         v
 topology + safety
@@ -168,24 +177,31 @@ fresh setup
   wait_for_fault
         |
         v
-harness.agent.run_scenario()
+harness.spec.ExperimentSpec + RunContext
+  scenario, backend, commands, frozen env
+  run identity, store, reporter, resume flag
+         |
+         v
+harness.agent.Agent.run(spec, ctx)
   build_agent()
-    LLMClient
+    ChatClient adapter (LLMClient)
     TOOL_REGISTRY
     Diagnosis
     Repair
-        |
-        v
-harness.engine.run_scenario()
+         |
+         v
+harness.loop.AgentLoop.run(spec, ctx) -> RunResult
   restore/create AgentState
   restore/create Message[]
+  Budget / Call / LLMResponse
   SystemPrompt(topology).render()
   checkpoint
+
         |
         v
 LLM LOOP
-  Message[] -> dicts -> LLMClient.chat()
-  response -> Message
+  Message[] -> dicts -> ChatClient.chat()
+  response -> LLMResponse -> Message
   append to SQLite messages
   redact for event log
   checkpoint
@@ -193,7 +209,7 @@ LLM LOOP
         +-- no tool calls + no diagnosis -> nudge
         +-- no tool calls + diagnosis -> stop
         +-- tool calls:
-              parse args
+              Call.from_tool_call()
               registry.get(name)
               store.begin_tool_call()
               Tool.run(args, ToolContext)
@@ -205,15 +221,17 @@ LLM LOOP
         |
         v
 budget/stop condition
-  budget_steps / budget_tokens / submitted / provider_error_* / agent_stopped
-        |
-        v
+  Budget.exhausted_reason() / submitted / provider_error_* / agent_stopped
+         |
+         v
 VERIFY + FINISH
-  subprocess.run(verify_cmd)
+  subprocess.run(verify_cmd, env=spec.run_env)
   record = {...}
-  score = {...}
+  score = Score.from_record(...)
   store.finish_run()
-  export_all()
+  store.export_trace()
+  store.export_all()
+
         |
         v
 derived views
@@ -590,10 +608,10 @@ composition/
   chaos_cli.main()
 ```
 
-## 7. Recommended refactor sequence
+## 7. Refactor sequence
 
-The next work should not be “move more code.” Safety fixes went first because they
-did not depend on the refactor; structural changes go last.
+Safety fixes went first, then the typed boundary objects, then the loop seam.
+The legacy dict facade remains only as a compatibility adapter.
 
 Completed in the current hardening pass:
 
@@ -603,17 +621,21 @@ Completed in the current hardening pass:
 2. One `Score` object used by engine, `score.py`, and `replay.py`; explicit
    scorer-version precedence; `verify_output` in records.
 3. Streaming fallback visibility and redacted derived traces/exports.
+4. `Scenario` is authoritative in runner, engine, and gate policy; dicts are
+   coerced only at compatibility boundaries and serialization.
+5. `ExperimentSpec` / `RunContext`, `Budget`, `Call`, `LLMResponse`, `Result`,
+   `Approval`, and `Refusal` carry the previously untyped boundary state.
+6. One typed `AgentLoop.run(spec, ctx) -> RunResult`; `run_scenario` is a legacy
+   adapter, and `Agent.run` is composition rather than the loop.
+7. `RunStore` and `ChatClient` ports define the loop dependencies; the SQLite
+   store is the only writer of derived traces and exports.
 
 Remaining:
 
-4. Make `Scenario` authoritative end-to-end.
-5. Introduce `ExperimentSpec` / `RunContext` instead of dict bags.
-6. Collapse the two `run_scenario` APIs into one typed
-   `AgentLoop.run(spec) -> RunResult`.
-7. Consolidate policy into `TopologyPolicy` and state into events plus a
+8. Consolidate policy into `TopologyPolicy` and state into events plus a
    rebuildable projection.
-8. Add `RunStore` and `ChatClient` ports, then move code incrementally into the
-   target layout in §6 with `tools/` re-export shims.
+9. Move code incrementally into the target layout in §6 with `tools/` re-export
+   shims.
 
 ## 8. Review-driven design decisions
 
@@ -661,5 +683,6 @@ used by the engine, `score.py`, and `replay.py`.
 ### 8.6 Incremental OO migration
 
 The target layout in §6 is a destination, not a big-bang rewrite. `Score`,
-`ExperimentSpec`, `TopologyPolicy`, and `RunStore` land first; `tools/` re-export
-shims keep imports stable while modules move.
+`ExperimentSpec`, `RunContext`, `RunStore`, and `ChatClient` have landed; the
+legacy `run_scenario` facade and `tools/` re-exports keep imports stable while
+remaining policy and infrastructure modules move incrementally.

@@ -7,6 +7,7 @@ import time
 from typing import Any
 
 from tools import cluster_config, topology as topology_tools
+from tools.scenario import as_scenario
 from tools.ssh import run_on_node
 
 FAULT_TIMEOUTS = {
@@ -31,11 +32,12 @@ ETCDCTL_ARGS = [
 ]
 
 
-def timeout_for(scenario: dict[str, Any]) -> float:
-    configured = scenario.get("fault_present_timeout_seconds")
+def timeout_for(scenario: Any) -> float:
+    value = as_scenario(scenario)
+    configured = value.fault_present_timeout_seconds
     if configured is not None:
         return float(configured)
-    return FAULT_TIMEOUTS.get(str(scenario.get("id", "")), 60.0)
+    return FAULT_TIMEOUTS.get(value.id, 60.0)
 
 
 def _kubectl(args: list[str], timeout: int = 20) -> tuple[bool, str]:
@@ -163,11 +165,11 @@ def _quorum_lost(targets: list[str]) -> tuple[bool, str]:
 
 
 def check_fault_present(
-    scenario: dict[str, Any],
+    scenario: Any,
     targets: list[str],
     env: dict[str, str] | None = None,
 ) -> tuple[bool, str]:
-    scenario_id = str(scenario.get("id", ""))
+    scenario_id = as_scenario(scenario).id
     check_env = os.environ if env is None else env
     if check_env.get("CHAOS_FAULT_CHECK_MODE") == "fixture":
         return True, "fixture mode skips live fault check"
@@ -200,7 +202,7 @@ def check_fault_present(
 
 
 def wait_for_fault(
-    scenario: dict[str, Any],
+    scenario: Any,
     targets: list[str],
     timeout: float | None = None,
     env: dict[str, str] | None = None,

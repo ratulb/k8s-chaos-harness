@@ -13,6 +13,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from tools.scenario import as_scenario
+
 RECOMMENDED_MEMBERS = 3
 ORDINAL_ROLES = (
     "first", "second", "third", "fourth", "fifth", "sixth", "seventh",
@@ -635,22 +637,21 @@ def resolve_targets(
 
 
 def capability_check(
-    scenario: dict[str, Any],
+    scenario: Any,
     topology: dict[str, Any],
     mode: str = "benchmark",
     local_node: str | None = None,
 ) -> dict[str, Any]:
     if mode not in {"benchmark", "repair"}:
         raise RuntimeError(f"unknown mode {mode!r}")
+    value = as_scenario(scenario)
     warnings = [str(item) for item in topology.get("warnings") or []]
     member_count = int(topology.get("etcd_member_count") or len(topology.get("etcd_members") or []))
-    minimum = int(scenario.get("min_etcd_members") or 1)
-    impact_class = str(scenario.get("impact_class") or "control")
-    selectors = scenario.get("target_nodes") or []
-    if isinstance(selectors, str):
-        selectors = [selectors]
+    minimum = int(value.min_etcd_members or 1)
+    impact_class = str(value.impact_class or "control")
+    selectors = value.target_nodes
     dynamic_quorum = any(str(item) == "quorum_losing_set" for item in selectors)
-    avoid_local = bool(scenario.get("avoid_local_target"))
+    avoid_local = value.avoid_local_target
 
     if member_count != RECOMMENDED_MEMBERS:
         warnings.append(

@@ -19,10 +19,12 @@ from llm.client import LLMClient
 from tools import fault_checks, topology as topology_tools
 from tools import safety as safety_tools
 from tools.scenario_schema import load_scenario_object
-from harness.agent import run_scenario
+from harness.agent import build_agent
 from harness.reporter import UiReporter
+from harness.spec import ExperimentSpec, RunContext
 from harness.ui import LiveView
 from storage.sqlite_store import active_topology_hash, archive_state, discard_state, SQLiteStore
+from tools.scenario import as_scenario
 
 _SAFE_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
@@ -83,7 +85,7 @@ def _record_topology(store: SQLiteStore, run_id: str, topology_data: dict, capab
 
 def _terminal_record(
     run_id: str,
-    scenario: dict,
+    scenario,
     backend,
     reset_ok: bool,
     baseline_ok: bool,
@@ -92,9 +94,10 @@ def _terminal_record(
     fault_present: bool = False,
 ) -> dict:
     from tools.truncate import truncate
+    value = as_scenario(scenario)
     return {
         "run_id": run_id,
-        "scenario": scenario["id"],
+        "scenario": value.id,
         "backend": backend.name,
         "reset_ok": reset_ok,
         "baseline_ok": baseline_ok,
@@ -102,7 +105,7 @@ def _terminal_record(
         "fault_present": fault_present,
         "diagnosis": None,
         "diagnosis_raw": None,
-        "truth": scenario["root_cause"],
+        "truth": value.root_cause,
         "diagnosis_correct": False,
         "approval_granted": False,
         "repair": None,
@@ -121,7 +124,7 @@ def _terminal_record(
 def _run_fresh(
     store: SQLiteStore,
     run_row: dict,
-    scenario: dict,
+    scenario,
     backend,
     inject_cmd: str,
     verify_cmd: str,
@@ -135,6 +138,7 @@ def _run_fresh(
     mode: str = "benchmark",
     approve: str = "policy",
 ) -> dict:
+    scenario = as_scenario(scenario)
     run_id = run_row["run_id"]
     log_path = _log_path(logs_dir, run_id)
     owner = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
@@ -222,29 +226,34 @@ def _run_fresh(
     def resume_view() -> None:
         if view:
             view.start()
+    spec = ExperimentSpec(
+        scenario=scenario,
+        backend=backend,
+        inject_cmd=inject_cmd,
+        verify_cmd=verify_cmd,
+        verify_timeout=timeout,
+        trace_dir=trace_dir,
+        run_env=run_env,
+        approve=approve,
+        mode=mode,
+    )
+    ctx = RunContext(
+        run_id=run_id,
+        store=store,
+        reporter=reporter,
+        resume=False,
+        log_path=log_path,
+        setup_output=setup_output,
+        baseline_ok=baseline_ok,
+        reset_ok=reset_ok,
+        inject_ok=inject_ok,
+        fault_present=fault_present,
+        pause_reporter=pause_view,
+        resume_reporter=resume_view,
+        lease_owner=owner,
+    )
     try:
-        rec = run_scenario(
-            scenario,
-            backend,
-            run_id,
-            inject_cmd,
-            verify_cmd,
-            trace_dir=trace_dir,
-            verify_timeout=timeout,
-            baseline_ok=baseline_ok,
-            reset_ok=reset_ok,
-            inject_ok=inject_ok,
-            fault_present=fault_present,
-            setup_output=setup_output,
-            store=store,
-            resume=False,
-            reporter=reporter,
-            log_path=log_path,
-            approve=approve,
-            pause_reporter=pause_view,
-            resume_reporter=resume_view,
-            run_env=run_env,
-        )
+        rec = build_agent().run(spec, ctx).to_record()
     finally:
         if view:
             view.stop()
@@ -256,7 +265,7 @@ def _run_fresh(
 def _run_resume(
     store: SQLiteStore,
     row: dict,
-    scenario: dict,
+    scenario,
     backend,
     root: str,
     trace_dir: str,
@@ -267,6 +276,7 @@ def _run_resume(
     approve: str = "policy",
     run_env: dict[str, str] | None = None,
 ) -> dict:
+    scenario = as_scenario(scenario)
     run_id = row["run_id"]
     log_path = _log_path(logs_dir, run_id)
     if approve == "prompt":
@@ -287,7 +297,7 @@ def _run_resume(
                 error="read-only call superseded by resume",
             )
 
-    verify_cmd = scenario["verify"]
+    verify_cmd = scenario.verify
     if not os.path.isabs(verify_cmd):
         verify_cmd = os.path.join(root, verify_cmd)
     reporter = UiReporter(run_id, store)
@@ -300,24 +310,29 @@ def _run_resume(
     def resume_view() -> None:
         if view:
             view.start()
+    spec = ExperimentSpec(
+        scenario=scenario,
+        backend=backend,
+        inject_cmd="",
+        verify_cmd=verify_cmd,
+        verify_timeout=300,
+        trace_dir=trace_dir,
+        run_env=dict(run_env or {}),
+        approve=approve,
+        mode=mode,
+    )
+    ctx = RunContext(
+        run_id=run_id,
+        store=store,
+        reporter=reporter,
+        resume=True,
+        log_path=log_path,
+        pause_reporter=pause_view,
+        resume_reporter=resume_view,
+        lease_owner=owner,
+    )
     try:
-        rec = run_scenario(
-            scenario,
-            backend,
-            run_id,
-            "",
-            verify_cmd,
-            trace_dir=trace_dir,
-            verify_timeout=300,
-            store=store,
-            resume=True,
-            reporter=reporter,
-            log_path=log_path,
-            approve=approve,
-            pause_reporter=pause_view,
-            resume_reporter=resume_view,
-            run_env=run_env,
-        )
+        rec = build_agent().run(spec, ctx).to_record()
     finally:
         if view:
             view.stop()
@@ -409,20 +424,20 @@ def main() -> None:
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         sys.exit(2)
-    scenario = scenario_obj.to_dict()
+    scenario = scenario_obj
 
     try:
         topology_data = topology_tools.discover_topology()
         destructive_guard = safety_tools.require_destructive_guard(topology_data)
         topology_tools.freeze_topology(topology_data)
         capability = topology_tools.capability_check(scenario, topology_data, args.mode)
-        targets = scenario_obj.target_nodes
+        targets = scenario.target_nodes
         resolved = topology_tools.resolve_targets(
             topology_data,
             targets,
-            avoid_local=scenario_obj.avoid_local_target,
+            avoid_local=scenario.avoid_local_target,
         )
-        min_targets = int(scenario_obj.raw.get("selector_requirements", {}).get("min_targets", 0))
+        min_targets = scenario.min_targets
         if len(resolved) < min_targets:
             raise RuntimeError(f"scenario requires at least {min_targets} target node(s); resolved {resolved}")
         resolved = _validate_targets(resolved)
@@ -474,22 +489,23 @@ def main() -> None:
         print(json.dumps(summary), flush=True)
 
     store = SQLiteStore(args.db)
-    spec_hash = store.hash_spec(scenario)
-    spec_json = json.dumps(scenario, sort_keys=True)
-    scenario_version = store.ensure_scenario(scenario["id"], spec_hash, spec_json)
+    scenario_dict = scenario.to_dict()
+    spec_hash = store.hash_spec(scenario_dict)
+    spec_json = json.dumps(scenario_dict, sort_keys=True)
+    scenario_version = store.ensure_scenario(scenario.id, spec_hash, spec_json)
 
     backend = build_backend(args.backend)
 
-    inject_cmd = scenario["inject"]
+    inject_cmd = scenario.inject
     if not os.path.isabs(inject_cmd):
         inject_cmd = os.path.join(root, inject_cmd)
-    verify_cmd = scenario["verify"]
+    verify_cmd = scenario.verify
     if not os.path.isabs(verify_cmd):
         verify_cmd = os.path.join(root, verify_cmd)
     reset_cmd = args.reset_cmd
     if reset_cmd and not os.path.isabs(reset_cmd):
         reset_cmd = os.path.join(root, reset_cmd)
-    timeout = int(scenario.get("timeout_seconds", 300))
+    timeout = scenario.verification_timeout
 
     run_env = os.environ.copy()
     run_env["CHAOS_TOPOLOGY_JSON"] = json.dumps(topology_data, sort_keys=True)
@@ -517,7 +533,7 @@ def main() -> None:
         batch_id = store.create_batch(
             batch_id=args.batch_id,
             command=sys.argv,
-            scenario_ids=[scenario["id"]],
+            scenario_ids=[scenario.id],
             backend=backend.name,
             seed_start=args.seed,
             runs_requested=args.runs,
@@ -525,11 +541,11 @@ def main() -> None:
             config_hash=config_hash,
             topology_hash=topology_data["topology_hash"],
         )
-        run_id = f"{scenario['id']}-{backend.name}-{args.seed}-unsupported-{uuid.uuid4().hex[:8]}"
+        run_id = f"{scenario.id}-{backend.name}-{args.seed}-unsupported-{uuid.uuid4().hex[:8]}"
         run_row = store.create_run(
             run_id,
             batch_id=batch_id,
-            scenario_id=scenario["id"],
+            scenario_id=scenario.id,
             scenario_version=scenario_version,
             spec_hash=spec_hash,
             backend=backend.name,
@@ -538,7 +554,7 @@ def main() -> None:
             seed=args.seed,
             status="pending",
             phase="queued",
-            truth=scenario["root_cause"],
+            truth=scenario.root_cause,
             config_hash=config_hash,
             topology_hash=topology_data["topology_hash"],
             interactive=args.approve == "prompt",
@@ -562,7 +578,7 @@ def main() -> None:
     batch_id = store.create_batch(
         batch_id=args.batch_id,
         command=sys.argv,
-        scenario_ids=[scenario["id"]],
+        scenario_ids=[scenario.id],
         backend=backend.name,
         seed_start=args.seed,
         runs_requested=args.runs,
@@ -589,7 +605,7 @@ def main() -> None:
                     file=sys.stderr,
                 )
                 sys.exit(1)
-            if row["scenario_id"] != scenario["id"] or row["backend"] != backend.name:
+            if row["scenario_id"] != scenario.id or row["backend"] != backend.name:
                 print(f"run {row['run_id']} does not match --scenario/--backend", file=sys.stderr)
                 continue
             reason = None
@@ -625,13 +641,13 @@ def main() -> None:
         return
 
     for i in range(args.runs):
-        run_id = f"{scenario['id']}-{backend.name}-{args.seed + i}-{uuid.uuid4().hex[:8]}"
+        run_id = f"{scenario.id}-{backend.name}-{args.seed + i}-{uuid.uuid4().hex[:8]}"
         if args.ui == "none":
             print(f"=== run {i+1}/{args.runs}: {run_id} ===", flush=True)
         run_row = store.create_run(
             run_id,
             batch_id=batch_id,
-            scenario_id=scenario["id"],
+            scenario_id=scenario.id,
             scenario_version=scenario_version,
             spec_hash=spec_hash,
             backend=backend.name,
@@ -640,7 +656,7 @@ def main() -> None:
             seed=args.seed + i,
             status="pending",
             phase="queued",
-            truth=scenario["root_cause"],
+            truth=scenario.root_cause,
             config_hash=config_hash,
             topology_hash=topology_data["topology_hash"],
             interactive=args.approve == "prompt",

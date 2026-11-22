@@ -59,6 +59,7 @@ class ToolContext:
     call_id: str
     diagnosis: Any | None = None
     repair: Any | None = None
+    call: Any | None = None
 
 
 @dataclass(frozen=True)

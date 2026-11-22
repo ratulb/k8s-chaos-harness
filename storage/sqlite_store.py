@@ -1500,6 +1500,20 @@ class SQLiteStore:
             records.append(record)
         return records
 
+    def export_trace(self, run_id: str, trace_dir: str | Path) -> Path:
+        directory = Path(trace_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / f"{run_id}.jsonl"
+        events = self.load_events(run_id)
+        target.write_text(
+            "".join(
+                json.dumps(Message.redact_payload(event), sort_keys=True, default=str) + "\n"
+                for event in events
+            ),
+            encoding="utf-8",
+        )
+        return target
+
     def export_all(self, runs_path: str | Path, trace_dir: str | Path) -> dict[str, Any]:
         runs_path = Path(runs_path)
         trace_dir = Path(trace_dir)
@@ -1523,14 +1537,7 @@ class SQLiteStore:
         for run_id in run_ids:
             events = self.load_events(run_id)
             if events:
-                target = trace_dir / f"{run_id}.jsonl"
-                target.write_text(
-                    "".join(
-                        json.dumps(Message.redact_payload(event), sort_keys=True) + "\n"
-                        for event in events
-                    ),
-                    encoding="utf-8",
-                )
+                self.export_trace(run_id, trace_dir)
                 trace_count += 1
             snapshots = self.load_state_snapshots(run_id)
             if snapshots:

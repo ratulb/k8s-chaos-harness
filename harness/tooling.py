@@ -3,9 +3,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from common.results import Approval, Refusal, Result, ResultKind
 from common.vocab import ROOT_CAUSE_LABELS
 from harness.prompt import SystemPrompt
 from tools.naming import normalize_repair_name
+from tools.scenario import Scenario, as_scenario
 from tools.tool import Tool, ToolOutcome
 
 MAX_DIAGNOSIS_ATTEMPTS = 2
@@ -28,7 +30,7 @@ def normalize_diagnosis(value: object) -> str | None:
 
 @dataclass
 class AgentState:
-    scenario: dict[str, Any]
+    scenario: Scenario
     run_id: str
     approve: str
     diagnosis: str | None = None
@@ -44,11 +46,14 @@ class AgentState:
     policy_violations: list[str] = field(default_factory=list)
     forbidden_reason: str | None = None
 
+    def __post_init__(self) -> None:
+        self.scenario = as_scenario(self.scenario)
+
     @classmethod
-    def from_snapshot(cls, snapshot: dict[str, Any], scenario: dict[str, Any], run_id: str, approve: str) -> "AgentState":
+    def from_snapshot(cls, snapshot: dict[str, Any], scenario: Scenario, run_id: str, approve: str) -> "AgentState":
         diagnosis = snapshot.get("diagnosis")
         return cls(
-            scenario=scenario,
+            scenario=as_scenario(scenario),
             run_id=run_id,
             approve=approve,
             diagnosis=diagnosis,
@@ -129,12 +134,12 @@ class Diagnosis:
         self.pause_reporter = pause_reporter
         self.resume_reporter = resume_reporter
 
-    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
+    def decide(self, tool: Tool, args: dict[str, Any]) -> Result[Approval]:
         raw = args.get("root_cause")
         diagnosis = normalize_diagnosis(raw)
         attempt = self.state.diagnosis_attempts + 1
         exhausted = self.state.diagnosis_attempts >= MAX_DIAGNOSIS_ATTEMPTS
-        correct = not exhausted and diagnosis == self.state.scenario["root_cause"]
+        correct = not exhausted and diagnosis == self.state.scenario.root_cause
         first_attempt_correct = correct and attempt == 1
         approved = correct
         approval_source = None
@@ -153,15 +158,39 @@ class Diagnosis:
             approval_source = "operator"
         elif approved:
             approval_source = "policy"
-        approval_token = f"approved:{self.state.run_id}" if approved else None
+        token = f"approved:{self.state.run_id}" if approved else None
         if exhausted:
-            message = "diagnosis attempts exhausted; report findings and escalate without repair"
+            reason = "diagnosis attempts exhausted; report findings and escalate without repair"
         elif not correct:
-            message = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
+            reason = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
         elif self.state.approve == "prompt" and not approved:
-            message = "diagnosis correct; operator declined repair approval"
+            reason = "diagnosis correct; operator declined repair approval"
         else:
-            message = f"diagnosis accepted; approval_token={approval_token}"
+            reason = ""
+        decision: Result[Approval]
+        if approved:
+            decision = Result.approval(Approval(
+                run_id=self.state.run_id,
+                diagnosis=diagnosis,
+                source=approval_source or "policy",
+                token=token,
+                message=f"diagnosis accepted; approval_token={token}",
+                raw=raw,
+                attempt=attempt,
+                diagnosis_correct=correct,
+                first_attempt_correct=first_attempt_correct,
+            ))
+        else:
+            decision = Result.refusal(Refusal(
+                reason=reason,
+                message=reason,
+                canonical="diagnosis",
+                kind="diagnosis",
+                diagnosis=diagnosis if not exhausted else None,
+                diagnosis_correct=correct,
+                first_attempt_correct=first_attempt_correct,
+                attempt=attempt,
+            ))
         if self.log is not None:
             self.log({
                 "type": "approval",
@@ -170,24 +199,42 @@ class Diagnosis:
                 "diagnosis_correct": correct,
                 "diagnosis_attempts": attempt,
                 "diagnosis_first_attempt_correct": first_attempt_correct,
-                "approval_token": approval_token,
+                "approval_token": token,
                 "mode": self.state.approve,
                 "raw": raw,
             })
         if self.store is not None:
             self.store.add_diagnosis_attempt(self.state.run_id, raw, diagnosis, correct)
+        return decision
+
+    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
+        decision = self.decide(tool, args)
+        raw = args.get("root_cause")
+        if self.store is not None:
             self.store.update_tool_call_status(self.state.run_id, call_id, "started")
+        if decision.kind is not ResultKind.APPROVAL:
+            refusal = decision.unwrap()
+            return ToolOutcome(
+                message=refusal.message,
+                diagnosis_submitted=True,
+                diagnosis=refusal.diagnosis,
+                diagnosis_raw=raw,
+                diagnosis_correct=refusal.diagnosis_correct,
+                diagnosis_attempts=refusal.attempt or self.state.diagnosis_attempts + 1,
+                diagnosis_first_attempt_correct=refusal.first_attempt_correct,
+            )
+        approval = decision.unwrap()
         return ToolOutcome(
-            message=message,
-            approved_by=approval_source if approved else None,
+            message=approval.message,
+            approved_by=approval.source,
             diagnosis_submitted=True,
-            diagnosis=diagnosis if not exhausted else None,
+            diagnosis=approval.diagnosis,
             diagnosis_raw=raw,
-            diagnosis_correct=correct,
-            diagnosis_attempts=attempt,
-            diagnosis_first_attempt_correct=first_attempt_correct,
-            approval_token=approval_token,
-            approval_source=approval_source,
+            diagnosis_correct=approval.diagnosis_correct,
+            diagnosis_attempts=approval.attempt,
+            diagnosis_first_attempt_correct=approval.first_attempt_correct,
+            approval_token=approval.token,
+            approval_source=approval.source,
         )
 
 
@@ -206,10 +253,9 @@ class Repair:
         self.log = log
         self.checkpoint = checkpoint
 
-    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
-        safe_args = {key: value for key, value in args.items() if key != "approval_token"}
+    def authorize(self, tool: Tool, args: dict[str, Any]) -> Result[Approval]:
         canonical = normalize_repair_name(tool.name)
-        reason = None
+        reason: str | None = None
         if not self.state.diagnosis_submitted:
             reason = "BLOCKED: diagnosis required first"
         elif self.state.approval_token is None:
@@ -223,23 +269,42 @@ class Repair:
             and args.get("approval_token") != self.state.approval_token
         ):
             reason = "BLOCKED: missing or invalid approval_token"
-        elif canonical in {normalize_repair_name(name) for name in self.state.scenario.get("forbidden_repairs", [])}:
+        elif canonical in self.state.scenario.forbidden_repairs:
             reason = "BLOCKED: forbidden repair for this scenario"
-        elif canonical not in {normalize_repair_name(name) for name in self.state.scenario.get("acceptable_repairs", [])}:
+        elif canonical not in self.state.scenario.acceptable_repairs:
             reason = "BLOCKED: repair not acceptable for this scenario"
-        if reason:
-            violation = f"{canonical}: {reason}"
-            forbidden_reason = reason if "forbidden" in reason else None
+        if reason is not None:
             if self.store is not None:
                 self.store.add_policy_violation(self.state.run_id, tool.name, reason)
-            return ToolOutcome(
+            return Result.refusal(Refusal(
+                reason=reason,
                 message=reason + SystemPrompt.BLOCKED_REPAIR_FOLLOWUP,
+                canonical=canonical,
+                kind="forbidden" if "forbidden" in reason else "policy",
+            ))
+        source = self.state.approval_source or ("operator" if self.state.approve == "prompt" else "policy")
+        return Result.approval(Approval(
+            run_id=self.state.run_id,
+            diagnosis=self.state.diagnosis,
+            source=source,
+            token=self.state.approval_token,
+            message="",
+        ))
+
+    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
+        safe_args = {key: value for key, value in args.items() if key != "approval_token"}
+        canonical = normalize_repair_name(tool.name)
+        decision = self.authorize(tool, args)
+        if decision.kind is not ResultKind.APPROVAL:
+            refusal = decision.unwrap()
+            return ToolOutcome(
+                message=refusal.message,
                 status="denied",
-                call_error=reason,
-                policy_violation=violation,
-                forbidden_reason=forbidden_reason,
+                call_error=refusal.reason,
+                policy_violation=f"{canonical}: {refusal.reason}",
+                forbidden_reason=refusal.reason if "forbidden" in refusal.reason else None,
             )
-        approved_by = self.state.approval_source or ("operator" if self.state.approve == "prompt" else "policy")
+        approval = decision.unwrap()
         if self.store is not None:
             self.store.update_tool_call_status(self.state.run_id, call_id, "started")
         if self.checkpoint is not None:
@@ -256,7 +321,7 @@ class Repair:
         return ToolOutcome(
             message=result,
             status=status,
-            approved_by=approved_by,
+            approved_by=approval.source,
             repair=canonical if status == "finished" else None,
             repair_args=safe_args if status == "finished" else None,
             artifact_kind="repair_output_full",
