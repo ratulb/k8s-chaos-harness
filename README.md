@@ -135,6 +135,7 @@ never sees fault scripts or scoring truth.
 | Headline score | Default aggregate over clean, finished, non-interactive, non-resumed runs |
 
 Internally, `tools/scenario.py:Scenario` wraps scenario JSON,
+`harness/prompt.py:SystemPrompt` renders agent instructions from optional topology,
 `common/errors.py:LLMError` carries structured provider failures, and
 `common/vocab.py` is the single source for tool names, destructive tool names,
 and root-cause labels. JSON files, JSONL exports, and SQLite rows remain the

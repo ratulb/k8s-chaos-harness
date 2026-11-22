@@ -16,6 +16,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harness.agent as agent
+from harness.prompt import SystemPrompt
 from tools import cluster_config, repairs
 
 
@@ -250,9 +251,22 @@ class TestRepairGate(unittest.TestCase):
         self.assertIn("escalate to the operator", trace_text)
 
     def test_prompt_has_blocked_and_timeout_guidance(self):
-        prompt = agent.system_prompt()
+        prompt = SystemPrompt().render()
         self.assertIn("If a repair call is BLOCKED", prompt)
         self.assertIn("If a repair reports a timeout", prompt)
+
+    def test_system_prompt_uses_optional_topology(self):
+        topology = {
+            "control_planes": ["vm1", "vm2", "vm3"],
+            "probe_node": "vm2",
+            "quorum": 2,
+            "quorum_loss_targets": 2,
+        }
+        prompt = SystemPrompt(topology).render()
+        self.assertIn("3-control-plane", prompt)
+        self.assertIn("The discoverable node names are: vm1, vm2, vm3", prompt)
+        self.assertIn("The default probe node is vm2", prompt)
+        self.assertIn("Etcd quorum is 2 of 3", prompt)
 
     def test_repair_ready_timeout_is_configurable(self):
         with patch.dict(os.environ, {"CHAOS_REPAIR_READY_TIMEOUT": "240"}):

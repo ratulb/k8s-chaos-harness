@@ -9,6 +9,7 @@ from typing import Any
 
 from common.errors import LLMError
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS, ROOT_CAUSE_LABELS
+from harness.prompt import SystemPrompt
 from llm.client import LLMClient
 from tools import cluster_config
 from tools import topology as topology_tools
@@ -19,16 +20,6 @@ from tools.repairs import (
     snapshot_restore_full, reset_cluster,
 )
 from tools.truncate import truncate
-
-
-BLOCKED_REPAIR_FOLLOWUP = (
-    " Stop attempting repairs. Report this limitation and escalate to the operator "
-    "in your final response."
-)
-REPAIR_TIMEOUT_FOLLOWUP = (
-    " Repair did not complete. Do not spend the remaining budget on broad debugging; "
-    "report the timeout and escalate to the operator in your final response."
-)
 
 
 def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:
@@ -107,37 +98,6 @@ def normalize_diagnosis(value: object) -> str | None:
     if "no fault" in lowered or "cluster healthy" in lowered or "healthy" in lowered:
         return "no_fault"
     return text
-
-
-def system_prompt(topology: dict | None = None) -> str:
-    control_planes = list(topology.get("control_planes") or []) if topology else cluster_config.nodes()
-    probe = topology.get("probe_node") if topology else None
-    probe = probe or cluster_config.default_node()
-    count = len(control_planes)
-    if topology and count:
-        quorum_line = (
-            f"Etcd quorum is {topology['quorum']} of {count}; stopping "
-            f"{topology['quorum_loss_targets']} member(s) removes write quorum."
-        )
-    else:
-        quorum_line = "Quorum depends on the live etcd member count; confirm it with etcdctl_member_list."
-    return f"""You are an etcd fault diagnosis and repair agent for a {count}-control-plane Kubernetes cluster.
-
-The discoverable node names are: {', '.join(control_planes)}. Use only those exact names for node arguments.
-The default probe node is {probe}.
-Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
-root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
-
-If the diagnosis is accepted, submit_diagnosis returns an approval_token. Every repair call MUST include that exact approval_token.
-If the diagnosis is rejected, do not repair and do not brute-force labels; gather one new decisive observation before submitting again.
-Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
-Investigate briefly: use at most four assistant turns of read-only tools, then call submit_diagnosis immediately. Do not keep investigating once the likely root cause is clear.
-A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
-A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. {quorum_line}
-A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
-Choose only repairs allowed by the scenario. Keep steps efficient.
-If a repair call is BLOCKED, forbidden, or rejected, do not try another repair; report the limitation and escalate to the operator.
-If a repair reports a timeout, make at most one read-only health check, then report that the repair did not complete and escalate to the operator."""
 
 
 def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -220,8 +180,9 @@ def run_scenario(
     state = store.get_state(run_id) if (store is not None and resume) else {}
     messages: list[dict[str, Any]] = store.load_messages(run_id) if (store is not None and resume) else []
     if not messages:
+        prompt = SystemPrompt(topology_tools.frozen_topology())
         messages = [
-            {"role": "system", "content": system_prompt(topology_tools.frozen_topology())},
+            {"role": "system", "content": prompt.render()},
             {"role": "user", "content": "Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."},
         ]
         if store is not None:
@@ -439,7 +400,7 @@ def run_scenario(
                 elif name not in acceptable:
                     reason = "BLOCKED: repair not acceptable for this scenario"
                 if reason:
-                    result = reason + BLOCKED_REPAIR_FOLLOWUP
+                    result = reason + SystemPrompt.BLOCKED_REPAIR_FOLLOWUP
                     call_status = "denied"
                     call_error = reason
                     policy_violations.append(f"{name}: {reason}")
@@ -455,7 +416,7 @@ def run_scenario(
                     try:
                         result = _exec_repair(name, args)
                         if result.startswith("timeout waiting for"):
-                            result += REPAIR_TIMEOUT_FOLLOWUP
+                            result += SystemPrompt.REPAIR_TIMEOUT_FOLLOWUP
                         repair = name
                         repair_args = safe_args
                     except Exception as e:
