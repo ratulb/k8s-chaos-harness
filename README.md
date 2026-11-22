@@ -11,11 +11,11 @@ etcd failures in a live Kubernetes cluster.
 
 This README is the main guide: motivation, architecture, data model, operator
 workflow, and troubleshooting. `DESIGN.md` is the canonical decision record,
-`PHASES.md` is current status, and the remaining documents are historical or
-focused supplements.
+`PHASES.md` is current status, and `docs/ARCHITECTURE.md` is a focused
+supplement.
 
 > **Authority.** If anything conflicts, current code plus `DESIGN.md` win;
-> `PHASES.md` is status. Historical docs are context, not truth.
+> `PHASES.md` is status.
 
 Contents:
 
@@ -875,7 +875,8 @@ Tables group into configuration (`scenarios`, `batches`), run lifecycle
 Important `runs` fields: `topology_hash`, `config_hash`, `resume_of`,
 `resume_count`, `interactive`, `launch_id`, `pid`, `status`, `phase`,
 `end_reason`, `truth`, `diagnosis_correct`, `approval_granted`, `repair`,
-`verify_ok`, `seq`, `state_seq`, and lease fields.
+`verify_ok`, `seq`, `state_seq`, and lease fields. Provenance fields are
+`model`, `quant`, `temperature`, `seed`, `prompt_hash`, and `harness_git_sha`.
 
 Mutating tool calls are recorded as intents before execution and updated after.
 An unfinished mutating call marks an unknown-effect crash boundary. State is
@@ -1266,12 +1267,6 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `DESIGN.md` | Canonical decisions and locked constraints |
 | `PHASES.md` | Status, acceptance history, remaining work |
 | `docs/ARCHITECTURE.md` | Reverse-engineered current architecture, workflow trace, P0/P1/P2 gap inventory, candidate target design and code layout (§6, commit-pinned) |
-| `docs/archive/SQLite.md` | Historical event-store reviewer input |
-| `docs/archive/feedback.md` | Historical reviewer dialogue and rationale |
-| `docs/archive/NOTES.md` | Historical notes; defers to design and phases |
-| `docs/archive/skeleton.md` | Superseded early roadmap |
-| `docs/archive/reviewer_feedback_on_readme.md` | Historical README review notes |
 | `scripts/README.md` | Helper-script details |
 
-When historical documents conflict with this guide, current code plus
-`DESIGN.md` and `PHASES.md` win.
+When documents conflict, current code plus `DESIGN.md` and `PHASES.md` win.

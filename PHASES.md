@@ -2,8 +2,7 @@
 
 Status legend: `[ ]` not started, `[~]` in progress, `[x]` done, `[!]` blocked
 
-Canonical design: `DESIGN.md`. Historical inputs: `docs/archive/SQLite.md`,
-`docs/archive/feedback.md`.
+Canonical design: `DESIGN.md`.
 
 Cluster/GPU rebuild is in progress; wait for operator confirmation before live
 or destructive validation.
@@ -118,7 +117,7 @@ or destructive validation.
       rebuild flow, scoring, and done criteria
 - [x] Rewrite `PHASES.md` with honest history and actionable phases
 - [x] Update `README.md` quickstart
-- [x] Update `NOTES.md` canonical-document pointers
+- [x] Consolidate canonical-document pointers
 - [x] Update internal runbook benchmark example to use `ollama`
 - Deliverable: no ambiguity about what is being built
 - Acceptance: design matches every locked decision; no stale prescriptive
@@ -128,7 +127,7 @@ or destructive validation.
 - [x] Rename public legacy backend → `ollama`
 - [x] Normalize stored/imported legacy backend values to `ollama`
 - [x] Update `.env.example`, scripts, comments, examples, and docs
-- [x] Keep historical reviewer/feedback files, sanitized
+- [x] Remove superseded reviewer/feedback files after salvage
 - [x] Add scenario fields: `risk`, menu summary, `min_etcd_members`, selector
       requirements, expected `impact_class`
 - [x] Implement `chaos scenario list|show|validate`
@@ -258,7 +257,7 @@ or destructive validation.
 - [x] Add default-deny destructive guard for live benchmark runs
 - [x] Route generated menus through `./chaos run`
 - [x] Request and consume streamed usage payloads
-- [x] Archive historical reviewer documents
+- [x] Retire historical reviewer documents after salvage
 - [x] Run full offline suite after changes
 - [x] Calibrate fault-present timeouts on the rebuilt cluster
 - [x] Run non-destructive live smoke after cluster/GPU are ready

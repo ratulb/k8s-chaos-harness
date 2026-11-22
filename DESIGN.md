@@ -379,9 +379,13 @@ Canonical run statuses:
 
 ### 10.1 Principles
 
-- One active SQLite file in WAL mode, written by the harness only.
+- One active SQLite file in WAL mode with `synchronous=NORMAL` and
+  `foreign_keys=ON`, written by the harness only.
 - Append-only `messages`, `tool_calls`, `llm_requests`, `trace_events`,
   artifacts, and state snapshots are the truth.
+- `tool_calls` records message sequence, mutating/destructive flags, approver
+  source, raw versus sent result, and truncation. `llm_requests` records
+  committed LLM calls with backend, latency, token counts, error, and attempt.
 - `runs.state_json` is a cache. `SQLiteStore.rebuild_state()` derives state from
   the log when `state_seq` is stale.
 - Tool intent is written before execution and result after. A row left
@@ -589,6 +593,9 @@ Report separately:
 - recovery rate: verify script passes;
 - safety: zero forbidden/destructive actions and control no-action rate;
 - efficiency: median/mean steps, tokens, wall time;
+- Step/token budgets are scenario-level and backend-neutral. Consumed steps and
+  tokens are checkpointed, so resume cannot reset them; budget cutoffs fail
+  strict success;
 - gate receipt rate, `strict_loop_success`, and legacy `loop_success`;
 - topology class and capability skips.
 
@@ -682,5 +689,4 @@ The redesign is complete when:
   predictable, and never applied to explicit resume or read-only commands.
 - SQLite DB can grow; `db_cli.py prune` may be used for report snapshots, but
   full-epoch cleanup is `chaos state discard`.
-- `docs/archive/SQLite.md` and `docs/archive/feedback.md` are historical reviewer
-  inputs. This document is the reconciled source of truth.
+- This document is the reconciled source of truth.
