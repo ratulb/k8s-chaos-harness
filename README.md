@@ -70,9 +70,7 @@ without unsafe guesses. Triggering external remediation workflows is out of scop
 
 - **First: one working LLM endpoint or key.** Self-hosted Ollama-compatible or
   hosted; this is the brain the agent depends on. `./chaos ping` needs it, but no
-  cluster. No paid subscription is required: use a local GPU with Ollama or the
-  budget-friendly Kaggle GPU route in `kaggle/README.md`. Hosted keys are
-  optional baselines.
+  cluster.
 - Linux and Python 3
 - `kubectl`/`etcdctl` and SSH access to control-plane nodes for benchmark runs
 - An existing cluster for benchmark runs; three etcd members are recommended,
@@ -98,11 +96,9 @@ cluster. It owns injection and reset, uses direct tool calls, discovers topology
 dynamically, stores history in SQLite, and gates repairs on diagnosis and
 approval. It is not a generic Kubernetes autopilot, an MCP-first system, a
 raw-shell interface, a fixed three-node tool, or a JSONL-first store. It works
-with an existing cluster; `k8s-easy-install` is optional lab infrastructure, and
-Kaggle is a budget-friendly way to supply GPU-backed Ollama without a paid LLM
-subscription. `kaggle` is not a selectable backend; it runs the same `ollama`
-backend through a tunnel, and legacy `kaggle`/`kaggle-ollama` values in the DB
-normalize to `ollama` (§12).
+with an existing cluster; `k8s-easy-install` and Kaggle are optional
+infrastructure. `kaggle` is not a selectable backend; legacy `kaggle` and
+`kaggle-ollama` values in the DB normalize to `ollama` (§12).
 
 ## 3. System at a glance
 
@@ -272,16 +268,6 @@ or one hosted key (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, or
 and no cluster, `./chaos ping` should produce a visible LLM reply. Cluster
 commands can wait.
 
-Budget-friendly brain options:
-
-- **Own GPU:** run Ollama locally and point `OLLAMA_BASE_URL` at it.
-- **No GPU, no paid API:** use the Kaggle free-tier GPU route in `kaggle/README.md`.
-  It still uses `--backend ollama`; Kaggle is infrastructure, not a backend
-  choice. The tunnel is ephemeral and must be restarted when the notebook cell
-  exits.
-- **Paid APIs:** Groq/OpenRouter/Cloudflare are optional for comparison runs,
-  not a requirement to use the harness.
-
 | Variable group | Purpose |
 | --- | --- |
 | `CHECKPOINT_DB` | Authoritative SQLite path; default `results.sqlite3` |
@@ -300,8 +286,7 @@ Temperature is fixed at `0.2`; `--seed` is recorded metadata, not model
 sampling control. Run from the repository root because `.env` and some default
 paths are working-directory sensitive; `./chaos run` uses the root for children.
 
-See `kaggle/README.md` for the budget-friendly free GPU route; it still uses
-backend `ollama`.
+See `kaggle/README.md` for optional tunnel setup. It still uses backend `ollama`.
 
 ## 8. Quickstart
 
@@ -321,11 +306,6 @@ If the default `ollama` endpoint is not yours, either edit `OLLAMA_BASE_URL` and
 `OLLAMA_MODEL`, or select a hosted backend with
 `./chaos ping "hello" --backend groq|openrouter|cloudflare`. A successful ping
 prints the backend/model and the LLM reply before any cluster tooling is used.
-
-No GPU and no paid key? Follow `kaggle/README.md` to expose a Kaggle free-tier GPU as
-an Ollama endpoint, set `OLLAMA_BASE_URL` to the forwarded port, then rerun the
-same `./chaos ping` command. Paid hosted backends are optional comparison
-targets, not the entry ticket.
 
 Prerequisites for benchmark runs: `kubectl` access, SSH access to control-plane
 nodes, and network access for installs.
@@ -906,9 +886,7 @@ An unfinished mutating call marks an unknown-effect crash boundary. State is
 rebuilt when `cached.seq`, `runs.state_seq`, and `runs.seq` disagree.
 
 Backend values `kaggle` and `kaggle-ollama` normalize to `ollama` on DB init and
-export; Kaggle is GPU infrastructure for that backend, not a separate provider.
-`kaggle/` is kept as the repeatable budget-GPU setup and as the record of that
-track. Export writes derived files; `import-legacy` is explicit migration and
+export. Export writes derived files; `import-legacy` is explicit migration and
 does not import `.snapshots.jsonl` or `.ui.jsonl`.
 
 ## 13. State lifecycle
@@ -1298,7 +1276,7 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `docs/archive/NOTES.md` | Historical notes; defers to design and phases |
 | `docs/archive/skeleton.md` | Superseded early roadmap |
 | `docs/archive/reviewer_feedback_on_readme.md` | Historical README review notes |
-| `kaggle/README.md` | Budget-friendly Kaggle GPU path to the Ollama backend; keep this track |
+| `kaggle/README.md` | Optional Kaggle-hosted Ollama endpoint |
 | `scripts/README.md` | Helper-script details |
 
 When historical documents conflict with this guide, current code plus
