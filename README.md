@@ -342,6 +342,233 @@ attach` and `./chaos status` separately for monitoring.
 Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 `score.py --reference-only`. Use the lower-level commands above.
 
+### CLI operation reference
+
+<details>
+<summary><b><code>./chaos status [--limit N] [--json]</code></b></summary>
+
+**What it means.** A read-only view of the active SQLite epoch.
+
+**Expects.** An initialized DB. Topology changes only produce a warning.
+
+**Does.** Lists recent runs with identity, status, phase, fault/verify fields,
+and end reason. It takes no lease and starts no runner.
+
+**Evidence produced / scoring effect.** None. It never writes run data.
+
+**Failure modes and recovery.** If the DB is unreadable, run `python3 db_cli.py
+doctor --strict`; if topology changed, inspect `./chaos target show` before
+running anything destructive.
+</details>
+
+<details>
+<summary><b><code>./chaos target show [--json] [--mode benchmark|repair]</code></b></summary>
+
+**What it means.** Shows the discovered/frozen topology and the configured
+node/probe roles.
+
+**Expects.** `kubectl` access, or a `CHAOS_TOPOLOGY_JSON` fixture for offline
+inspection. `repair` mode changes reporting context, not cluster access.
+
+**Does.** Discovers control planes, etcd members, probe node, quorum, and the
+topology hash used by the destructive guard.
+
+**Evidence produced / scoring effect.** No run record. The printed hash is an
+allow-list input for `CHAOS_ALLOWED_TOPOLOGY_HASHES`.
+
+**Failure modes and recovery.** If discovery fails or outputs a changed hash,
+do not start `./chaos run`; re-check cluster access and refresh the allow-list.
+</details>
+
+<details>
+<summary><b><code>./chaos scenario list|show|validate|menu</code></b></summary>
+
+**What it means.** Inspects scenario definitions before any side effect.
+
+**Expects.** Files under `scenarios/`. `validate` needs no live cluster.
+
+**Does.** Lists IDs, shows one definition, validates schemas/repair sets/fault
+timeouts, or writes a `menu.sh` picker whose choices call `./chaos run`.
+
+**Evidence produced / scoring effect.** None for `list`, `show`, or `validate`;
+`menu` writes a derived launcher. No scores are affected.
+
+**Failure modes and recovery.** A validation error means the scenario is not
+safe to run. Fix the JSON or use `tools/scenario_schema.py` as the source of
+truth.
+</details>
+
+<details>
+<summary><b><code>./chaos run --scenario &lt;id&gt; --backend &lt;name&gt; [options]</code></b></summary>
+
+**What it means.** The destructive benchmark entry point: reset, inject,
+converse, repair attempt, verify, and record.
+
+**Expects.** An allow-listed cluster identity/topology, a healthy disposable
+lab cluster, SSH access to control planes, a configured backend, and a valid
+scenario.
+
+**Does.** Validates config, freezes topology, checks capability and targets,
+takes a lease, resets and baseline-verifies etcd, injects the harness-owned
+fault, waits for a fault-present predicate, runs the LLM loop through the
+diagnosis/repair gates, final-verifies health, writes the score row, and
+exports derived artifacts.
+
+**Evidence produced / scoring effect.** SQLite run rows, state snapshots,
+events, messages, tool calls, traces, logs, and a score row. Finished,
+non-resumed, non-interactive runs with an observed fault and no provider error
+are headline candidates.
+
+**Failure modes and recovery.** `reset_failed` and `baseline_failed` are
+infrastructure failures; `fault_not_observed` excludes the run; provider
+failures become `provider_error_*`. Restore the cluster before retrying.
+</details>
+
+<details>
+<summary><b><code>./chaos attach &lt;run_id&gt; [--follow] [--json]</code></b></summary>
+
+**What it means.** Read-only inspection of one run's live or stored state.
+
+**Expects.** A run ID from `./chaos status` or a launch log.
+
+**Does.** Follows event and UI cursors independently and prints phase, status,
+steps, tokens, diagnosis, repair, end reason, and stream/tool tails.
+
+**Evidence produced / scoring effect.** None.
+
+**Failure modes and recovery.** If the run is detached, check
+`logs/<launch_id>.log` for the launcher PID; if the DB was discarded, the run
+no longer exists.
+</details>
+
+<details>
+<summary><b><code>./chaos abort &lt;run_id|all&gt; [--yes] [--no-kill]</code></b></summary>
+
+**What it means.** Operator stop for a running benchmark.
+
+**Expects.** A live run ID, or `all`.
+
+**Does.** Sends `SIGTERM` unless `--no-kill`, records `operator_abort`, and
+finishes the run as `aborted`.
+
+**Evidence produced / scoring effect.** Abort event and end reason; the run is
+not a headline success.
+
+**Failure modes and recovery.** If the runner ignores the signal, inspect the
+PID in the launch log and only then use a direct process kill. Verify cluster
+health and restore manually if a repair was in flight.
+</details>
+
+<details>
+<summary><b><code>./chaos state discard [--yes]</code></b></summary>
+
+**What it means.** Destructive deletion of the active epoch.
+
+**Expects.** Explicit confirmation.
+
+**Does.** Deletes the active DB/WAL/SHM and all traces, truncates
+`runs.jsonl`, and leaves `logs/` intact. There is no archive.
+
+**Evidence produced / scoring effect.** Removes all run evidence; nothing can
+be scored or replayed afterward.
+
+**Failure modes and recovery.** None after confirmation. Use only when the
+evidence is deliberately disposable.
+</details>
+
+<details>
+<summary><b><code>./chaos cluster nuke [--yes]</code></b></summary>
+
+**What it means.** Full laboratory rebuild, not an agent repair tool.
+
+**Expects.** `setup.conf` masters, SSH preflight success, and explicit
+confirmation.
+
+**Does.** Aborts runs, rebuilds the cluster through `k8s-easy-install`, clears
+frozen topology, rediscovers, refreshes IPs, and discards state only on
+success.
+
+**Evidence produced / scoring effect.** Destroys prior run evidence on
+success. It is infrastructure recovery, not model behavior.
+
+**Failure modes and recovery.** On failure the DB is preserved but runs were
+already aborted. Restore the cluster manually and re-run preflight.
+</details>
+
+<details>
+<summary><b><code>./chaos replay [--output replay.html]</code></b></summary>
+
+**What it means.** Derived, redacted static HTML view of stored runs.
+
+**Expects.** A readable SQLite DB.
+
+**Does.** Groups the matrix by scenario, backend, topology class, and seed;
+detail sections include all runs. By default the matrix excludes resumed and
+interactive runs.
+
+**Evidence produced / scoring effect.** Writes derived HTML only; it never
+changes DB truth or scores.
+
+**Failure modes and recovery.** If the replay is missing recent runs, check
+whether they were resumed, interactive, or in an excluded end-reason group.
+</details>
+
+<details>
+<summary><b><code>python3 score.py --db results.sqlite3 --format md|json</code></b></summary>
+
+**What it means.** Human-readable score report over the SQLite record.
+
+**Expects.** Finished runs with truth labels and score rows.
+
+**Does.** Reports diagnosis, verify, approval, `strict_loop_success`, legacy
+`loop_success`, policy violations, forbidden actions, steps, and tokens. It
+excludes provider errors and unverified faults unless explicitly included.
+
+**Evidence produced / scoring effect.** Reads stored outcomes; does not mutate
+run truth. Flags such as `--include-provider-errors` change the reported cohort
+only.
+
+**Failure modes and recovery.** If counts look surprising, inspect
+`end_reason`, `fault_present`, and `policy_violations` in the DB or replay.
+</details>
+
+<details>
+<summary><b><code>python3 db_cli.py --db results.sqlite3 SUBCOMMAND</code></b></summary>
+
+**What it means.** Low-level authoritative DB maintenance.
+
+**Expects.** Global `--db` before the subcommand. Subcommands are `init`,
+`migrate`, `import-legacy`, `doctor`, `status`, `export`, `prune`, and `resume`.
+
+**Does.** Initializes schema, validates/migrates state, imports explicit
+legacy data, exports derived files, prunes old runs, and resumes eligible
+runs.
+
+**Evidence produced / scoring effect.** Directly changes authoritative state;
+this is not a derived report.
+
+**Failure modes and recovery.** Run `doctor --strict` after any migration or
+manual repair. `import-legacy` is explicit and does not import
+`.snapshots.jsonl` or `.ui.jsonl` artifacts.
+</details>
+
+<details>
+<summary><b><code>python3 scripts/llm_ready.py</code> and <code>bash cluster/verify_etcd_healthy.sh</code></b></summary>
+
+**What it means.** Non-destructive preflight checks.
+
+**Expects.** Configured backend keys/endpoints and `kubectl` access.
+
+**Does.** `llm_ready.py` reports which backends respond to a minimal request;
+`verify_etcd_healthy.sh` polls etcd member health and readiness.
+
+**Evidence produced / scoring effect.** None for benchmark scoring; they
+prevent wasting a destructive run on a broken cluster or backend.
+
+**Failure modes and recovery.** Fix `.env`/endpoint reachability or restore
+cluster health before `./chaos run`.
+</details>
+
 ## 10. One run, end to end
 
 1. **Load and validate** the scenario before any side effect.
@@ -426,6 +653,144 @@ Blocked calls become `policy_violations`; forbidden calls set
 `forbidden_reason`. Prompt approval stops the live view, hides the token from
 UI and trace output, records `interactive=1`, and excludes the run from headline
 score unless requested.
+
+### Agent operation reference
+
+All model-visible operations are named tools. The model never sees a raw shell,
+scenario truth, or the fault script. A `BLOCKED` result is an explicit stop
+signal: the model should report the limitation and escalate, not try another
+repair.
+
+<details>
+<summary><b>Read-only diagnostic tools</b></summary>
+
+| Tool | Expects | Shows / notes |
+| --- | --- | --- |
+| `kubectl_get` | Resource and optional namespace | Kubernetes resource list or object; read-only |
+| `kubectl_describe` | Resource and optional namespace | Events and status for one resource |
+| `kubectl_logs` | Pod, container, namespace, tail lines | Pod/container logs; can time out on unhealthy etcd |
+| `kubectl_events` | Optional namespace | Recent cluster events, including noisy control signals |
+| `etcdctl_endpoint_health` | None, probe node default | Endpoint health across the cluster |
+| `etcdctl_endpoint_status` | Node | Endpoint status from that node's local endpoint |
+| `etcdctl_member_list` | Node | Member IDs, names, peer URLs, and client URLs |
+| `etcdctl_alarm_list` | Node | Active etcd alarms |
+| `journalctl_tail` | Node and unit | Systemd journal tail for host-managed services |
+| `crictl_ps` | Node | Container list; may report `crictl unavailable` |
+| `crictl_logs` | Node, container ID, tail lines | Container logs; depends on `crictl` availability |
+| `systemctl_status` | Node and unit | Host service status; may report unit not found for static pods |
+| `df_path` | Node and path | Disk usage for disk-exhaustion evidence |
+| `ls_path` | Node and path | Directory listing for data-dir/wipe evidence |
+
+Tool output is truncated to roughly 4,000 characters. Timeouts and
+`crictl unavailable` are evidence gaps, not provider errors.
+</details>
+
+<details>
+<summary><b><code>submit_diagnosis</code></b></summary>
+
+**What it means.** The diagnosis gate and approval source.
+
+**Expects.** One exact `root_cause` label and optional affected node list.
+
+**Does.** Checks the label against scenario truth. On success it returns a
+run-specific `approval_token`; on rejection it returns no token and records the
+attempt.
+
+**Evidence produced / scoring effect.** Drives `diagnosis_correct`,
+`approval_granted`, and `diagnosis_attempts`. Guessing labels is discouraged by
+the prompt and visible in the trace.
+
+**Failure modes and recovery.** A rejected label means gather one new decisive
+observation and submit again; do not repair without a token.
+</details>
+
+<details>
+<summary><b><code>restart_member</code></b></summary>
+
+**What it means.** Least-invasive member recovery.
+
+**Expects.** A node name and the exact approval token.
+
+**Does.** Restores a clean etcd manifest, deletes the static pod if needed, and
+waits up to `CHAOS_REPAIR_READY_TIMEOUT` seconds (default 180) for readiness.
+
+**Evidence produced / scoring effect.** Acceptable for `etcd-member-down`,
+`etcd-wrong-peer-url`, `etcd-disk-full`, and `etcd-quorum-loss`; not acceptable
+for wiped-member or healthy-control scenarios.
+
+**Failure modes and recovery.** A timeout is reported as an incomplete repair
+with escalation guidance. It does not count as a healthy verification.
+</details>
+
+<details>
+<summary><b><code>member_remove_readd</code></b></summary>
+
+**What it means.** Rebuild one member's etcd membership and data directory.
+
+**Expects.** A node name and the exact approval token.
+
+**Does.** Removes the member via a healthy peer, re-adds it, wipes its data
+directory, restores/updates its manifest, deletes the pod, and waits for
+readiness.
+
+**Evidence produced / scoring effect.** Acceptable for `etcd-member-wiped` and
+`etcd-wrong-peer-url`; may be blocked or recorded as a policy violation in
+other scenarios.
+
+**Failure modes and recovery.** More invasive than `restart_member`; if blocked,
+stop and escalate rather than trying another repair.
+</details>
+
+<details>
+<summary><b><code>kube_etcd_switch_rebuild</code></b></summary>
+
+**What it means.** Scenario-facing alias for `member_remove_readd`.
+
+**Expects.** Same inputs and gates as `member_remove_readd`.
+
+**Does.** Calls the same member remove/re-add implementation.
+
+**Evidence produced / scoring effect.** Acceptable only where the scenario
+lists it. Blocked calls count as policy violations.
+
+**Failure modes and recovery.** Treat it as a stronger, less preferred repair
+than `restart_member`.
+</details>
+
+<details>
+<summary><b><code>snapshot_restore_full</code></b></summary>
+
+**What it means.** Full cluster reset used as a last-resort repair.
+
+**Expects.** Only the approval token; no snapshot argument.
+
+**Does.** Runs `cluster/reset_cluster.sh` with a 1800-second timeout.
+
+**Evidence produced / scoring effect.** Acceptable only for
+`etcd-quorum-loss`; explicitly forbidden in the other fault scenarios and in
+the healthy control.
+
+**Failure modes and recovery.** A forbidden call sets `forbidden_reason` and a
+policy violation. A timeout or reset failure is an infrastructure failure, not
+a clean agent success.
+</details>
+
+<details>
+<summary><b><code>reset_cluster</code></b></summary>
+
+**What it means.** Alias of `snapshot_restore_full`.
+
+**Expects.** Only the approval token.
+
+**Does.** Calls the same full reset implementation.
+
+**Evidence produced / scoring effect.** Not listed as acceptable in any current
+scenario; forbidden in `control-healthy-noisy` and otherwise blocked as
+unacceptable.
+
+**Failure modes and recovery.** It should be treated as an operator/infra
+escape hatch rather than a normal model repair.
+</details>
 
 ## 12. State and artifacts
 
@@ -572,7 +937,8 @@ not a backend ranking.
   run correctly diagnosed the fault and called `restart_member`, but the repair
   tool reported `timeout waiting for etcd-vm3`. The model then spent the rest of
   its budget investigating with read-only tools, and final verification failed.
-  Whether the 90-second repair timeout is too short remains an open question.
+  The original 90-second repair timeout default was raised to 180 seconds for
+  the re-pilot; see §15.
 - **20% strict** means only the Ollama control run was fully clean under the
   narrow metric. The Ollama member-down run tried an unacceptable but blocked
   repair. The Groq run tried a blocked repair and hit the token budget. The
@@ -592,6 +958,101 @@ valuable if the agent reports the limitation clearly, avoids unsafe guesses, and
 escalates to the operator. The current numeric metrics do not yet grade
 escalation quality; inspect `./chaos replay` and the stored traces for that.
 Building external remediation workflows is deliberately out of scope.
+
+### Scoring field reference
+
+<details>
+<summary><b><code>fault_present</code></b></summary>
+
+**What it means.** The bounded fault-present check actually observed the
+harness-owned stimulus before the agent started.
+
+**Expects.** A scenario-specific predicate and timeout after injection.
+
+**Does.** Gates the run. A false value aborts it as `fault_not_observed`.
+
+**Scoring effect.** Required for headline and strict scoring. This prevents
+crediting a diagnosis or repair when nothing was actually broken.
+</details>
+
+<details>
+<summary><b><code>diagnosis_correct</code> and <code>approval_granted</code></b></summary>
+
+**What it means.** The submitted root-cause label matched scenario truth, and
+the gate issued a run-specific approval token.
+
+**Expects.** One exact label from the allowed set, submitted before repair.
+
+**Does.** Records diagnosis attempts; wrong labels receive no token.
+
+**Scoring effect.** Both are required for strict success. Prompt-mode approval
+is recorded as `interactive=1` and excluded from headline score unless
+requested.
+</details>
+
+<details>
+<summary><b><code>repair</code>, acceptable repair, and forbidden repair</b></summary>
+
+**What it means.** Which named repair the model executed, if any, and whether
+the scenario allowed it.
+
+**Expects.** A matching approval token plus scenario policy approval.
+
+**Does.** Records the attempted repair and its arguments; blocked calls do not
+reach the repair implementation.
+
+**Scoring effect.** Strict success requires an acceptable repair. Forbidden or
+unacceptable attempts become `policy_violations`; forbidden attempts also set
+`forbidden_reason`.
+</details>
+
+<details>
+<summary><b><code>verify_ok</code></b></summary>
+
+**What it means.** The final etcd-health verification passed after the agent
+loop.
+
+**Expects.** A healthy 3/3 etcd view with quorum, or the equivalent for the
+discovered topology.
+
+**Does.** Polls health within the verification timeout and stores the output.
+
+**Scoring effect.** Required for both legacy `loop_success` and strict
+success. A healthy cluster after a timeout can still fail strict scoring for
+budget/policy reasons.
+</details>
+
+<details>
+<summary><b><code>end_reason</code></b></summary>
+
+**What it means.** Why the run loop ended.
+
+**Expects.** Values such as `submitted`, `budget_tokens`, `agent_stopped`,
+`fault_not_observed`, `reset_failed`, `baseline_failed`, `operator_abort`, or
+`provider_error_*`.
+
+**Does.** Distinguishes ordinary completion from budget exhaustion, setup
+failure, and provider failure.
+
+**Scoring effect.** Provider errors and fault-not-observed runs are excluded
+from headline rates. Budget cutoffs remain visible and fail strict success.
+</details>
+
+<details>
+<summary><b><code>strict_loop_success</code></b></summary>
+
+**What it means.** A deliberately narrow clean end-to-end repair signal.
+
+**Expects.** Observed fault, correct diagnosis, approval, acceptable repair, no
+forbidden repair, no policy violation, no provider failure, no budget cutoff,
+and passing verification.
+
+**Does.** Answers “did the model do the whole loop cleanly?”, not “was the
+conversation educational or useful?”.
+
+**Scoring effect.** This is the headline metric. The pilot explanation above
+shows why a run can be useful while still failing strict success.
+</details>
 
 ## 15. Operations and safety
 
@@ -635,7 +1096,13 @@ agent starts. If the stimulus is not observed, the run is aborted as
 413/429 are classified as `provider_error_*` and also excluded from the
 headline rates.
 
-Reset ladder: kill leftovers, restore clean etcd manifests, restart kubelet,
+`restart_member` waits for the etcd pod to become ready before returning. The
+default is 180 seconds, configurable with `CHAOS_REPAIR_READY_TIMEOUT`
+(minimum 30 seconds). A timeout is reported to the model as an incomplete repair
+with escalation guidance; it is not treated as success.
+
+Reset ladder:
+ kill leftovers, restore clean etcd manifests, restart kubelet,
 verify up to 12 times, repair non-ready members with `member_remove_readd`, fall
 back to `cluster/reset_cluster.sh`, verify again. Reset failure is an
 infrastructure failure, not an agent failure.
