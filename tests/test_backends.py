@@ -23,7 +23,7 @@ def configured_backends() -> list[Backend]:
     """Build backend objects only for providers with credentials configured."""
     backends: list[Backend] = []
 
-    # Local Ollama (or a Kaggle tunnel exposed as an Ollama-compatible URL).
+    # Local Ollama (or a tunneled endpoint exposed as an Ollama-compatible URL).
     if os.environ.get("OLLAMA_BASE_URL"):
         backends.append(
             Backend(

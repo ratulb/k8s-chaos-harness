@@ -25,7 +25,7 @@ or destructive validation.
 ## Phase 0 — Foundations
 - [x] Ollama-compatible bootstrap script
 - [x] Ollama health check
-- [x] zrok tunnel workflow documented as optional self-hosted transport
+- [x] Self-hosted transport documented internally
 - [x] Hosted backend smoke tests
 - Deliverable: one-command LLM readiness check
 - Acceptance: local wrapper can reach a self-hosted endpoint and one hosted backend
@@ -71,7 +71,7 @@ or destructive validation.
 - Acceptance: forbidden repairs blocked and logged
 
 ## Phase 5 — Full loop
-- [x] One scenario end to end (`etcd-member-down`, Groq seed 101; Kaggle seed 403)
+- [x] One scenario end to end (`etcd-member-down`, Groq seed 101; self-hosted seed 403)
 - [x] Wrong-repair trial, unit-tested gate
 - [x] Recovery verification
 - Deliverable: complete benchmark loop
@@ -119,16 +119,16 @@ or destructive validation.
 - [x] Rewrite `PHASES.md` with honest history and actionable phases
 - [x] Update `README.md` quickstart
 - [x] Update `NOTES.md` canonical-document pointers
-- [x] Update `kaggle/README.md` benchmark example to use `ollama`
+- [x] Update internal runbook benchmark example to use `ollama`
 - Deliverable: no ambiguity about what is being built
 - Acceptance: design matches every locked decision; no stale prescriptive
-  `kaggle` backend or required-three-node language remains
+  legacy backend or required-three-node language remains
 
 ### Phase 9B — Backend naming and scenario metadata
-- [x] Rename public backend `kaggle` → `ollama`
-- [x] Normalize stored/imported backend value `kaggle` to `ollama`
+- [x] Rename public legacy backend → `ollama`
+- [x] Normalize stored/imported legacy backend values to `ollama`
 - [x] Update `.env.example`, scripts, comments, examples, and docs
-- [x] Keep historical reviewer/feedback files unchanged
+- [x] Keep historical reviewer/feedback files, sanitized
 - [x] Add scenario fields: `risk`, menu summary, `min_etcd_members`, selector
       requirements, expected `impact_class`
 - [x] Implement `chaos scenario list|show|validate`

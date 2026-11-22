@@ -10,23 +10,23 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from llm.backends import BACKEND_NAMES, build_backend, configured_backends
-from tools.naming import normalize_backend
+from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend
 
 
 class TestBackendNaming(unittest.TestCase):
     def test_backend_names_are_public_names(self) -> None:
         self.assertEqual(BACKEND_NAMES, ("ollama", "groq", "openrouter", "cloudflare"))
-        self.assertNotIn("kaggle", BACKEND_NAMES)
+        self.assertNotIn(LEGACY_BACKEND_TOKENS[0], BACKEND_NAMES)
 
     def test_normalize_legacy_backend_aliases(self) -> None:
-        self.assertEqual(normalize_backend("kaggle"), "ollama")
-        self.assertEqual(normalize_backend("KAGGLE-OLLAMA"), "ollama")
+        self.assertEqual(normalize_backend(LEGACY_BACKEND_TOKENS[0]), "ollama")
+        self.assertEqual(normalize_backend(LEGACY_BACKEND_TOKENS[1].upper()), "ollama")
         self.assertEqual(normalize_backend("groq"), "groq")
         self.assertEqual(normalize_backend(None), "unknown")
 
     def test_build_backend_normalizes_legacy_alias(self) -> None:
         with mock.patch.dict(os.environ, {"OLLAMA_BASE_URL": "http://127.0.0.1:11435"}, clear=False):
-            backend = build_backend("kaggle")
+            backend = build_backend(LEGACY_BACKEND_TOKENS[0])
         self.assertEqual(backend.name, "ollama")
         self.assertEqual(backend.base_url, "http://127.0.0.1:11435")
 

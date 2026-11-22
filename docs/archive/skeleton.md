@@ -12,7 +12,7 @@ free endpoints) as the reasoning engine.
 - Cluster provisioning: k8s-easy-install (multi-node, Calico VXLAN).
 - Disaster/etcd drills: kube-etcd-switch (snapshots, external etcd).
 - LLM tool loop: tool_call_loop (Ollama + Groq/OpenRouter/Cloudflare).
-- Kaggle GPU tunneling: zrok SSH tunnel.
+- External GPU tunneling: SSH tunnel.
 
 ## Architecture (high level)
 - LLM client abstraction: one interface, many backends.
@@ -26,7 +26,7 @@ free endpoints) as the reasoning engine.
 ## Phase 0 — Foundations
 - Keep cluster healthy; document baseline.
 - Verify LLM backends (local + free endpoints) with tool calls.
-- Smooth Kaggle tunnel workflow.
+- Smooth external tunnel workflow.
 
 ## Phase 1 — Minimal agent MVP
 - One fault (e.g., delete a pod / scale deployment to 0).
@@ -104,7 +104,7 @@ A reproducible benchmark + agent that:
 
 ## D. Prerequisites first
 - Docker available in the VM (check `docker run hello-world`).
-- zrok/Kaggle tunnel tested end-to-end (SSH into notebook).
+- Self-hosted tunnel tested end-to-end (SSH into notebook).
 - One hosted backend API key available (Groq/OpenRouter/Cloudflare).
 - Local model runnable (Ollama) for quick iteration.
 
@@ -150,5 +150,5 @@ A reproducible benchmark + agent that:
 1. Cluster substrate: Docker Compose etcd (default) vs Multipass.
 2. Transport: direct tool-calling client (default) vs MCP.
 3. Score schema: JSONL (default).
-4. Backends: Kaggle small model + one hosted baseline.
+4. Backends: external small model + one hosted baseline.
 5. Budget: max_steps=40, max_tokens=60000 for both.

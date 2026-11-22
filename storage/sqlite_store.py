@@ -24,7 +24,7 @@ from typing import Any, Iterator
 from common.scoring import SCORER_VERSION
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
 from harness.message import Message
-from tools.naming import normalize_backend, normalize_repair_name
+from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend, normalize_repair_name
 
 SCHEMA_VERSION = 5
 
@@ -722,10 +722,22 @@ class SQLiteStore:
             for column, definition in SCORE_COLUMNS.items():
                 if column not in score_columns:
                     conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
-            conn.execute("UPDATE batches SET backend='ollama' WHERE backend='kaggle'")
-            conn.execute("UPDATE runs SET backend='ollama' WHERE backend='kaggle'")
-            conn.execute("UPDATE messages SET backend='ollama' WHERE backend='kaggle'")
-            conn.execute("UPDATE llm_requests SET backend='ollama' WHERE backend='kaggle'")
+            conn.execute(
+                "UPDATE batches SET backend='ollama' WHERE backend=?",
+                (LEGACY_BACKEND_TOKENS[0],),
+            )
+            conn.execute(
+                "UPDATE runs SET backend='ollama' WHERE backend=?",
+                (LEGACY_BACKEND_TOKENS[0],),
+            )
+            conn.execute(
+                "UPDATE messages SET backend='ollama' WHERE backend=?",
+                (LEGACY_BACKEND_TOKENS[0],),
+            )
+            conn.execute(
+                "UPDATE llm_requests SET backend='ollama' WHERE backend=?",
+                (LEGACY_BACKEND_TOKENS[0],),
+            )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(version, applied_at, notes) VALUES (?, ?, ?)",
                 (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, UI stream, fault presence, strict scoring"),

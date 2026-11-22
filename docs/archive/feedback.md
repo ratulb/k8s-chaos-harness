@@ -1,6 +1,6 @@
 Reviewer 1(and ignorant me in between):
 
-These are new territories for me. My this repo was localhost based small tool call try out. Today I have added remote calls to grok/openrouter/cloudflare. Small step - before we go for " the focused "break the loop" demo with a local model and SQLite checkpointer" - with a kaggle hosted LLM(tunnelling to it). And I guess my - https://github.com/ratulb/k8s-easy-install or https://github.com/ratulb/kube-etcd-switch could be broken and repaired. Your thoughts!
+These are new territories for me. My this repo was localhost based small tool call try out. Today I have added remote calls to grok/openrouter/cloudflare. Small step - before we go for " the focused "break the loop" demo with a local model and SQLite checkpointer" - with a external hosted LLM(tunnelling to it). And I guess my - https://github.com/ratulb/k8s-easy-install or https://github.com/ratulb/kube-etcd-switch could be broken and repaired. Your thoughts!
 Your instinct here is excellent, and it's a far stronger move than the generic "break the loop" demo. Let me explain why, and then how to execute it.
 
 Why this is the right pivot
@@ -33,14 +33,14 @@ Simulate a worker dropping out or a stale join token, then show your re-run idem
 
 Each fault gets: inject ? observe the breakage ? repair ? verify recovered state. That's the chaos-engineering loop, and it's exactly the "tracing, recovery, idempotency" story you wanted, but on infrastructure instead of an LLM.
 
-Where the Kaggle-hosted LLM fits
-This is the clever part of your plan: use a Kaggle-hosted model as the agent that drives the chaos and repair, tunneled to from your VM. That way the artifact is both:
+Where the external GPU-backed LLM fits
+This is the clever part of your plan: use a external GPU-backed model as the agent that drives the chaos and repair, tunneled to from your VM. That way the artifact is both:
 
 a chaos-engineering demo (the infrastructure fault/repair), and
 
 an agentic workflow demo (a model issuing commands, observing failures, and recovering them).
 
-That's a genuinely novel combination, and it directly serves your positioning: "I can point an agent at a live cluster, break it, and show the agent — and the operator — how to recover." The Kaggle model is fine for this because the tasks are scripted, not open-ended; you don't need frontier reasoning, just reliable tool-calling, which you've already proven with your Cloudflare/Grok/OpenRouter loop.
+That's a genuinely novel combination, and it directly serves your positioning: "I can point an agent at a live cluster, break it, and show the agent — and the operator — how to recover." The External model is fine for this because the tasks are scripted, not open-ended; you don't need frontier reasoning, just reliable tool-calling, which you've already proven with your Cloudflare/Grok/OpenRouter loop.
 
 What to build, concretely
 A small chaos harness (Python, reusing your tool-call loop): tools = kill_etcd_member, restore_etcd_snapshot, restart_lb, check_cluster_health, rejoin_node. The model picks a fault, the script injects it, the model observes, the harness (or the model) repairs.
@@ -53,7 +53,7 @@ One caution
 Scope the cluster to something disposable. Use the single-node e2e path (tests/e2e-single-node.sh) or a 3-node LXD/multipass cluster on your VM. Don't chaos-test anything you'd be sad to lose. Your README's "nuclear teardown" and idempotent re-run are your safety net — lean on them.
 
 The bottom line
-Yes — do this instead of, or as the centerpiece of, the agent demo. It's more original, more credible, more aligned with your 24-year systems background, and it revives your k8s work as current. The Kaggle-hosted model driving the chaos loop is a smart way to fuse the two threads. Start with the etcd fault using kube-etcd-switch — it's the sharpest, most respected failure mode, and your tool already exists to repair it.
+Yes — do this instead of, or as the centerpiece of, the agent demo. It's more original, more credible, more aligned with your 24-year systems background, and it revives your k8s work as current. The external GPU-backed model driving the chaos loop is a smart way to fuse the two threads. Start with the etcd fault using kube-etcd-switch — it's the sharpest, most respected failure mode, and your tool already exists to repair it.
 
 If you want, I can sketch the chaos-harness tool schema and the minimal Python loop (reusing your existing tool-calling script structure) so you have a runnable skeleton for day one.
 
@@ -83,14 +83,14 @@ It reuses everything. The installer, the LB abstraction, the CNI handling, the i
 
 It connects three of your repos into one narrative. kubemcp (MCP control plane) + k8s-easy-install (the pipeline) + kube-etcd-switch (the etcd repair tool) become one story: "I built an agent-operable Kubernetes provisioner, then taught it to break and heal itself." That's a portfolio-level arc.
 
-The Kaggle-hosted LLM fits cleanly. An agent connected to kubemcp over MCP can be pointed at the cluster: "break something, then recover it." The model doesn't need frontier reasoning — the tools are structured, the state is observable, the repair path is known. Your Cloudflare/Grok/OpenRouter tool-calling loop is exactly the right client.
+The external GPU-backed LLM fits cleanly. An agent connected to kubemcp over MCP can be pointed at the cluster: "break something, then recover it." The model doesn't need frontier reasoning — the tools are structured, the state is observable, the repair path is known. Your Cloudflare/Grok/OpenRouter tool-calling loop is exactly the right client.
 
 How to scope the 10-day VM
 Days 1–2: Add the three fault-injection MCP tools. Test each manually via the MCP client. Confirm get_cluster_status reports the breakage.
 
 Days 3–4: Build the repair paths. For etcd, wire in kube-etcd-switch's snapshot restore. For LB, re-run the LB install script. For worker, re-run the join command. Each repair should be a callable MCP tool too — restore_etcd, restart_lb, rejoin_worker.
 
-Days 5–6: Connect the Kaggle-hosted model as the agent. Give it the full tool surface. Run the loop: inject ? observe ? repair ? verify. Log every step (this is your tracing story).
+Days 5–6: Connect the external GPU-backed model as the agent. Give it the full tool surface. Run the loop: inject ? observe ? repair ? verify. Log every step (this is your tracing story).
 
 Days 7–8: Harden. What happens if the agent injects two faults? If a repair fails? Add a dry_run flag so the demo is safe. Write the observability layer.
 
@@ -121,12 +121,12 @@ Where the reviewer is right and I was wrong
 
 3. My tool surface was too coarse. kill_etcd_member and restore_etcd_snapshot as agent tools make the task trivial and unsafe. The reviewer's alternative — give the agent read-only primitives (kubectl, etcdctl endpoint health/status, journalctl, crictl) plus a small set of named repair actions behind the gate — is the right shape. The diagnostic reasoning over noisy logs is where models differ; coarse tools erase the thing you're trying to measure.
 
-4. I was over-optimistic about the Kaggle model. "Reliable tool-calling" at 8–14B is fine for single-step calls but degrades over long diagnostic chains with noisy output — and etcd logs are exactly noisy. Expect to need output truncation, summarizing tools, and constrained JSON. Latency and session limits matter more here too: a chaos run that dies mid-repair leaves a broken cluster, so the harness must snapshot/reset before each scenario. And the reviewer's framing is sharper than mine: "small Kaggle model vs hosted model on the same faults" is the story — you already have Grok/OpenRouter/Cloudflare wired in as the baseline.
+4. I was over-optimistic about the External model. "Reliable tool-calling" at 8–14B is fine for single-step calls but degrades over long diagnostic chains with noisy output — and etcd logs are exactly noisy. Expect to need output truncation, summarizing tools, and constrained JSON. Latency and session limits matter more here too: a chaos run that dies mid-repair leaves a broken cluster, so the harness must snapshot/reset before each scenario. And the reviewer's framing is sharper than mine: "small External model vs hosted model on the same faults" is the story — you already have Grok/OpenRouter/Cloudflare wired in as the baseline.
 
 5. One fault class first — etcd only, 4–5 variants. I proposed three fault classes; that's scope creep. Do etcd with variants (member down, corrupted data dir, quorum loss, disk full, wrong peer URL). Add LB and node-join only after etcd works end-to-end with traces and a score table.
 
 Where my advice still holds
-The checkpointer idea maps directly here, for real reasons. If a session dies mid-diagnosis, the agent resumes with history and the harness knows which repair steps already ran. That's the "break the loop" demo made concrete: kill the Kaggle session mid-repair, show the run resume against a different backend. The reviewer endorses this — it's the one piece of my framing that survives intact.
+The checkpointer idea maps directly here, for real reasons. If a session dies mid-diagnosis, the agent resumes with history and the harness knows which repair steps already ran. That's the "break the loop" demo made concrete: kill the external session mid-repair, show the run resume against a different backend. The reviewer endorses this — it's the one piece of my framing that survives intact.
 
 kubemcp is still the right substrate — but you extend it with read-only diagnostic tools and gated repair actions, not fault-injection tools the model can call.
 
@@ -136,7 +136,7 @@ The one thing I'd add
 The reviewer's step 2 asks: "Would you like me to draft the fault scenarios and the scoring format?" Yes — take that offer. The fault variants and score table are the part where precision matters most, and a second pair of eyes on the exact etcd failure modes (what "corrupted data dir" means operationally, how you detect quorum loss, what the reset script must restore) will save you days.
 
 My corrected one-line recommendation
-Build the etcd-only chaos benchmark on kubemcp, with the model doing read-only diagnosis and gated repair, scored across Kaggle vs hosted backends, with a snapshot/reset harness and a SQLite checkpointer for session resumption. That's tighter, safer, and more publishable than what I originally sketched — and the reviewer's ordering (Kaggle SSH ? disposable cluster + reset ? read-only tools + trace ? gated repair ? sweep ? write-up) is the sequence to follow.
+Build the etcd-only chaos benchmark on kubemcp, with the model doing read-only diagnosis and gated repair, scored across self-hosted vs hosted backends, with a snapshot/reset harness and a SQLite checkpointer for session resumption. That's tighter, safer, and more publishable than what I originally sketched — and the reviewer's ordering (external SSH ? disposable cluster + reset ? read-only tools + trace ? gated repair ? sweep ? write-up) is the sequence to follow.
 
 So: accept the reviewer's plan, drop my "model picks the faults" and "three fault classes" suggestions, and keep the checkpointer + kubemcp-as-substrate + cross-backend sweep. That's the version worth ten days.
 
@@ -189,7 +189,7 @@ Build a scripted fault-injection harness outside MCP (bash/Python): etcd member 
 
 Snapshot/reset between scenarios using kubemcp's destroy_cluster + re-provision, plus a VM snapshot if available.
 
-SQLite checkpointer for session resumption across mid-repair death, across backends (Kaggle vs hosted).
+SQLite checkpointer for session resumption across mid-repair death, across backends (self-hosted vs hosted).
 
 Score diagnosis separately from repair; run the wrong-repair trials to show the gate catching them.
 
@@ -298,7 +298,7 @@ Gated repair actions: restore_etcd_snapshot, switch_etcd_mode (the kube-etcd-swi
 
 Trace log + score table: per run, record the tool calls, the diagnosis, the repair chosen, and whether the cluster recovered. Score diagnosis quality separately from repair success.
 
-Cross-backend sweep: Kaggle-hosted model vs a hosted baseline (Grok/OpenRouter/Cloudflare — you already have these wired).
+Cross-backend sweep: external GPU-backed model vs a hosted baseline (Grok/OpenRouter/Cloudflare — you already have these wired).
 
 SQLite checkpointer so a killed session resumes mid-diagnosis without losing state.
 
@@ -431,7 +431,7 @@ The diagnostic tool surface — read-only primitives the model can see (kubectl, e
 
 The repair tool surface — a small set of named actions behind an approval gate, plus a required submit_diagnosis call before any repair.
 
-The agent runner — the loop that connects a model (Kaggle-hosted or hosted baseline) to the tool surfaces, records every step, and enforces budgets.
+The agent runner — the loop that connects a model (external GPU-backed or hosted baseline) to the tool surfaces, records every step, and enforces budgets.
 
 The trace + score store — a SQLite (or JSONL) record of every run: tool calls, diagnosis, repair chosen, recovery yes/no, steps/tokens used. This is what you publish.
 
@@ -445,7 +445,7 @@ Transport for tools: direct tool-calling client (reuse your Cloudflare/Grok/Open
 
 Score schema: what a "run" record looks like. Decide now; it drives everything.
 
-Backends: Kaggle-hosted model + one hosted baseline. Name them.
+Backends: external GPU-backed model + one hosted baseline. Name them.
 
 Phase 1 — The Skeleton (days 1–2)
 Goal: one scenario works end-to-end, even if it's trivial.
@@ -506,7 +506,7 @@ Checkpoint: the score table has 5 rows for one backend.
 Phase 5 — The Sweep (day 9)
 Goal: cross-backend comparison.
 
-Run all 5 scenarios × N runs × 2 backends (Kaggle small model, hosted baseline).
+Run all 5 scenarios × N runs × 2 backends (external small model, hosted baseline).
 
 Add the SQLite checkpointer: kill a session mid-run, resume, prove state survives.
 
@@ -528,7 +528,7 @@ Deterministic fault injection. A fault that produces different symptoms on diffe
 
 Unconditional reset. If reset is best-effort, a half-repaired cluster poisons the next run. Make reset destroy-and-rebuild, not patch-up.
 
-Small-model degradation. The Kaggle model will lose the thread on long diagnostic chains. Budget for truncation, summarization, and constrained tool-call output. Compare honestly against the hosted baseline.
+Small-model degradation. The External model will lose the thread on long diagnostic chains. Budget for truncation, summarization, and constrained tool-call output. Compare honestly against the hosted baseline.
 
 The gate. It's easy to build a gate that blocks forbidden repairs; it's harder to make the trace legible so the writeup can show "the model tried X, the gate said no because Y." Design the trace record for the post, not just for debugging.
 
@@ -538,7 +538,7 @@ What "done" looks like
 A repo where, from a clean machine, you can run:
 
 text
-./run_benchmark.sh --scenario etcd-member-wiped --backend kaggle --runs 3
+./run_benchmark.sh --scenario etcd-member-wiped --backend ollama --runs 3
 …and get a score table plus a trace file. Five scenarios, two backends, a README explaining the three surfaces, and a blog post with the table. That's the artifact. Everything else is optional.
 
 The immediate next step
@@ -615,7 +615,7 @@ A reproducible benchmark that injects deterministic etcd faults into a disposabl
 {
   "run_id": "uuid",
   "scenario_id": "etcd-member-wiped",
-  "backend": "kaggle-qwen" | "hosted-grok",
+  "backend": "ollama-qwen" | "hosted-grok",
   "model": "qwen3-4b" | "grok-4",
   "fault_variant": "stop_wipe_leave_stopped",
   "diagnosis": {
@@ -647,10 +647,10 @@ A reproducible benchmark that injects deterministic etcd faults into a disposabl
 }
 Why this shape: diagnosis and repair are scored separately (a model can diagnose right and repair wrong). The gate is recorded (gated, allowed) so the wrong-repair trials are legible. steps_to_diagnosis is a secondary metric. verify_script_exit is objective ground truth.
 
-2.4 Backends: Kaggle-hosted small model + one hosted baseline
+2.4 Backends: external GPU-backed small model + one hosted baseline
 Decision:
 
-Primary: Kaggle-hosted model (your SSH-forward setup). Start with Qwen3-4B or similar; expect degradation on long chains. Document the model name and any quantization.
+Primary: external GPU-backed model (your SSH-forward setup). Start with Qwen3-4B or similar; expect degradation on long chains. Document the model name and any quantization.
 
 Baseline: One hosted model via your existing client (Grok or a strong OpenRouter model). Same tool list, same budget.
 
@@ -724,13 +724,13 @@ Diagnosis + gate: submit_diagnosis required; repair tools + gate; one full loop 
 
 Remaining faults: add the other four, each with determinism check.
 
-Sweep: Kaggle vs hosted, 5 scenarios × N runs, SQLite/JSONL score table, wrong-repair trials, session-kill/resume.
+Sweep: self-hosted vs hosted, 5 scenarios × N runs, SQLite/JSONL score table, wrong-repair trials, session-kill/resume.
 
 Publish: blog post + README.
 
 8. What "Done" Looks Like
 text
-./run_benchmark.sh --scenario etcd-member-wiped --backend kaggle --runs 3
+./run_benchmark.sh --scenario etcd-member-wiped --backend ollama --runs 3
 …produces a runs.jsonl with 3 records, a trace per run, and a summary table with diagnosis accuracy, repair correctness, gate-blocks, steps/tokens — per backend. Five scenarios, two backends. That's the artifact.
 
 9. Out of Scope (for now)
@@ -779,21 +779,21 @@ Run a few trials where the agent picks the wrong repair and show the guardrails 
 3. The tools in the feedback are too coarse.
 kill_etcd_member and restore_etcd_snapshot as agent tools make the task trivial and unsafe. Better to give the agent kubectl, etcdctl endpoint health/status, journalctl, and crictl read-only, plus a small set of named repair actions. The diagnostic reasoning is where models differ.
 
-4. Be realistic about the Kaggle model.
+4. Be realistic about the External model.
 
 “Reliable tool-calling” at 8-14B is fine for single-step calls but degrades over long diagnostic chains with noisy output (etcd logs are verbose). Expect to need output truncation, summarizing tools, and constrained JSON tool calls.
 The latency and session-limit issues also matter more here. A chaos run that dies mid-repair leaves a broken cluster, so the harness must snapshot the VM or cluster state before each scenario and be able to reset.
-Compare against a hosted model (you already have Grok/OpenRouter/Cloudflare wired in) as a baseline. “Small model on Kaggle vs hosted model on the same faults” is the story.
+Compare against a hosted model (you already have Grok/OpenRouter/Cloudflare wired in) as a baseline. “Small model on self-hosted vs hosted model on the same faults” is the story.
 
 5. Scope: one fault class first.
 The feedback proposes three (etcd, LB, node join). That’s a lot. Do etcd only, with 4-5 variants (one member down, member with corrupted data dir, quorum loss, disk full, wrong peer URL). If that works end to end with traces and a score table, add the others.
 
 The checkpointer idea fits well
 
-Your SQLite checkpointer plan is useful here for real reasons: if a session dies mid-diagnosis, the agent resumes with its history and the harness knows which repair steps already ran. Make that part of the “break the loop” demo: kill the Kaggle session mid-repair and show the run resume against a different backend.
+Your SQLite checkpointer plan is useful here for real reasons: if a session dies mid-diagnosis, the agent resumes with its history and the harness knows which repair steps already ran. Make that part of the “break the loop” demo: kill the external session mid-repair and show the run resume against a different backend.
 
 Suggested order
-Kaggle backend working through the SSH forward (small step, as you said).
+legacy backend working through the SSH forward (small step, as you said).
 A disposable cluster (single-node or 3 VMs) with a reset script, and 3 etcd fault scripts.
 Read-only agent tools plus the trace log. Score diagnosis only, no repair yet.
 Add the gated repair actions using kube-etcd-switch.
@@ -857,7 +857,7 @@ One JSON line per run, written by the harness (not the model):
 
 json
 {
-  "run_id": "...", "scenario": "etcd-member-wiped", "backend": "kaggle-qwen3-14b",
+  "run_id": "...", "scenario": "etcd-member-wiped", "backend": "ollama-qwen3-14b",
   "seed": 3, "started": "...",
   "diagnosis": {"label": "etcd_member_data_loss", "correct": true},
   "repair": {"action": "member_remove_readd", "acceptable": true, "forbidden": false},
@@ -893,7 +893,7 @@ for scenario, seed:
         run verify
         write record, save trace
 
-The baseline check before injection is easy to skip and then you spend hours debugging a “failure” that was a broken starting state. Also write the record before verify can hang, and use per-run timeouts, since a session dying mid-run is expected on Kaggle.
+The baseline check before injection is easy to skip and then you spend hours debugging a “failure” that was a broken starting state. Also write the record before verify can hang, and use per-run timeouts, since a session dying mid-run is expected on External.
 
 Build order
 verify/ scripts and faults/ scripts, tested by hand with no agent. If you can’t inject and recover manually in a repeatable way, an agent won’t fix that.

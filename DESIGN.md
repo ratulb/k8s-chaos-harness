@@ -208,9 +208,7 @@ Backends:
   a tunneled endpoint, or another compatible server.
 - `groq`, `openrouter`, `cloudflare`: hosted OpenAI-compatible baselines.
 
-Kaggle is historical infrastructure for obtaining a temporary GPU-backed
-Ollama endpoint. The tunnel setup remains documented as an optional way to
-provide the `ollama` backend, but it is not a backend identity.
+External temporary endpoints are historical infrastructure and are not a backend identity.
 
 `scripts/llm_ready.py` reports configured backend health and counts ready
 backends. Hosted 429/5xx/network retries remain in `llm/client.py` with
@@ -504,7 +502,7 @@ remain as lower-level tools.
 
 Rules:
 
-- `ollama` is the self-hosted backend name. `kaggle` is not user-facing.
+- `ollama` is the self-hosted backend name. Legacy aliases are not user-facing.
 - `./chaos run` is a new benchmark or repair attempt. It may auto-discard on
   topology mismatch.
 - `./chaos run --resume-of` is explicit resume. It never auto-discards.
@@ -621,7 +619,7 @@ zero and different seeds.
 
 Completed:
 
-1. Ollama-compatible LLM bootstrap, including optional Kaggle tunnel.
+1. Ollama-compatible LLM bootstrap.
 2. Cluster setup, reset, verify, and one fault by hand.
 3. Diagnostic tool layer, trace recorder, and budget enforcement.
 4. Diagnosis gate and repair gating.
@@ -658,7 +656,7 @@ The redesign is complete when:
 - `./chaos scenario list` shows risk, capability requirements, and menu data.
 - N=1, N=2, 3-member, even, and 5+ topologies are covered by offline tests.
 - Quorum-loss targets are computed dynamically.
-- Backend `ollama` replaces all user-facing `kaggle` naming.
+- Backend `ollama` replaces all legacy naming.
 - SQLite v3 migration passes `chaos doctor`/`db_cli.py doctor --strict`.
 - Live UI streams intermediate model/tool/cluster events without corrupting
   final JSON.

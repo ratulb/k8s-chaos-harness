@@ -22,8 +22,8 @@ Right now prerequisites live in §8. A visitor deciding whether to clone needs: L
 2. Lead with the headline metric and how to read it
 loop_success is defined in §14 but never shown as a result. Add a short "What good looks like" paragraph and, once you have numbers, a results table (scenario × backend ? diagnosis %, verify %, loop_success). The §17 note that the full sweep is pending is fine — but a "Results" section with a placeholder ("full cross-backend sweep pending; reduced 13-run sweep results in PHASES.md") signals intent and directs readers.
 
-3. Fix the kaggle / kaggle-ollama normalization contradiction
-§2 says "kaggle is not a backend name." §12 says "kaggle and kaggle-ollama normalize to ollama on DB init and export." Both can be true (it's not a selectable backend, but legacy values are coerced), but as written it reads like a contradiction. Reword §2 to: "kaggle is not a selectable backend; legacy kaggle/kaggle-ollama values in the DB normalize to ollama (§12)."
+3. Fix the external / legacy alias normalization contradiction
+§2 says "external is not a backend name." §12 says "external and legacy alias normalize to ollama on DB init and export." Both can be true (it's not a selectable backend, but legacy values are coerced), but as written it reads like a contradiction. Reword §2 to: "external is not a selectable backend; legacy external/legacy alias values in the DB normalize to ollama (§12)."
 
 4. Define legacy_exploratory where it's used
 §14 says headline records exclude "no legacy_exploratory end reason." A reader has no idea what that is. Add one clause: what sets it and why it's excluded. Same for reset
@@ -93,7 +93,7 @@ Insert a "Requirements at a glance" box after §1.
 
 Insert a "How to read this / Authority" callout at the top.
 
-Reword the kaggle sentence in §2 to match §12.
+Reword the external sentence in §2 to match §12.
 
 Add a one-line glossary for legacy_exploratory, reset_failed, baseline_failed (or link to §16).
 

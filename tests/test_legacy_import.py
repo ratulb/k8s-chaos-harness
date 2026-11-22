@@ -17,6 +17,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from storage.sqlite_store import SQLiteStore
+from tools.naming import LEGACY_BACKEND_TOKENS
 
 
 def record(run_id: str, *, pre_gate: bool = False, backend: str = "groq") -> dict:
@@ -89,8 +90,8 @@ class TestLegacyImport(unittest.TestCase):
         self.assertEqual(second["imported"], 0)
         self.assertEqual(second["skipped"], 4)
 
-    def test_legacy_kaggle_backend_normalizes_to_ollama(self) -> None:
-        legacy = record("legacy-kaggle", backend="kaggle")
+    def test_legacy_backend_normalizes_to_ollama(self) -> None:
+        legacy = record("legacy-external", backend=LEGACY_BACKEND_TOKENS[0])
         self.runs_path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
         source_before = self.runs_path.read_text(encoding="utf-8")
 
@@ -98,7 +99,7 @@ class TestLegacyImport(unittest.TestCase):
 
         with self.store._connect() as conn:
             row = conn.execute(
-                "SELECT backend FROM runs WHERE run_id='legacy-kaggle'"
+                "SELECT backend FROM runs WHERE run_id='legacy-external'"
             ).fetchone()
         self.assertEqual(row["backend"], "ollama")
         self.assertEqual(self.runs_path.read_text(encoding="utf-8"), source_before)

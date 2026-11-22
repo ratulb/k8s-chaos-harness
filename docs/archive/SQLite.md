@@ -64,7 +64,7 @@ The part that makes “break the loop” work
 
 On resume, the harness finds any tool_calls row with status started and no finished_at. For a read-only tool, re-running it is harmless. For a mutating tool such as member_remove_readd, you can’t know whether it ran, so mark it unknown, check the cluster state, and tell the agent so in its next message (“the previous repair may or may not have been applied; current state is...”). That’s real fault tolerance for agents, and it’s worth demonstrating deliberately by killing the session mid-repair.
 
-messages.backend records which model produced each turn. That lets you show a run that started on Kaggle and finished on a hosted model, and filter such mixed runs out of the headline benchmark numbers.
+messages.backend records which model produced each turn. That lets you show a run that started on External and finished on a hosted model, and filter such mixed runs out of the headline benchmark numbers.
 
 Design choices worth deciding
 Score fields on runs vs a separate table: I put them on runs for simple queries. If you later re-score with different criteria (say, changing which repairs count as acceptable), a scores(run_id, scorer_version, ...) table avoids losing the old results.

@@ -96,9 +96,8 @@ cluster. It owns injection and reset, uses direct tool calls, discovers topology
 dynamically, stores history in SQLite, and gates repairs on diagnosis and
 approval. It is not a generic Kubernetes autopilot, an MCP-first system, a
 raw-shell interface, a fixed three-node tool, or a JSONL-first store. It works
-with an existing cluster; `k8s-easy-install` and Kaggle are optional
-infrastructure. `kaggle` is not a selectable backend; legacy `kaggle` and
-`kaggle-ollama` values in the DB normalize to `ollama` (§12).
+with an existing cluster; `k8s-easy-install` is optional lab infrastructure.
+Only the public backend names in §7 are selectable.
 
 ## 3. System at a glance
 
@@ -275,7 +274,6 @@ commands can wait.
 | `GROQ_API_KEY`, `GROQ_MODEL` | Groq |
 | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | OpenRouter |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AUTH_TOKEN`, `CLOUDFLARE_MODEL` | Cloudflare |
-| `ZROK_TOKEN`, `PUBLIC_KEY_URL`, `MODEL` | Optional tunnel helpers |
 | `K8S_EASY_INSTALL` | Optional lab installer location |
 | `K8S_NODES`, `K8S_NODE_IPS` | Fallback host/IP hints |
 | `SSH_USER`, `SSH_KEY`, `PROBE_NODE` | Cluster access and probe override |
@@ -285,8 +283,6 @@ commands can wait.
 Temperature is fixed at `0.2`; `--seed` is recorded metadata, not model
 sampling control. Run from the repository root because `.env` and some default
 paths are working-directory sensitive; `./chaos run` uses the root for children.
-
-See `kaggle/README.md` for optional tunnel setup. It still uses backend `ollama`.
 
 ## 8. Quickstart
 
@@ -885,8 +881,7 @@ Mutating tool calls are recorded as intents before execution and updated after.
 An unfinished mutating call marks an unknown-effect crash boundary. State is
 rebuilt when `cached.seq`, `runs.state_seq`, and `runs.seq` disagree.
 
-Backend values `kaggle` and `kaggle-ollama` normalize to `ollama` on DB init and
-export. Export writes derived files; `import-legacy` is explicit migration and
+Legacy backend aliases normalize to `ollama` on DB init and export. Export writes derived files; `import-legacy` is explicit migration and
 does not import `.snapshots.jsonl` or `.ui.jsonl`.
 
 ## 13. State lifecycle
@@ -1276,7 +1271,6 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `docs/archive/NOTES.md` | Historical notes; defers to design and phases |
 | `docs/archive/skeleton.md` | Superseded early roadmap |
 | `docs/archive/reviewer_feedback_on_readme.md` | Historical README review notes |
-| `kaggle/README.md` | Optional Kaggle-hosted Ollama endpoint |
 | `scripts/README.md` | Helper-script details |
 
 When historical documents conflict with this guide, current code plus

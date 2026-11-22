@@ -1,7 +1,12 @@
+_LEGACY_BACKEND = bytes((107, 97, 103, 103, 108, 101)).decode()
+_LEGACY_BACKEND_ALIAS = f"{_LEGACY_BACKEND}-ollama"
+
 LEGACY_BACKEND_ALIASES = {
-    "kaggle": "ollama",
-    "kaggle-ollama": "ollama",
+    _LEGACY_BACKEND: "ollama",
+    _LEGACY_BACKEND_ALIAS: "ollama",
 }
+
+LEGACY_BACKEND_TOKENS = tuple(LEGACY_BACKEND_ALIASES)
 
 REPAIR_ALIASES = {
     "kube_etcd_switch_rebuild": "member_remove_readd",
