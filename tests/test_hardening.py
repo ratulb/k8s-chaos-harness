@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import subprocess
@@ -7,6 +8,7 @@ import sys
 import tempfile
 import unittest
 import urllib.error
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -311,6 +313,47 @@ class TestHardening(unittest.TestCase):
         script = chaos_cli._menu_script([{"id": "etcd-member-down", "label": "Etcd member down"}])
         self.assertIn('exec ./chaos run --scenario "$id" --backend "$BACKEND" "$@"', script)
         self.assertNotIn("run_benchmark.sh", script)
+
+    def test_ping_prints_llm_response_without_cluster(self) -> None:
+        class PingClient:
+            def __init__(self, backend: object) -> None:
+                self.messages: list[dict] = []
+
+            def health(self) -> bool:
+                return True
+
+            def chat(self, messages: list[dict], **kwargs: object) -> dict:
+                self.messages = messages
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+                    "usage": {"total_tokens": 2},
+                }
+
+        client = PingClient(object())
+        out = io.StringIO()
+        with patch.object(chaos_cli, "LLMClient", lambda backend: client), redirect_stdout(out):
+            code = chaos_cli.main(["ping", "hello brain", "--backend", "ollama"])
+        self.assertEqual(code, 0)
+        self.assertIn("pong", out.getvalue())
+        self.assertEqual(client.messages[-1], {"role": "user", "content": "hello brain"})
+
+    def test_ping_reports_missing_endpoint_configuration(self) -> None:
+        class DownClient:
+            def __init__(self, backend: object) -> None:
+                pass
+
+            def health(self) -> bool:
+                return False
+
+            def chat(self, messages: list[dict], **kwargs: object) -> dict:
+                raise AssertionError("chat should not run when the endpoint is down")
+
+        err = io.StringIO()
+        with patch.object(chaos_cli, "LLMClient", DownClient), redirect_stderr(err), redirect_stdout(io.StringIO()):
+            code = chaos_cli.main(["ping", "hello", "--backend", "openrouter"])
+        self.assertEqual(code, 1)
+        self.assertIn("OPENROUTER_API_KEY", err.getvalue())
+        self.assertIn("./chaos ping", err.getvalue())
 
 
 if __name__ == "__main__":

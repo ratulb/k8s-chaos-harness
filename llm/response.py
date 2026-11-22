@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import TYPE_CHECKING, Any, Sequence
 
 from common.errors import LLMError
 from common.results import Result, ResultKind
-from harness.journal import Journal
 from harness.message import Message
+
+if TYPE_CHECKING:
+    from harness.journal import Journal
 
 
 @dataclass(frozen=True)

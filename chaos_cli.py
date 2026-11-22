@@ -17,12 +17,17 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from llm.backends import BACKEND_NAMES
+from llm.backends import BACKEND_NAMES, build_backend
+from llm.client import LLMClient
+from llm.env import load_env
+from llm.response import LLMOutcome
 from replay import write_replay as write_replay_file
 from storage import sqlite_store as store_tools
 from tools import cluster_config
 from tools import topology as topology_tools
 from tools.scenario_schema import load_scenario, scenario_ids, validate_scenario
+
+load_env()
 
 
 def _print_json(payload: object) -> None:
@@ -206,12 +211,52 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _ping(backend_name: str, message: str | None) -> int:
+    backend = build_backend(backend_name)
+    client = LLMClient(backend)
+    if not client.health():
+        hints = {
+            "ollama": "OLLAMA_BASE_URL, OLLAMA_MODEL, OLLAMA_API_KEY",
+            "groq": "GROQ_API_KEY, GROQ_MODEL",
+            "openrouter": "OPENROUTER_API_KEY, OPENROUTER_MODEL",
+            "cloudflare": "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_AUTH_TOKEN, CLOUDFLARE_MODEL",
+        }
+        print(f"LLM endpoint is not reachable for backend {backend.name} ({backend.base_url}).", file=sys.stderr)
+        print(f"Set {hints[backend.name]} in .env, then run: ./chaos ping --backend {backend.name}", file=sys.stderr)
+        return 1
+    if message is None:
+        try:
+            message = input("Say something to the LLM [default: Reply with exactly: pong]: ").strip()
+        except EOFError:
+            message = ""
+    message = message or "Reply with exactly: pong"
+    outcome = LLMOutcome.invoke(
+        client,
+        [
+            {"role": "system", "content": "You are a concise assistant. Reply directly to the user."},
+            {"role": "user", "content": message},
+        ],
+    )
+    if outcome.failed:
+        print(f"LLM ping failed: {outcome.result.error}", file=sys.stderr)
+        return 1
+    response = outcome.result.unwrap()
+    content = response.primary.content or "(empty response)"
+    print(f"{backend.name} / {backend.model}")
+    print(content)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(prog="chaos")
     ap.add_argument("--db", default=os.environ.get("CHECKPOINT_DB", str(ROOT / "results.sqlite3")))
     ap.add_argument("--runs-file", default=str(ROOT / "runs.jsonl"))
     ap.add_argument("--trace-dir", default=str(ROOT / "traces"))
     sub = ap.add_subparsers(dest="command", required=True)
+
+    ping = sub.add_parser("ping", help="Check the configured LLM brain with a one-shot prompt; no cluster needed")
+    ping.add_argument("message", nargs="?", default=None)
+    ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", "ollama"), choices=list(BACKEND_NAMES))
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
@@ -283,6 +328,9 @@ def main(argv: list[str] | None = None) -> int:
     scenario_menu.add_argument("--output", default="menu.sh")
 
     args = ap.parse_args(argv)
+
+    if args.command == "ping":
+        return _ping(args.backend, args.message)
 
     if args.command == "run":
         launch_id = f"launch-{uuid.uuid4().hex[:8]}"

@@ -68,10 +68,13 @@ without unsafe guesses. Triggering external remediation workflows is out of scop
 
 ### Requirements at a glance
 
-- Linux, Python 3, and `kubectl`/`etcdctl` access to a control plane
-- SSH access to control-plane nodes for fault injection and reset
-- An existing cluster; three etcd members are recommended, not required
-- At least one configured backend endpoint or key (`ollama` needs no hosted key)
+- **First: one working LLM endpoint or key.** Self-hosted Ollama-compatible or
+  hosted; this is the brain the agent depends on. `./chaos ping` needs it, but no
+  cluster.
+- Linux and Python 3
+- `kubectl`/`etcdctl` and SSH access to control-plane nodes for benchmark runs
+- An existing cluster for benchmark runs; three etcd members are recommended,
+  not required
 
 ### What good looks like
 
@@ -258,6 +261,13 @@ comparable baselines.
 cp .env.example .env
 ```
 
+The LLM brain comes before the cluster. Fill in one working endpoint first:
+`OLLAMA_BASE_URL`/`OLLAMA_MODEL` for a self-hosted Ollama-compatible endpoint,
+or one hosted key (`GROQ_API_KEY`, `OPENROUTER_API_KEY`, or
+`CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_AUTH_TOKEN`). With only `.env` populated
+and no cluster, `./chaos ping` should produce a visible LLM reply. Cluster
+commands can wait.
+
 | Variable group | Purpose |
 | --- | --- |
 | `CHECKPOINT_DB` | Authoritative SQLite path; default `results.sqlite3` |
@@ -280,15 +290,27 @@ See `kaggle/README.md` for optional tunnel setup. It still uses backend `ollama`
 
 ## 8. Quickstart
 
-Prerequisites: Linux with Python 3, `kubectl` access, SSH access to control-plane
-nodes, at least one configured backend, and network access for installs.
+Prerequisites for the first step: Linux with Python 3 and one working LLM
+endpoint/key in `.env`. No Kubernetes cluster is needed to ping the brain.
 
 ```bash
 cp .env.example .env
+# edit .env: set OLLAMA_* or one hosted key
 bash scripts/setup_venv.sh
 source .venv/bin/activate
+./chaos ping "Say hello in one sentence"
 python3 scripts/llm_ready.py
+```
 
+If the default `ollama` endpoint is not yours, either edit `OLLAMA_BASE_URL` and
+`OLLAMA_MODEL`, or select a hosted backend with
+`./chaos ping "hello" --backend groq|openrouter|cloudflare`. A successful ping
+prints the backend/model and the LLM reply before any cluster tooling is used.
+
+Prerequisites for benchmark runs: `kubectl` access, SSH access to control-plane
+nodes, and network access for installs.
+
+```bash
 python3 db_cli.py init
 python3 db_cli.py doctor --strict
 
@@ -315,6 +337,7 @@ python3 score.py --db results.sqlite3 --format md
 Implemented `./chaos` commands:
 
 ```text
+./chaos ping ["message"] [--backend ollama|groq|openrouter|cloudflare]
 ./chaos status [--limit N] [--json]
 ./chaos target show [--json] [--mode benchmark|repair]
 ./chaos scenario list|show|validate|menu ...
