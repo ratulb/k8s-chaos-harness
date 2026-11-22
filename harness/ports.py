@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Callable, Protocol, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 
-from llm.response import LLMResponse
+if TYPE_CHECKING:
+    from llm.response import LLMResponse
 
 
 class RunStore(Protocol):
@@ -100,4 +101,4 @@ class ChatClient(Protocol):
         tools: Sequence[dict[str, Any]] | None = None,
         on_chunk: Callable[[str], None] | None = None,
         **kwargs: Any,
-    ) -> LLMResponse | dict[str, Any]: ...
+    ) -> "LLMResponse | dict[str, Any]": ...

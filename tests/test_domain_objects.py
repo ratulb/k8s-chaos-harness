@@ -7,24 +7,26 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common.results import Approval, Refusal, Result, ResultKind
 from harness.budget import Budget
-from harness.call import Call
 from harness.agent import Agent, build_agent
+from harness.call import Call, CallExecution
 from harness.checkpoint import Checkpoint
+from harness.journal import Journal
 from harness.loop import RunResult
 from harness.spec import ExperimentSpec, RunContext
 from harness.tooling import AgentState
+from harness.verification import Verification
 from llm.client import LLMClient
-from llm.response import LLMResponse
+from llm.response import LLMOutcome, LLMResponse
 from storage.sqlite_store import SQLiteStore
 from tools.scenario import Scenario
-from tools.tool import TOOL_REGISTRY
+from tools.tool import TOOL_REGISTRY, Tool, ToolContext
 
 
 class _Backend:
@@ -161,7 +163,7 @@ class DomainObjectTests(unittest.TestCase):
                 run_env=os.environ.copy(),
             )
             ctx = RunContext(run_id="typed-run", store=store)
-            with patch("harness.loop.subprocess.run") as completed:
+            with patch("harness.verification.subprocess.run") as completed:
                 completed.return_value.returncode = 0
                 completed.return_value.stdout = "ok"
                 completed.return_value.stderr = ""
@@ -177,6 +179,141 @@ class DomainObjectTests(unittest.TestCase):
             self.assertIn("approval", trace)
             self.assertIn("[REDACTED]", trace)
             self.assertNotIn("approved:typed-run", trace)
+
+    def test_response_commits_its_own_audit_trail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("response-commit", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("response-commit", store)
+            response = LLMResponse.from_value({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "content": "accepted approval_token=approved:response-commit",
+                        "tool_calls": [{
+                            "id": "call-1",
+                            "function": {
+                                "name": "submit_diagnosis",
+                                "arguments": json.dumps({"root_cause": "no_fault", "approval_token": "approved:response-commit"}),
+                            },
+                        }],
+                    },
+                }],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+            })
+            message = response.commit(journal, "fake", 12)
+            stored_messages = json.dumps(store.load_messages("response-commit"))
+            artifact = store.get_latest_artifact("response-commit", "llm_response_full")
+            events = store.load_events("response-commit")
+            with store._connect() as conn:
+                request = conn.execute("SELECT * FROM llm_requests WHERE run_id=?", ("response-commit",)).fetchone()
+            store.close()
+        self.assertIn("approved:response-commit", message.content or "")
+        self.assertNotIn("approved:response-commit", stored_messages)
+        self.assertNotIn("approved:response-commit", artifact["content"])
+        self.assertEqual((request["latency_ms"], request["tokens_in"], request["tokens_out"]), (12, 1, 2))
+        self.assertTrue(any(event["type"] == "assistant" for event in events))
+
+    def test_llm_outcome_failure_commits_error_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            store.create_run("llm-fail", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("llm-fail", store)
+            client = Mock()
+            client.chat.side_effect = RuntimeError("boom")
+            outcome = LLMOutcome.invoke(client, [], tools=[])
+            response = outcome.commit(journal, "fake")
+            events = store.load_events("llm-fail")
+            artifact = store.get_latest_artifact("llm-fail", "llm_error_full")
+            with store._connect() as conn:
+                request = conn.execute("SELECT * FROM llm_requests WHERE run_id=?", ("llm-fail",)).fetchone()
+            store.close()
+        self.assertTrue(outcome.failed)
+        self.assertEqual(outcome.end_reason, "error")
+        self.assertIsNone(response)
+        self.assertTrue(any(event["type"] == "llm_error" for event in events))
+        self.assertIn("boom", artifact["content"])
+        self.assertIn("boom", request["error"])
+
+    def test_call_manages_intent_execution_and_success(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            store.create_run("call-run", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("call-run", store)
+            tool = Tool(
+                name="probe",
+                description="probe",
+                handler=lambda args: "restarted",
+                kind="repair",
+                mutating=True,
+            )
+            call = Call.from_tool_call({
+                "id": "call-1",
+                "function": {"name": "probe", "arguments": json.dumps({"node": "vm1"})},
+            }, 3).for_tool(tool)
+            context = ToolContext(call_id="")
+            execution = call.invoke(tool, context, journal)
+            unresolved = store.has_unknown_mutating_tool_call("call-run")
+            tool_message = execution.commit(journal, "fake")
+            stored = store.load_tool_calls("call-run")[0]
+            messages = store.load_messages("call-run")
+            events = store.load_events("call-run")
+            store.close()
+        self.assertIsInstance(execution, CallExecution)
+        self.assertIs(execution.result.kind, ResultKind.SUCCESS)
+        self.assertTrue(unresolved)
+        self.assertEqual(context.call_id, call.id)
+        self.assertEqual(tool_message.content, "restarted")
+        self.assertEqual(stored["status"], "finished")
+        self.assertEqual(stored["result_raw"], "restarted")
+        self.assertEqual(messages[0]["tool_call_id"], "call-1")
+        self.assertTrue(any(event["type"] == "tool" for event in events))
+
+    def test_call_failure_is_a_result_variant_and_is_persisted(self) -> None:
+        def explode(args: dict[str, Any]) -> str:
+            raise RuntimeError("boom")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            store.create_run("call-fail", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("call-fail", store)
+            tool = Tool(name="explode", description="explode", handler=explode)
+            call = Call.from_tool_call({
+                "id": "call-fail-1",
+                "function": {"name": "explode", "arguments": "{}"},
+            }, 1).for_tool(tool)
+            execution = call.invoke(tool, ToolContext(call_id=""), journal)
+            execution.commit(journal, "fake")
+            stored = store.load_tool_calls("call-fail")[0]
+            store.close()
+        self.assertIs(execution.result.kind, ResultKind.FAILURE)
+        self.assertTrue(execution.failed)
+        self.assertEqual(stored["status"], "failed")
+        self.assertIn("boom", stored["error"])
+
+    def test_verification_commits_and_exposes_result_variant(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("verify-run", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("verify-run", store)
+            spec = ExperimentSpec(
+                scenario=Scenario.from_dict({"root_cause": "no_fault"}),
+                backend=_Backend(),
+                inject_cmd="",
+                verify_cmd="false",
+                run_env=os.environ.copy(),
+            )
+            verification = Verification.run(spec)
+            verification.commit(journal)
+            artifact = store.get_latest_artifact("verify-run", "verify_output_full")
+            events = store.load_events("verify-run")
+            store.close()
+        self.assertFalse(verification.ok)
+        self.assertIs(verification.result.kind, ResultKind.FAILURE)
+        self.assertIn("output", artifact["content"])
+        self.assertTrue(any(event["type"] == "verify" for event in events))
 
 
 if __name__ == "__main__":

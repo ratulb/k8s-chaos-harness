@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
+from common.errors import LLMError
+from common.results import Result, ResultKind
+from harness.journal import Journal
 from harness.message import Message
 
 
@@ -45,3 +49,81 @@ class LLMResponse:
 
     def to_dict(self) -> dict[str, Any]:
         return self.raw
+
+    @property
+    def primary(self) -> Message:
+        return self.messages[0] if self.messages else Message.assistant("")
+
+    def commit(self, journal: Journal, backend: str, latency_ms: int) -> Message:
+        journal.store.add_llm_request(
+            journal.run_id,
+            backend,
+            latency_ms,
+            self.usage.prompt_tokens,
+            self.usage.completion_tokens,
+        )
+        journal.artifact("llm_response_full", Message.redact_payload(self.to_dict()))
+        message = self.primary
+        message.persist(journal, backend=backend, tokens=self.usage.total_tokens)
+        journal.event({
+            "type": "assistant",
+            "message": message.to_stored_dict(),
+            "finish_reason": self.finish_reason,
+            "stream_fallback": self.stream_fallback,
+        })
+        return message
+
+
+@dataclass(frozen=True)
+class LLMOutcome:
+    result: Result[LLMResponse]
+    latency_ms: int
+    error: LLMError | None = None
+
+    @classmethod
+    def invoke(
+        cls,
+        client: Any,
+        messages: Sequence[dict[str, Any]],
+        tools: Sequence[dict[str, Any]] | None = None,
+        on_chunk: Any = None,
+        **kwargs: Any,
+    ) -> "LLMOutcome":
+        started = time.monotonic()
+        try:
+            response = LLMResponse.from_value(client.chat(
+                list(messages),
+                tools=tools,
+                on_chunk=on_chunk,
+                **kwargs,
+            ))
+        except Exception as exc:
+            error = LLMError.from_exception(exc)
+            return cls(
+                result=Result.failure(str(error)),
+                latency_ms=int((time.monotonic() - started) * 1000),
+                error=error,
+            )
+        return cls(
+            result=Result.success(response),
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    @property
+    def failed(self) -> bool:
+        return self.result.kind is ResultKind.FAILURE
+
+    @property
+    def end_reason(self) -> str:
+        return self.error.classify() if self.error is not None else "error"
+
+    def commit(self, journal: Journal, backend: str) -> LLMResponse | None:
+        if self.failed:
+            error_text = self.result.error or str(self.error or "unknown LLM error")
+            journal.store.add_llm_request(journal.run_id, backend, self.latency_ms, 0, 0, error_text)
+            journal.event({"type": "llm_error", "error": error_text})
+            journal.artifact("llm_error_full", {"error": error_text})
+            return None
+        response = self.result.unwrap()
+        response.commit(journal, backend, self.latency_ms)
+        return response

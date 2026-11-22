@@ -76,6 +76,13 @@ class Message:
         return cls("tool", content, tool_call_id=tool_call_id)
 
     @classmethod
+    def from_tool_result(cls, content: str, call_id: str, limit: int | None = None) -> "Message":
+        message = cls.tool(content, call_id)
+        if limit is None:
+            return message
+        return cls.from_dict(cls.truncate(message.to_dict(), limit))
+
+    @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Message":
         return cls(
             role=str(data.get("role", "unknown")),
@@ -91,3 +98,24 @@ class Message:
         if self.tool_call_id is not None:
             data["tool_call_id"] = self.tool_call_id
         return data
+
+    def to_stored_dict(self) -> dict[str, Any]:
+        return Message.redact_payload(self.to_dict())
+
+    def persist(
+        self,
+        journal: "Journal",
+        backend: str | None = None,
+        tokens: int | None = None,
+        tool_call_id: str | None = None,
+    ) -> None:
+        stored = self.to_stored_dict()
+        journal.store.append_message(
+            journal.run_id,
+            stored["role"],
+            stored.get("content"),
+            stored.get("tool_calls") or None,
+            tool_call_id=stored.get("tool_call_id") if tool_call_id is None else tool_call_id,
+            tokens=tokens,
+            backend=backend,
+        )

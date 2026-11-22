@@ -48,17 +48,18 @@ AGENT COMPOSITION
             v
 TYPED BOUNDARY
   ExperimentSpec + RunContext
-  Budget + Call + LLMResponse + Result/Approval/Refusal
+  Budget + Call/CallExecution + LLMOutcome/LLMResponse + Verification
+  Result/Approval/Refusal
             |
             v
 AGENT ORCHESTRATION
   harness/loop.py  AgentLoop.run(spec, ctx) -> RunResult
-    - event/artifact logging through RunStore
+    - Journal owns events/artifacts/UI emission
     - Checkpoint captures AgentState into RunStore
     - Message[] conversation
-    - LLM loop
-    - tool dispatch
-    - verification
+    - LLMOutcome owns LLM success/failure and commits the audit trail
+    - CallExecution commits tool intent and results
+    - Verification commits verification evidence
     - record + Score + finish_run
             |
             v
@@ -67,8 +68,11 @@ DOMAIN / POLICY OBJECTS
   ExperimentSpec        harness/spec.py
   RunContext            harness/spec.py
   Budget / Call         harness/budget.py / harness/call.py
+  CallExecution         harness/call.py
   Checkpoint            harness/checkpoint.py
-  LLMResponse           llm/response.py
+  Journal               harness/journal.py
+  Verification          harness/verification.py
+  LLMOutcome/LLMResponse llm/response.py
   Result/Approval/Refusal common/results.py
   LLMError / Score      common/errors.py / common/scoring.py
   SystemPrompt          harness/prompt.py
@@ -105,13 +109,17 @@ some CLI code, and tool handlers still accept raw dicts for compatibility.
 | Cluster identity / topology | `tools/topology.py:516` | Discovers, freezes, hashes, resolves targets; still returns raw dicts. |
 | Destructive safety | `tools/safety.py:29` | Enforces context/cluster/topology allow-lists. |
 | Backend config | `llm/client.py:17` | `Backend` is typed, but engine receives it untyped. |
-| Chat messages | `harness/message.py:10` | `Message` owns shape, `redact()`, and `truncate()`. |
+| Chat messages | `harness/message.py:10` | `Message` owns shape, redaction, truncation, and persistence. |
+| Event/artifact channel | `harness/journal.py` | Owns event mutation, UI descriptions, and artifact serialization. |
 | Prompt policy | `harness/prompt.py:9` | `SystemPrompt` renders topology-aware prompt. |
 | Tool catalog | `tools/tool.py:235` | Singleton `TOOL_REGISTRY`; dynamic schemas; late-bound repair handlers. |
 | Diagnosis/repair gates | `harness/tooling.py:104`, `harness/tooling.py:173` | Real domain policy; good seam. |
 | Agent wiring | `harness/agent.py` | `Agent()` has default factories; `build_agent()` is a compatibility shim; `Agent.run` delegates to `AgentLoop`. |
+| Response audit | `llm/response.py` | `LLMOutcome` maps success/failure to `Result`; `commit()` records request, artifact, message, and event. |
+| Tool lifecycle | `harness/call.py` | `Call` persists intent; `CallExecution` maps `Result` success/failure and commits the result. |
 | Checkpointing | `harness/checkpoint.py` | Owns state snapshot, lease renewal, and run-row projection. |
-| Orchestration loop | `harness/loop.py` | Owns budget, LLM responses, tool calls, verify, and `RunResult`. |
+| Verification | `harness/verification.py` | Owns verify execution, `Result` variant, evidence artifact, and event. |
+| Orchestration loop | `harness/loop.py` | Coordinates objects and stop conditions; no longer owns per-call persistence details. |
 | Persistence | `storage/sqlite_store.py` | Authoritative, event-log-first; sole writer of derived traces/exports. |
 | Scoring | `common/scoring.py` | One `Score` used by engine, `score.py`, and `replay.py`. |
 
@@ -202,24 +210,28 @@ harness.loop.AgentLoop.run(spec, ctx) -> RunResult
         |
         v
 LLM LOOP
-  Message[] -> dicts -> ChatClient.chat()
-  response -> LLMResponse -> Message
-  append to SQLite messages
-  redact for event log
+  Message[] -> dicts -> LLMOutcome.invoke(ChatClient.chat())
+  Result.success() / Result.failure()
+  LLMOutcome.commit() -> LLMResponse | None
+    success: add_llm_request + artifact + message + assistant event
+    failure: add_llm_request(error) + artifact + llm_error event
+  Budget.add_tokens()
   Checkpoint.capture()
         |
-        +-- no tool calls + no diagnosis -> nudge
+        +-- no tool calls + no diagnosis -> Message.user().persist()
         +-- no tool calls + diagnosis -> stop
         +-- tool calls:
-              Call.from_tool_call()
-              registry.get(name)
-              store.begin_tool_call()
-              Tool.run(args, ToolContext)
-                diagnosis -> Diagnosis.execute()
-                repair    -> Repair.execute() -> Tool.invoke_handler()
+              Call.from_tool_call().for_tool(registry.get(name))
+              Call.invoke() -> CallExecution
+                begin_tool_call intent
+                Tool.run(args, ToolContext)
+                  diagnosis -> Diagnosis.execute()
+                  repair    -> Repair.execute() -> Tool.invoke_handler()
+                Result.success() / Result.failure()
               ToolOutcome -> AgentState.apply()
-              truncate tool result via Message.truncate()
-              artifact + event + Checkpoint.capture()
+              CallExecution.commit()
+                artifact + finish_tool_call + tool message + event
+              Checkpoint.capture()
         |
         v
 budget/stop condition
@@ -227,7 +239,9 @@ budget/stop condition
          |
          v
 VERIFY + FINISH
-  subprocess.run(verify_cmd, env=spec.run_env)
+  Verification.run(spec) -> Verification
+  Verification.commit()
+    artifact + event
   record = {...}
   score = Score.from_record(...)
   store.finish_run()
@@ -581,7 +595,13 @@ domain/
   Scenario                owns budgets, repair policy, targets
   TopologyPolicy          owns hash, capability, target selection
   ExperimentSpec          scenario + backend + guard + run_env + config_hash
-  Message                 chat shape + redaction + truncation
+  Message                 chat shape + redaction + truncation + persistence
+  LLMOutcome              LLM Result variant + audit trail commit
+  LLMResponse             response parsing + success audit trail commit
+  Call                    tool call identity + intent persistence
+  CallExecution           Result variant + post-execution persistence
+  Journal                 event/artifact/UI channel
+  Verification            verify run + evidence persistence
   ToolOutcome             typed result, no string-prefix success inference
   AgentState              pure state machine
   Diagnosis / Repair      gates
@@ -629,15 +649,17 @@ Completed in the current hardening pass:
    `Approval`, and `Refusal` carry the previously untyped boundary state.
 6. One typed `AgentLoop.run(spec, ctx) -> RunResult`; `run_scenario` is a legacy
    adapter, and `Agent.run` is composition rather than the loop.
-7. `RunStore` and `ChatClient` ports define the loop dependencies; the SQLite
+7. `Message`, `LLMOutcome`/`LLMResponse`, `Call`/`CallExecution`, `Journal`, and
+   `Verification` own their persistence details; the loop only coordinates.
+8. `RunStore` and `ChatClient` ports define the loop dependencies; the SQLite
    store is the only writer of derived traces and exports.
 
 Remaining:
 
-8. Consolidate policy into `TopologyPolicy` and state into events plus a
+9. Consolidate policy into `TopologyPolicy` and state into events plus a
    rebuildable projection.
-9. Move code incrementally into the target layout in §6 with `tools/` re-export
-   shims.
+10. Move code incrementally into the target layout in §6 with `tools/` re-export
+    shims.
 
 ## 8. Review-driven design decisions
 
