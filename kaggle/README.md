@@ -1,5 +1,11 @@
 # Kaggle bootstrap
 
+This is the budget-friendly GPU route for people without a paid OpenAI or
+Anthropic subscription and without a local GPU. It keeps the harness on the
+self-hosted `ollama` backend; Kaggle is only where the GPU runs. If you already
+have a GPU, skip this folder and run Ollama locally with
+`OLLAMA_BASE_URL=http://127.0.0.1:11434`.
+
 Run `kaggle/bootstrap.sh` in a Kaggle notebook cell with `%%bash`.
 
 It installs sshd, Ollama, pulls `qwen3.8:27b`, and opens a zrok tunnel. Wait until
@@ -54,18 +60,21 @@ OLLAMA_MODEL=qwen3.8:27b
 OLLAMA_API_KEY=ollama
 ```
 
-`OLLAMA_MODEL` must match the model tag pulled by the Kaggle cell. Then verify:
+`OLLAMA_MODEL` must match the model tag pulled by the Kaggle cell. Then verify
+the LLM brain first; no cluster is needed for these checks:
 
 ```bash
 curl http://127.0.0.1:11435/api/tags
 python3 scripts/llm_ready.py
+./chaos ping "Say hello in one sentence"
 python3 -m unittest tests.test_backends -v
 ```
 
-Once those pass, run a benchmark with the self-hosted `ollama` backend:
+A successful ping prints `ollama / <model>` and the reply. Once those pass, run a
+benchmark with the self-hosted `ollama` backend:
 
 ```bash
-./run_benchmark.sh --scenario etcd-member-down --backend ollama --runs 1
+./chaos run --scenario etcd-member-down --backend ollama --runs 1
 ```
 
 Notes:
@@ -77,3 +86,6 @@ Notes:
 - `PUBLIC_KEY_URL` must serve the public key matching the local private key used
   with `-i`; otherwise SSH asks for a password.
 - Kaggle is not needed for SQLite/checkpointer development or offline tests.
+- Kaggle is infrastructure, not a provider baseline: runs are recorded as the
+  `ollama` backend. Keep this folder as the repeatable no-subscription GPU path.
+- Never commit tunnel tokens or `.env`; this setup stays local to your machine.
