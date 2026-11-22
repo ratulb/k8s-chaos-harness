@@ -121,15 +121,16 @@ class TestHardening(unittest.TestCase):
             store.close()
 
     def test_provider_error_classification(self) -> None:
-        self.assertEqual(agent._classify_llm_error("HTTP Error 413: Payload Too Large"), "provider_error_413")
-        self.assertEqual(agent._classify_llm_error("HTTP Error 429: Too Many Requests"), "provider_error_429")
-        self.assertEqual(agent._classify_llm_error("HTTP Error 502: Bad Gateway"), "provider_error_5xx")
-        self.assertEqual(agent._classify_llm_error("boom"), "error")
+        self.assertEqual(classify_llm_error("HTTP Error 413: Payload Too Large"), "provider_error_413")
+        self.assertEqual(classify_llm_error("HTTP Error 429: Too Many Requests"), "provider_error_429")
+        self.assertEqual(classify_llm_error("HTTP Error 502: Bad Gateway"), "provider_error_5xx")
+        self.assertEqual(classify_llm_error("boom"), "error")
 
     def test_llm_error_object_classifies_structured_failures(self) -> None:
         error = LLMError.from_exception(urllib.error.HTTPError("http://x", 429, "slow down", {}, None))
         self.assertEqual(error.kind, "http")
         self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.classify(), "provider_error_429")
         self.assertEqual(error.end_reason, "provider_error_429")
         self.assertEqual(classify_llm_error(error), "provider_error_429")
         self.assertEqual(classify_llm_error(TimeoutError("late")), "error")

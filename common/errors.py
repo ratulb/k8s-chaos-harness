@@ -13,8 +13,7 @@ class LLMError(Exception):
     def __str__(self) -> str:
         return self.message
 
-    @property
-    def end_reason(self) -> str:
+    def classify(self) -> str:
         if self.status_code == 413:
             return "provider_error_413"
         if self.status_code == 429:
@@ -22,6 +21,10 @@ class LLMError(Exception):
         if self.status_code in {500, 502, 503, 504}:
             return "provider_error_5xx"
         return "error"
+
+    @property
+    def end_reason(self) -> str:
+        return self.classify()
 
     @classmethod
     def from_exception(cls, error: BaseException) -> "LLMError":
@@ -48,10 +51,10 @@ def _status_code(error: BaseException) -> int | None:
 
 def classify_llm_error(error: BaseException | str) -> str:
     if isinstance(error, LLMError):
-        return error.end_reason
+        return error.classify()
     status_code = _status_code(error) if isinstance(error, BaseException) else None
     if status_code is not None:
-        return LLMError(kind="http", message=str(error), status_code=status_code).end_reason
+        return LLMError(kind="http", message=str(error), status_code=status_code).classify()
     text = str(error).lower()
     if "413" in text or "payload too large" in text:
         return "provider_error_413"

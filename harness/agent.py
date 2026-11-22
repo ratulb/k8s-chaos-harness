@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from common.errors import classify_llm_error as _classify_provider_error
+from common.errors import LLMError
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS, ROOT_CAUSE_LABELS
 from llm.client import LLMClient
 from tools import cluster_config
@@ -29,10 +29,6 @@ REPAIR_TIMEOUT_FOLLOWUP = (
     " Repair did not complete. Do not spend the remaining budget on broad debugging; "
     "report the timeout and escalate to the operator in your final response."
 )
-
-
-def _classify_llm_error(error: object) -> str:
-    return _classify_provider_error(error)
 
 
 def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:
@@ -310,12 +306,14 @@ def run_scenario(
                 on_chunk=(lambda text: emit("assistant_delta", text)) if reporter is not None else None,
             )
         except Exception as e:
+            wrapped_error = LLMError.from_exception(e)
+            error_text = str(wrapped_error)
             llm_error = True
-            end_reason = _classify_llm_error(str(e))
+            end_reason = wrapped_error.classify()
             if store is not None:
-                store.add_llm_request(run_id, getattr(backend, "name", "unknown"), int((time.time() - started) * 1000), 0, 0, str(e))
-            log({"type": "llm_error", "error": str(e)})
-            artifact("llm_error_full", {"error": str(e)})
+                store.add_llm_request(run_id, getattr(backend, "name", "unknown"), int((time.time() - started) * 1000), 0, 0, error_text)
+            log({"type": "llm_error", "error": error_text})
+            artifact("llm_error_full", {"error": error_text})
             break
         usage = resp.get("usage", {}) or {}
         tokens_in = int(usage.get("prompt_tokens") or 0)
