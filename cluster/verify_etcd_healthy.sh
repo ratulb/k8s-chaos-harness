@@ -31,13 +31,18 @@ if [[ "$ready_nodes" -lt "$EXPECTED_NODES" ]]; then
   exit 1
 fi
 
-etcd_pods=$(kubectl --request-timeout=10s get pods -n kube-system -l component=etcd \
-  -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
-running=$(for pod in $etcd_pods; do
-  ready=$(kubectl --request-timeout=10s get pod "$pod" -n kube-system \
-    -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
-  [[ "$ready" == "true" ]] && echo "$pod"
-done | wc -l)
+running=0
+for i in $(seq 1 24); do
+  etcd_pods=$(kubectl --request-timeout=10s get pods -n kube-system -l component=etcd \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' 2>/dev/null || true)
+  running=$(for pod in $etcd_pods; do
+    ready=$(kubectl --request-timeout=10s get pod "$pod" -n kube-system \
+      -o jsonpath='{.status.containerStatuses[0].ready}' 2>/dev/null || true)
+    [[ "$ready" == "true" ]] && echo "$pod"
+  done | wc -l)
+  [[ "$running" -ge "$EXPECTED" ]] && break
+  sleep 5
+done
 if [[ "$running" -lt "$EXPECTED" ]]; then
   echo "Expected $EXPECTED running etcd pods, got $running" >&2
   exit 1
