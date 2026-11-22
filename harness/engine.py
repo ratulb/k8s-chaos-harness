@@ -7,10 +7,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from common.errors import LLMError
+from common.scoring import Score
 from harness.message import Message
 from harness.prompt import SystemPrompt
 from harness.tooling import AgentState, Diagnosis, Repair
 from llm.client import LLMClient
+from tools.naming import normalize_repair_name
 from tools import topology as topology_tools
 from tools.tool import TOOL_REGISTRY, ToolContext, ToolOutcome
 from tools.truncate import truncate
@@ -40,28 +42,38 @@ def run_scenario(
     tool_registry: Any = None,
     diagnosis_class: Any = Diagnosis,
     repair_class: Any = Repair,
+    run_env: dict[str, str] | None = None,
 ) -> dict:
     Path(trace_dir).mkdir(parents=True, exist_ok=True)
     trace_path = Path(trace_dir) / f"{run_id}.jsonl"
     trace: list[dict[str, Any]] = []
+    if trace_path.exists():
+        for line in trace_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                trace.append(Message.redact_payload(json.loads(line)))
+            except ValueError:
+                continue
     registry = tool_registry or TOOL_REGISTRY
     client_factory = client_factory or LLMClient
 
     def log(event: dict) -> int:
         event["ts"] = time.time()
-        trace.append(event)
-        with trace_path.open("a") as f:
-            f.write(json.dumps(event) + "\n")
+        trace_event = Message.redact_payload(event)
+        trace.append(trace_event)
+        with trace_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(trace_event, sort_keys=True, default=str) + "\n")
         event_type = str(event.get("type", "unknown"))
         if event_type == "assistant":
-            message = event.get("message", {}) or {}
+            message = trace_event.get("message", {}) or {}
             ui_text = message.get("content") or message.get("reasoning") or ""
         elif event_type == "tool":
-            ui_text = f"{event.get('name', '?')}: {event.get('status', '?')} {event.get('result', '')}"
+            ui_text = f"{trace_event.get('name', '?')}: {trace_event.get('status', '?')} {trace_event.get('result', '')}"
         elif event_type == "approval":
-            ui_text = f"diagnosis={event.get('diagnosis', '?')} granted={event.get('granted')}"
+            ui_text = f"diagnosis={trace_event.get('diagnosis', '?')} granted={trace_event.get('granted')}"
         else:
-            ui_text = json.dumps(event, sort_keys=True, default=str)
+            ui_text = json.dumps(trace_event, sort_keys=True, default=str)
         emit(event_type, ui_text)
         if store is None:
             return 0
@@ -100,8 +112,7 @@ def run_scenario(
     max_steps = scenario.get("max_steps", 40)
     max_tokens = scenario.get("max_tokens", 60000)
     diagnosis_deadline = scenario.get("diagnosis_deadline_steps", 4)
-    acceptable = set(scenario.get("acceptable_repairs", []))
-    forbidden = set(scenario.get("forbidden_repairs", []))
+    acceptable = {normalize_repair_name(name) for name in scenario.get("acceptable_repairs", [])}
     llm_error = False
     end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
 
@@ -118,6 +129,7 @@ def run_scenario(
         )
         if store is not None:
             store.set_state(run_id, current)
+            store.renew_lease(run_id)
             store.update_run(
                 run_id,
                 diagnosis=state.diagnosis,
@@ -182,20 +194,27 @@ def run_scenario(
                 tokens_in,
                 tokens_out,
             )
-        artifact("llm_response_full", resp)
+        artifact("llm_response_full", Message.redact_payload(resp))
         tokens_used += total_tokens
-        msg = Message.from_dict(resp["choices"][0]["message"])
+        choice = resp["choices"][0]
+        msg = Message.from_dict(choice["message"])
         messages.append(msg)
+        stored_msg = Message.redact_payload(msg.to_dict())
         if store is not None:
             store.append_message(
                 run_id,
-                msg.role,
-                msg.content,
-                msg.tool_calls,
+                stored_msg["role"],
+                stored_msg.get("content"),
+                stored_msg.get("tool_calls", ()),
                 tokens=total_tokens,
                 backend=getattr(backend, "name", "unknown"),
             )
-        log({"type": "assistant", "message": Message.redact(msg.to_dict()) if approve == "prompt" else msg.to_dict()})
+        log({
+            "type": "assistant",
+            "message": stored_msg,
+            "finish_reason": choice.get("finish_reason"),
+            "stream_fallback": bool(resp.get("stream_fallback")),
+        })
         checkpoint()
 
         tool_calls = msg.tool_calls
@@ -220,11 +239,7 @@ def run_scenario(
                 args = json.loads(tc["function"].get("arguments") or "{}")
             except Exception:
                 args = {}
-            log_args = (
-                {key: value for key, value in args.items() if key != "approval_token"}
-                if approve == "prompt" and isinstance(args, dict)
-                else args
-            )
+            log_args = Message.redact_payload(args)
             call_id = f"{tc.get('id', 'call')}-{steps}-{len(messages)}"
             tool = registry.get(name)
             mutating = bool(tool and tool.mutating)
@@ -246,18 +261,28 @@ def run_scenario(
             if outcome.artifact_kind:
                 artifact(outcome.artifact_kind, outcome.artifact_payload)
             elif tool is not None and tool.kind == "diagnostic":
-                artifact("tool_output_full", {"tool": name, "args": args, "result": result})
+                artifact("tool_output_full", {"tool": name, "args": Message.redact_payload(args), "result": Message.redact_payload(result)})
 
             raw_result = result
             tool_message = Message.from_dict(Message.truncate(Message.tool(raw_result, tc["id"]).to_dict(), 4000))
             result = str(tool_message.content or "")
             trunc = len(result) < len(raw_result)
             if store is not None:
-                store.finish_tool_call(run_id, call_id, call_status, raw_result, result, trunc, approved_by, call_error)
+                store.finish_tool_call(
+                    run_id, call_id, call_status,
+                    Message.redact_payload(raw_result),
+                    Message.redact_payload(result),
+                    trunc, approved_by, call_error,
+                )
             messages.append(tool_message)
             if store is not None:
-                store.append_message(run_id, tool_message.role, tool_message.content, tool_call_id=tool_message.tool_call_id, backend=getattr(backend, "name", "unknown"))
-            log({"type": "tool", "name": name, "args": log_args, "result": result, "status": call_status, "mutating": mutating})
+                store.append_message(
+                    run_id, tool_message.role,
+                    Message.redact_payload(tool_message.content),
+                    tool_call_id=tool_message.tool_call_id,
+                    backend=getattr(backend, "name", "unknown"),
+                )
+            log({"type": "tool", "name": name, "args": log_args, "result": Message.redact_payload(result), "status": call_status, "mutating": mutating})
             checkpoint()
 
         if not state.diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
@@ -278,7 +303,14 @@ def run_scenario(
         store.update_run(run_id, phase="verifying", end_reason=end_reason)
     log({"type": "verify_started", "verify_timeout": verify_timeout})
     try:
-        v = subprocess.run(verify_cmd, shell=True, capture_output=True, text=True, timeout=verify_timeout)
+        v = subprocess.run(
+            verify_cmd,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=verify_timeout,
+            env=run_env,
+        )
         verify_ok = (v.returncode == 0)
         verify_output = (v.stdout + v.stderr).strip()
     except Exception as e:
@@ -311,6 +343,8 @@ def run_scenario(
         "truth": scenario["root_cause"],
         "diagnosis_correct": state.diagnosis == scenario["root_cause"],
         "approval_granted": state.approval_token is not None,
+        "diagnosis_attempts": state.diagnosis_attempts,
+        "diagnosis_first_attempt_correct": state.diagnosis_first_attempt_correct,
         "repair": state.repair,
         "repair_args": state.repair_args,
         "policy_violations": state.policy_violations,
@@ -324,29 +358,7 @@ def run_scenario(
     }
     log({"type": "record", "record": record})
     final_state = checkpoint()
-    no_fault = scenario["root_cause"] == "no_fault"
-    loop_success = bool(
-        record["diagnosis_correct"]
-        and verify_ok
-        and (bool(state.repair) != no_fault)
-    )
-    if no_fault:
-        repair_acceptable = state.repair is None
-    else:
-        repair_acceptable = bool(state.repair and state.repair in acceptable)
-    score = {
-        "scorer_version": "legacy-record-v1",
-        "fault_present": fault_present,
-        "end_reason": end_reason,
-        "diagnosis": state.diagnosis,
-        "diagnosis_correct": record["diagnosis_correct"],
-        "repair_action": state.repair,
-        "repair_acceptable": repair_acceptable,
-        "repair_forbidden": bool(state.repair and state.repair in forbidden),
-        "recovered": verify_ok,
-        "policy_violations": len(state.policy_violations),
-        "loop_success": loop_success,
-    }
+    score = Score.from_record(record, acceptable).to_dict()
     if store is not None:
         store.finish_run(run_id, record, status="finished", end_reason=end_reason, state=final_state, score=score)
     return record

@@ -38,6 +38,7 @@ class TestRunBenchmarkTopology(unittest.TestCase):
     def _runner(self, db: Path, tmp_path: Path, *extra: str) -> subprocess.CompletedProcess:
         env = os.environ.copy()
         env["CHAOS_TOPOLOGY_JSON"] = str(ROOT / "tests" / "fixtures" / "topologies" / "n1.json")
+        env["CHAOS_ALLOW_FIXTURE_RUNS"] = "1"
         env["CHAOS_CLUSTER_ID"] = "fixture"
         env["CHAOS_ALLOWED_CLUSTER_IDS"] = "fixture"
         env["CHECKPOINT_DB"] = str(db)
@@ -65,6 +66,7 @@ class TestRunBenchmarkTopology(unittest.TestCase):
             db = tmp_path / "results.sqlite3"
             env = os.environ.copy()
             env["CHAOS_TOPOLOGY_JSON"] = str(ROOT / "tests" / "fixtures" / "topologies" / "n1.json")
+            env["CHAOS_ALLOW_FIXTURE_RUNS"] = "1"
             env["CHAOS_CLUSTER_ID"] = "fixture"
             env["CHAOS_ALLOWED_CLUSTER_IDS"] = "fixture"
             env["CHECKPOINT_DB"] = str(db)
@@ -105,15 +107,19 @@ class TestRunBenchmarkTopology(unittest.TestCase):
             self.assertIn("capability", event_types)
             conn.close()
 
-    def test_topology_mismatch_auto_discards_stale_state(self) -> None:
+    def test_topology_mismatch_archives_before_discarding_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
             db = tmp_path / "results.sqlite3"
             self._seed_old_run(db)
 
-            result = self._runner(db, tmp_path)
+            result = self._runner(db, tmp_path, "--discard-stale")
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("discarding stale state", result.stdout)
+            self.assertIn("archiving and discarding stale state", result.stdout)
+            archives = sorted((tmp_path / "archive").glob("*/manifest.json"))
+            self.assertEqual(len(archives), 1)
+            manifest = json.loads(archives[0].read_text())
+            self.assertEqual(manifest["reason"], "state_discard")
             conn = sqlite3.connect(db)
             rows = conn.execute("SELECT run_id, topology_hash FROM runs").fetchall()
             batches = conn.execute("SELECT COUNT(*) FROM batches").fetchone()[0]
@@ -122,6 +128,25 @@ class TestRunBenchmarkTopology(unittest.TestCase):
             self.assertNotEqual(rows[0][0], "old-run")
             self.assertNotEqual(rows[0][1], "old-topology")
             self.assertEqual(batches, 1)
+
+    def test_topology_mismatch_archives_and_exits_without_flag(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db = tmp_path / "results.sqlite3"
+            self._seed_old_run(db)
+
+            result = self._runner(db, tmp_path)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("archived stale state and exiting", result.stdout)
+            archives = sorted((tmp_path / "archive").glob("*/manifest.json"))
+            self.assertEqual(len(archives), 1)
+            manifest = json.loads(archives[0].read_text())
+            self.assertEqual(manifest["reason"], "topology_change")
+            self.assertIn("old-run", manifest["active_runs"])
+            conn = sqlite3.connect(db)
+            rows = conn.execute("SELECT run_id, topology_hash FROM runs").fetchall()
+            conn.close()
+            self.assertEqual(rows, [("old-run", "old-topology")])
 
     def test_explicit_resume_refuses_topology_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

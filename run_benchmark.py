@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -21,7 +22,16 @@ from tools.scenario_schema import load_scenario_object
 from harness.agent import run_scenario
 from harness.reporter import UiReporter
 from harness.ui import LiveView
-from storage.sqlite_store import active_topology_hash, discard_state, SQLiteStore
+from storage.sqlite_store import active_topology_hash, archive_state, discard_state, SQLiteStore
+
+_SAFE_TARGET_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _validate_targets(targets: list[str]) -> list[str]:
+    for target in targets:
+        if not _SAFE_TARGET_RE.fullmatch(target):
+            raise RuntimeError(f"unsafe target node name {target!r}")
+    return targets
 
 
 def _log_path(logs_dir: str | None, run_id: str) -> str | None:
@@ -177,7 +187,9 @@ def _run_fresh(
 
     store.update_run(run_id, phase="fault_check")
     targets = [item for item in str(run_env.get("TARGET_NODES", "")).split() if item]
-    fault_present, fault_detail, fault_elapsed = fault_checks.wait_for_fault(scenario, targets)
+    fault_present, fault_detail, fault_elapsed = fault_checks.wait_for_fault(
+        scenario, targets, env=run_env,
+    )
     fault_payload = {
         "present": fault_present,
         "detail": fault_detail,
@@ -231,6 +243,7 @@ def _run_fresh(
             approve=approve,
             pause_reporter=pause_view,
             resume_reporter=resume_view,
+            run_env=run_env,
         )
     finally:
         if view:
@@ -252,6 +265,7 @@ def _run_resume(
     logs_dir: str | None = None,
     mode: str = "benchmark",
     approve: str = "policy",
+    run_env: dict[str, str] | None = None,
 ) -> dict:
     run_id = row["run_id"]
     log_path = _log_path(logs_dir, run_id)
@@ -302,6 +316,7 @@ def _run_resume(
             approve=approve,
             pause_reporter=pause_view,
             resume_reporter=resume_view,
+            run_env=run_env,
         )
     finally:
         if view:
@@ -366,6 +381,7 @@ def main() -> None:
     ap.add_argument("--resume-of", default=None)
     ap.add_argument("--force-resume", action="store_true")
     ap.add_argument("--no-jsonl", action="store_true")
+    ap.add_argument("--discard-stale", action="store_true")
     ap.add_argument("--runs-file", default=None)
     ap.add_argument("--trace-dir", default="traces")
     ap.add_argument("--launch-id", default=None)
@@ -409,8 +425,16 @@ def main() -> None:
         min_targets = int(scenario_obj.raw.get("selector_requirements", {}).get("min_targets", 0))
         if len(resolved) < min_targets:
             raise RuntimeError(f"scenario requires at least {min_targets} target node(s); resolved {resolved}")
+        resolved = _validate_targets(resolved)
     except Exception as e:
         print(f"Topology preflight failed: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    if topology_data.get("source") == "fixture" and os.environ.get("CHAOS_ALLOW_FIXTURE_RUNS") != "1":
+        print(
+            "fixture topology rejected: set CHAOS_ALLOW_FIXTURE_RUNS=1 only for offline tests",
+            file=sys.stderr,
+        )
         sys.exit(2)
 
     active_hash = active_topology_hash(args.db)
@@ -422,9 +446,24 @@ def main() -> None:
         )
         sys.exit(1)
     if not (args.resume or args.resume_of) and active_hash and active_hash != topology_data["topology_hash"]:
+        if not args.discard_stale:
+            try:
+                summary = archive_state(
+                    args.db, runs_discard_path, trace_dir, reason="topology_change",
+                )
+            except Exception as exc:
+                print(f"automatic state archive failed: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(
+                f"topology changed from {active_hash} to {topology_data['topology_hash']}; "
+                f"archived stale state and exiting: {summary['archive']}",
+                flush=True,
+            )
+            print(json.dumps(summary), flush=True)
+            return
         print(
             f"topology changed from {active_hash} to {topology_data['topology_hash']}; "
-            "discarding stale state",
+            "archiving and discarding stale state",
             flush=True,
         )
         try:
@@ -579,7 +618,7 @@ def main() -> None:
                     print(f"=== resume {row['run_id']} ===", flush=True)
                 rec = _run_resume(
                     store, row, scenario, backend, root, trace_dir, runs_path,
-                    args.ui, logs_dir, args.mode, args.approve,
+                    args.ui, logs_dir, args.mode, args.approve, run_env,
                 )
             print(json.dumps(rec), flush=True)
         store.update_batch(batch_id, "complete")

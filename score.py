@@ -10,25 +10,8 @@ from collections import defaultdict
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from common.scoring import ACCEPTABLE_BY_TRUTH, SCORER_VERSION, Score, is_excluded
 from storage.sqlite_store import SQLiteStore
-
-ACCEPTABLE_BY_TRUTH = {
-    "no_fault": set(),
-    "etcd_member_unreachable": {"restart_member"},
-    "etcd_config_error": {"restart_member", "member_remove_readd"},
-    "etcd_member_data_loss": {"member_remove_readd", "kube_etcd_switch_rebuild"},
-    "etcd_disk_exhaustion": {"restart_member", "kube_etcd_switch_rebuild"},
-    "etcd_quorum_loss": {"restart_member", "snapshot_restore_full"},
-}
-
-
-def is_excluded(rec: dict, require_fault: bool = True) -> bool:
-    reason = str(rec.get("end_reason") or "")
-    if reason.startswith("provider_error") or reason in {"error", "fault_not_observed", "injection_failed"}:
-        return True
-    if require_fault and rec.get("fault_present") is not True:
-        return True
-    return False
 
 
 def load(
@@ -66,53 +49,31 @@ def load(
 
 
 def acceptable_repair(rec: dict) -> bool:
-    repair = rec.get("repair")
-    if "repair_acceptable" in rec:
-        return bool(rec["repair_acceptable"])
-    truth = str(rec.get("truth") or "")
-    if truth == "no_fault":
-        return not repair
-    return bool(repair and repair in ACCEPTABLE_BY_TRUTH.get(truth, set()))
+    return Score.from_record(rec).repair_acceptable
 
 
 def strict_success(rec: dict) -> bool:
-    if is_excluded(rec):
-        return False
-    if not rec.get("diagnosis_correct") or not rec.get("verify_ok"):
-        return False
-    if rec.get("repair_forbidden") or rec.get("forbidden_reason") or rec.get("policy_violations"):
-        return False
-    no_fault = rec.get("truth") == "no_fault"
-    if bool(rec.get("repair")) == no_fault:
-        return False
-    return acceptable_repair(rec)
+    return Score.from_record(rec).strict_loop_success
 
 
 def summarize(recs: list[dict]) -> dict:
     n = len(recs) or 1
-    diag = sum(bool(r.get("diagnosis_correct")) for r in recs)
-    verify = sum(bool(r.get("verify_ok")) for r in recs)
-    approved = sum(bool(r.get("approval_granted")) for r in recs)
-    forbidden = sum(bool(r.get("forbidden_reason")) for r in recs)
-    policy = sum(bool(r.get("policy_violations")) for r in recs)
-    success = 0
-    for r in recs:
-        no_fault = r.get("truth") == "no_fault"
-        repaired = bool(r.get("repair"))
-        if r.get("diagnosis_correct") and r.get("verify_ok") and (repaired != no_fault):
-            success += 1
-    strict = sum(strict_success(r) for r in recs)
+    scores = [Score.from_record(rec) for rec in recs]
     return {
         "runs": len(recs),
-        "diagnosis": round(diag / n, 3),
-        "verify": round(verify / n, 3),
-        "approval": round(approved / n, 3),
-        "strict_loop_success": round(strict / n, 3),
-        "loop_success": round(success / n, 3),
-        "policy_violations": round(policy / n, 3),
-        "forbidden": round(forbidden / n, 3),
+        "diagnosis": round(sum(s.diagnosis_correct for s in scores) / n, 3),
+        "first_attempt_diagnosis": round(sum(s.diagnosis_first_attempt_correct for s in scores) / n, 3),
+        "verify": round(sum(s.recovered for s in scores) / n, 3),
+        "approval": round(sum(bool(r.get("approval_granted")) for r in recs) / n, 3),
+        "strict_loop_success": round(sum(s.strict_loop_success for s in scores) / n, 3),
+        "loop_success": round(sum(s.loop_success for s in scores) / n, 3),
+        "policy_violations": round(sum(bool(s.policy_violations) for s in scores) / n, 3),
+        "forbidden": round(sum(s.repair_forbidden for s in scores) / n, 3),
+        "budget_exhausted": round(sum(s.end_reason in {"budget_steps", "budget_tokens"} for s in scores) / n, 3),
+        "avg_diagnosis_attempts": round(sum(s.diagnosis_attempts for s in scores) / n, 2),
         "avg_steps": round(sum(r.get("steps", 0) for r in recs) / n, 1),
         "avg_tokens": round(sum(r.get("tokens_used", 0) for r in recs) / n, 1),
+        "scorer_version": SCORER_VERSION,
     }
 
 
@@ -159,7 +120,7 @@ def main() -> None:
         print(json.dumps(result, indent=2))
         return
 
-    cols = ["runs", "diagnosis", "verify", "approval", "strict_loop_success", "loop_success", "policy_violations", "forbidden", "avg_steps", "avg_tokens"]
+    cols = ["runs", "diagnosis", "first_attempt_diagnosis", "verify", "approval", "strict_loop_success", "loop_success", "policy_violations", "forbidden", "budget_exhausted", "avg_diagnosis_attempts", "avg_steps", "avg_tokens"]
     print("| Group | " + " | ".join(cols) + " |")
     print("|---|" + "---|" * len(cols))
     for name, stats in [("overall", result["overall"])] + sorted(result["by_backend"].items()) + sorted(result["by_backend_scenario"].items()):

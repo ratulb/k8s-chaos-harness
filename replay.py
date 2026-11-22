@@ -7,6 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from common.scoring import Score
 from harness.reporter import redact
 from storage.sqlite_store import SQLiteStore, read_only_rows
 from tools import topology as topology_tools
@@ -50,7 +51,7 @@ def _matrix_rows(store: SQLiteStore, records: list[dict[str, Any]]) -> list[dict
         )
     }
     grouped: dict[tuple[str, str, str, str], dict[str, Any]] = defaultdict(
-        lambda: {"runs": 0, "diagnosed": 0, "repaired": 0, "verified": 0}
+        lambda: {"runs": 0, "diagnosed": 0, "first_attempt": 0, "repaired": 0, "verified": 0, "strict": 0}
     )
     for rec in records:
         key = (
@@ -60,11 +61,14 @@ def _matrix_rows(store: SQLiteStore, records: list[dict[str, Any]]) -> list[dict
             str(rec.get("seed", "")),
         )
         row = grouped[key]
+        score = Score.from_record(rec)
         row["runs"] += 1
-        row["diagnosed"] += int(bool(rec.get("diagnosis_correct")))
+        row["diagnosed"] += int(score.diagnosis_correct)
+        row["first_attempt"] += int(score.diagnosis_first_attempt_correct)
         repaired = bool(rec.get("repair"))
         row["repaired"] += int(repaired)
-        row["verified"] += int(bool(rec.get("verify_ok")))
+        row["verified"] += int(score.recovered)
+        row["strict"] += int(score.strict_loop_success)
     output: list[dict[str, Any]] = []
     for key, row in sorted(grouped.items()):
         scenario, backend, topology, seed = key
@@ -76,8 +80,10 @@ def _matrix_rows(store: SQLiteStore, records: list[dict[str, Any]]) -> list[dict
             "seed": seed,
             "runs": runs,
             "diagnosis_rate": row["diagnosed"] / runs,
+            "first_attempt_diagnosis_rate": row["first_attempt"] / runs,
             "repair_rate": row["repaired"] / runs,
             "verify_rate": row["verified"] / runs,
+            "strict_loop_success": row["strict"] / runs,
         })
     return output
 
@@ -167,8 +173,10 @@ def build_html(db_path: str | Path, include_interactive: bool = False) -> str:
         f"<td>{_escape(row['seed'])}</td>"
         f"<td>{row['runs']}</td>"
         f"<td>{row['diagnosis_rate']:.2f}</td>"
+        f"<td>{row['first_attempt_diagnosis_rate']:.2f}</td>"
         f"<td>{row['repair_rate']:.2f}</td>"
         f"<td>{row['verify_rate']:.2f}</td>"
+        f"<td>{row['strict_loop_success']:.2f}</td>"
         "</tr>"
         for row in matrix
     )
@@ -191,7 +199,8 @@ def build_html(db_path: str | Path, include_interactive: bool = False) -> str:
         "<p>Static replay from SQLite. Event and stream text is redacted before rendering.</p>",
         "<h2>Results matrix</h2>",
         "<table><thead><tr><th>Scenario</th><th>Backend</th><th>Topology</th><th>Seed</th>"
-        "<th>Runs</th><th>Diagnosis</th><th>Repair</th><th>Verify</th></tr></thead>"
+        "<th>Runs</th><th>Diagnosis</th><th>First-try diagnosis</th><th>Repair</th><th>Verify</th>"
+        "<th>Strict success</th></tr></thead>"
         f"<tbody>{matrix_lines}</tbody></table>",
         "<h2>Runs</h2>",
         *sections,

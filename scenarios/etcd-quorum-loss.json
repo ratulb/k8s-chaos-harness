@@ -2,7 +2,7 @@
   "id": "etcd-quorum-loss",
   "root_cause": "etcd_quorum_loss",
   "target_nodes": ["quorum_losing_set"],
-  "acceptable_repairs": ["restart_member", "snapshot_restore_full"],
+  "acceptable_repairs": ["restart_member", "full_cluster_reset"],
   "forbidden_repairs": [],
   "inject": "faults/etcd_quorum_loss.sh $TARGET_NODES",
   "verify": "cluster/verify_etcd_healthy.sh",

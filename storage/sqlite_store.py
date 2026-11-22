@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -16,13 +17,16 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
+from common.scoring import SCORER_VERSION
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
-from tools.naming import normalize_backend
+from harness.message import Message
+from tools.naming import normalize_backend, normalize_repair_name
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 RUN_COLUMNS = {
     "run_id": "TEXT PRIMARY KEY",
@@ -47,6 +51,8 @@ RUN_COLUMNS = {
     "diagnosis": "TEXT",
     "diagnosis_raw": "TEXT",
     "diagnosis_correct": "INTEGER",
+    "diagnosis_attempts": "INTEGER",
+    "diagnosis_first_attempt_correct": "INTEGER",
     "approval_granted": "INTEGER",
     "repair": "TEXT",
     "repair_args_json": "TEXT",
@@ -57,6 +63,7 @@ RUN_COLUMNS = {
     "inject_ok": "INTEGER",
     "fault_present": "INTEGER DEFAULT 0",
     "verify_ok": "INTEGER",
+    "verify_output": "TEXT",
     "steps": "INTEGER NOT NULL DEFAULT 0",
     "tokens_used": "INTEGER NOT NULL DEFAULT 0",
     "started_at": "REAL",
@@ -75,9 +82,24 @@ RUN_COLUMNS = {
     "lease_expires_at": "REAL",
 }
 
+SCORE_COLUMNS = {
+    "diagnosis_attempts": "INTEGER",
+    "diagnosis_first_attempt_correct": "INTEGER",
+    "strict_loop_success": "INTEGER",
+}
+
+SCORE_BOOL_FIELDS = {
+    "diagnosis_first_attempt_correct",
+    "repair_acceptable",
+    "repair_forbidden",
+    "strict_loop_success",
+    "loop_success",
+}
+
 RUN_JSON_COLUMNS = {"repair_args_json", "policy_violations_json", "state_json"}
 RUN_BOOL_COLUMNS = {
     "diagnosis_correct",
+    "diagnosis_first_attempt_correct",
     "approval_granted",
     "reset_ok",
     "baseline_ok",
@@ -95,6 +117,8 @@ RECORD_TO_COLUMN = {
     "diagnosis": "diagnosis",
     "diagnosis_raw": "diagnosis_raw",
     "diagnosis_correct": "diagnosis_correct",
+    "diagnosis_attempts": "diagnosis_attempts",
+    "diagnosis_first_attempt_correct": "diagnosis_first_attempt_correct",
     "approval_granted": "approval_granted",
     "repair": "repair",
     "repair_args": "repair_args_json",
@@ -105,6 +129,8 @@ RECORD_TO_COLUMN = {
     "inject_ok": "inject_ok",
     "fault_present": "fault_present",
     "verify_ok": "verify_ok",
+    "verify_output": "verify_output",
+    "end_reason": "end_reason",
     "steps": "steps",
     "tokens_used": "tokens_used",
     "trace": "trace_path",
@@ -237,6 +263,61 @@ def abort_runs(
     return {"aborted": aborted, "reason": reason}
 
 
+def archive_state(
+    db_path: str | Path,
+    runs_jsonl: str | Path,
+    trace_dir: str | Path,
+    ip_cache_path: str | Path | None = None,
+    reason: str = "topology_change",
+) -> dict[str, Any]:
+    database = Path(db_path)
+    runs_file = Path(runs_jsonl)
+    traces = Path(trace_dir)
+    cache = Path(ip_cache_path) if ip_cache_path else None
+    active = active_run_rows(database)
+    live = [row for row in active if _pid_alive(row.get("pid"))]
+    if live:
+        raise RuntimeError(
+            "refusing state archive while active runs are alive: "
+            + ", ".join(str(row["run_id"]) for row in live)
+        )
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive_dir = database.parent / "archive" / f"{stamp}-{uuid.uuid4().hex[:6]}"
+    archive_dir.mkdir(parents=True, exist_ok=False)
+    copied: list[str] = []
+    for source in (database, Path(f"{database}-wal"), Path(f"{database}-shm")):
+        if source.exists():
+            target = archive_dir / source.name
+            shutil.copy2(source, target)
+            copied.append(str(target))
+    if runs_file.exists():
+        target = archive_dir / "runs.jsonl"
+        shutil.copy2(runs_file, target)
+        copied.append(str(target))
+    if traces.exists():
+        trace_archive = archive_dir / "traces"
+        trace_archive.mkdir(parents=True, exist_ok=True)
+        for source in sorted(traces.glob("*.jsonl")):
+            if source.is_file():
+                target = trace_archive / source.name
+                shutil.copy2(source, target)
+                copied.append(str(target))
+    if cache and cache.exists():
+        target = archive_dir / cache.name
+        shutil.copy2(cache, target)
+        copied.append(str(target))
+    manifest = {
+        "reason": reason,
+        "created_at": stamp,
+        "database": str(database),
+        "files": copied,
+        "active_runs": [str(row["run_id"]) for row in active],
+    }
+    manifest_path = archive_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+    return {"archive": str(archive_dir), "files": copied, "active_runs": manifest["active_runs"]}
+
+
 def discard_state(
     db_path: str | Path,
     runs_jsonl: str | Path,
@@ -276,6 +357,10 @@ def discard_state(
                 raise RuntimeError(f"failed to abort active runs: {remaining}")
         finally:
             store.close()
+
+    summary["archive"] = archive_state(
+        database, runs_file, traces, cache, reason="state_discard",
+    )
 
     for suffix in ("", "-wal", "-shm"):
         target = Path(f"{database}{suffix}")
@@ -368,6 +453,10 @@ class SQLiteStore:
         return value
 
     @staticmethod
+    def _score_bool(value: Any) -> Any:
+        return int(bool(value)) if value is not None else None
+
+    @staticmethod
     def hash_spec(spec: dict[str, Any]) -> str:
         raw = json.dumps(spec, sort_keys=True, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(raw).hexdigest()
@@ -439,6 +528,8 @@ class SQLiteStore:
                     diagnosis TEXT,
                     diagnosis_raw TEXT,
                     diagnosis_correct INTEGER,
+                    diagnosis_attempts INTEGER,
+                    diagnosis_first_attempt_correct INTEGER,
                     approval_granted INTEGER,
                     repair TEXT,
                     repair_args_json TEXT,
@@ -448,6 +539,7 @@ class SQLiteStore:
                     baseline_ok INTEGER,
                     inject_ok INTEGER,
                     verify_ok INTEGER,
+                    verify_output TEXT,
                     steps INTEGER NOT NULL DEFAULT 0,
                     tokens_used INTEGER NOT NULL DEFAULT 0,
                     started_at REAL,
@@ -585,12 +677,15 @@ class SQLiteStore:
                     scorer_version TEXT NOT NULL,
                     diagnosis REAL,
                     diagnosis_correct INTEGER,
+                    diagnosis_attempts INTEGER,
+                    diagnosis_first_attempt_correct INTEGER,
                     repair_action TEXT,
                     repair_acceptable INTEGER,
                     repair_forbidden INTEGER,
                     recovered INTEGER,
                     policy_violations INTEGER NOT NULL DEFAULT 0,
                     loop_success INTEGER,
+                    strict_loop_success INTEGER,
                     created_at REAL NOT NULL,
                     PRIMARY KEY (run_id, scorer_version),
                     FOREIGN KEY(run_id) REFERENCES runs(run_id)
@@ -623,13 +718,17 @@ class SQLiteStore:
             batch_columns = {row["name"] for row in conn.execute("PRAGMA table_info(batches)")}
             if "topology_hash" not in batch_columns:
                 conn.execute("ALTER TABLE batches ADD COLUMN topology_hash TEXT")
+            score_columns = {row["name"] for row in conn.execute("PRAGMA table_info(scores)")}
+            for column, definition in SCORE_COLUMNS.items():
+                if column not in score_columns:
+                    conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
             conn.execute("UPDATE batches SET backend='ollama' WHERE backend='kaggle'")
             conn.execute("UPDATE runs SET backend='ollama' WHERE backend='kaggle'")
             conn.execute("UPDATE messages SET backend='ollama' WHERE backend='kaggle'")
             conn.execute("UPDATE llm_requests SET backend='ollama' WHERE backend='kaggle'")
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(version, applied_at, notes) VALUES (?, ?, ?)",
-                (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, UI stream, fault presence"),
+                (SCHEMA_VERSION, self._now(), "event-log-first schema; topology, snapshots, UI stream, fault presence, strict scoring"),
             )
             conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
 
@@ -1076,6 +1175,15 @@ class SQLiteStore:
             )
         return True
 
+    def renew_lease(self, run_id: str, ttl_seconds: int = 300) -> None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """UPDATE runs SET lease_expires_at=?, updated_at=?
+                   WHERE run_id=? AND lease_owner IS NOT NULL""",
+                (now + ttl_seconds, now, run_id),
+            )
+
     def release_lease(self, run_id: str) -> None:
         self.update_run(run_id, lease_owner=None, lease_expires_at=None)
 
@@ -1105,7 +1213,10 @@ class SQLiteStore:
             "diagnosis": None,
             "diagnosis_raw": None,
             "diagnosis_submitted": False,
+            "diagnosis_correct": False,
             "approval_token": None,
+            "diagnosis_attempts": 0,
+            "diagnosis_first_attempt_correct": False,
             "repair": None,
             "repair_args": None,
             "policy_violations": [],
@@ -1122,9 +1233,14 @@ class SQLiteStore:
                 state["steps"] = int(state["steps"]) + 1
             elif kind == "approval":
                 state["diagnosis_submitted"] = True
+                state["diagnosis_attempts"] = int(event.get("diagnosis_attempts") or 0)
                 state["diagnosis"] = event.get("diagnosis")
                 state["diagnosis_raw"] = event.get("raw")
+                state["diagnosis_correct"] = False
+                state["approval_token"] = None
                 if event.get("granted"):
+                    state["diagnosis_correct"] = True
+                    state["diagnosis_first_attempt_correct"] = bool(event.get("diagnosis_first_attempt_correct"))
                     state["approval_token"] = event.get("approval_token")
             elif kind == "nudge":
                 state["diagnosis_nudged"] = True
@@ -1133,7 +1249,7 @@ class SQLiteStore:
                 if not text.startswith("BLOCKED:") and not text.startswith("ERROR:"):
                     args = dict(event.get("args") or {})
                     args.pop("approval_token", None)
-                    state["repair"] = event.get("name")
+                    state["repair"] = normalize_repair_name(event.get("name"))
                     state["repair_args"] = args
         with self._connect() as conn:
             state["policy_violations"] = [
@@ -1152,6 +1268,12 @@ class SQLiteStore:
         cached = self._loads(row.get("state_json"), default={}) or {}
         if cached and cached.get("seq") == row.get("state_seq") == row.get("seq"):
             cached.setdefault("trace_path", row.get("trace_path") or f"traces/{run_id}.jsonl")
+            rebuilt = self.rebuild_state(run_id)
+            for key in (
+                "approval_token", "diagnosis_correct", "diagnosis_attempts",
+                "diagnosis_first_attempt_correct",
+            ):
+                cached[key] = rebuilt.get(key)
             return cached
         rebuilt = self.rebuild_state(run_id)
         self.set_state(run_id, rebuilt, source="rebuild")
@@ -1160,6 +1282,7 @@ class SQLiteStore:
     def set_state(self, run_id: str, state: dict[str, Any], source: str = "checkpoint") -> None:
         cache = dict(state)
         cache.pop("messages", None)
+        cache.pop("approval_token", None)
         seq = int(cache.get("seq") or 0)
         with self._connect() as conn:
             if not seq:
@@ -1248,6 +1371,11 @@ class SQLiteStore:
         record["backend"] = normalize_backend(record.get("backend"))
         return record
 
+    @staticmethod
+    def _score_rank(score: dict[str, Any]) -> tuple[int, float]:
+        preferred = 1 if score.get("scorer_version") == SCORER_VERSION else 0
+        return preferred, float(score.get("created_at") or 0)
+
     def finish_run(
         self,
         run_id: str,
@@ -1264,8 +1392,11 @@ class SQLiteStore:
             "finished_at": self._now(),
         }
         if record:
+            skipped = {"run_id"}
+            if end_reason is not None:
+                skipped.add("end_reason")
             for key, column in RECORD_TO_COLUMN.items():
-                if key in record and key != "run_id":
+                if key in record and key not in skipped:
                     fields[column] = record[key]
             self.add_artifact(run_id, "final_record", self._dumps(record) or "null", "application/json")
         self.update_run(run_id, **fields)
@@ -1277,32 +1408,39 @@ class SQLiteStore:
                 "scorer_version": score.get("scorer_version", "legacy-record-v1"),
                 "diagnosis": score.get("diagnosis"),
                 "diagnosis_correct": score.get("diagnosis_correct"),
+                "diagnosis_attempts": score.get("diagnosis_attempts"),
+                "diagnosis_first_attempt_correct": score.get("diagnosis_first_attempt_correct"),
                 "repair_action": score.get("repair_action"),
                 "repair_acceptable": score.get("repair_acceptable"),
                 "repair_forbidden": score.get("repair_forbidden"),
                 "recovered": score.get("recovered"),
                 "policy_violations": score.get("policy_violations", 0),
                 "loop_success": score.get("loop_success"),
+                "strict_loop_success": score.get("strict_loop_success"),
                 "created_at": self._now(),
             }
             with self._connect() as conn:
                 conn.execute(
                     """INSERT OR REPLACE INTO scores(
-                           run_id, scorer_version, diagnosis, diagnosis_correct, repair_action,
-                           repair_acceptable, repair_forbidden, recovered, policy_violations,
-                           loop_success, created_at
-                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           run_id, scorer_version, diagnosis, diagnosis_correct, diagnosis_attempts,
+                           diagnosis_first_attempt_correct, repair_action, repair_acceptable,
+                           repair_forbidden, recovered, policy_violations, loop_success,
+                           strict_loop_success, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         payload["run_id"],
                         payload["scorer_version"],
                         payload["diagnosis"],
                         self._db_value("diagnosis_correct", payload["diagnosis_correct"]),
+                        payload["diagnosis_attempts"],
+                        self._score_bool(payload["diagnosis_first_attempt_correct"]),
                         payload["repair_action"],
                         self._db_value("repair_acceptable", payload["repair_acceptable"]),
                         self._db_value("repair_forbidden", payload["repair_forbidden"]),
                         self._db_value("recovered", payload["recovered"]),
                         payload["policy_violations"],
                         self._db_value("loop_success", payload["loop_success"]),
+                        self._score_bool(payload["strict_loop_success"]),
                         payload["created_at"],
                     ),
                 )
@@ -1339,16 +1477,26 @@ class SQLiteStore:
                 score_rows = conn.execute(
                     f"SELECT * FROM scores WHERE run_id IN ({placeholders})", run_ids
                 ).fetchall()
-        score_by_run = {str(row["run_id"]): dict(row) for row in score_rows}
+        score_by_run: dict[str, dict[str, Any]] = {}
+        for row in score_rows:
+            score = dict(row)
+            run_id = str(score["run_id"])
+            current = score_by_run.get(run_id)
+            if current is None or self._score_rank(score) > self._score_rank(current):
+                score_by_run[run_id] = score
         records: list[dict[str, Any]] = []
         for row in rows:
             if row["truth"] is None:
                 continue
             record = self.record_from_row(dict(row))
             score = score_by_run.get(str(row["run_id"]), {})
-            for key in ("repair_acceptable", "repair_forbidden", "loop_success", "scorer_version"):
-                if key in score:
-                    record[key] = bool(score[key]) if key != "scorer_version" else score[key]
+            score_keys = (
+                "diagnosis_attempts", "diagnosis_first_attempt_correct", "repair_acceptable",
+                "repair_forbidden", "strict_loop_success", "loop_success", "scorer_version",
+            )
+            for key in score_keys:
+                if key in score and score[key] is not None:
+                    record[key] = bool(score[key]) if key in SCORE_BOOL_FIELDS else score[key]
             records.append(record)
         return records
 
@@ -1377,7 +1525,10 @@ class SQLiteStore:
             if events:
                 target = trace_dir / f"{run_id}.jsonl"
                 target.write_text(
-                    "".join(json.dumps(event, sort_keys=True) + "\n" for event in events),
+                    "".join(
+                        json.dumps(Message.redact_payload(event), sort_keys=True) + "\n"
+                        for event in events
+                    ),
                     encoding="utf-8",
                 )
                 trace_count += 1

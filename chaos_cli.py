@@ -65,8 +65,16 @@ def _stale_warnings(db_path: str, topology_hash: str | None = None) -> list[str]
             topology_hash = topology_tools.discover_topology()["topology_hash"]
         except Exception as exc:
             return [f"cannot discover topology for stale check: {exc}"]
+    warnings: list[str] = []
     warning = store_tools.stale_topology_warning(db_path, topology_hash)
-    return [warning] if warning else []
+    if warning:
+        warnings.append(warning)
+    active = store_tools.active_run_rows(db_path)
+    if active:
+        ids = ", ".join(str(row.get("run_id")) for row in active[:5])
+        suffix = "..." if len(active) > 5 else ""
+        warnings.append(f"{len(active)} active run row(s) remain: {ids}{suffix}")
+    return warnings
 
 
 def _json_field(value: str | None) -> Any:
@@ -248,6 +256,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--resume-of", default=None)
     run.add_argument("--force-resume", action="store_true")
     run.add_argument("--no-jsonl", action="store_true")
+    run.add_argument("--discard-stale", action="store_true")
 
     target = sub.add_parser("target")
     target_sub = target.add_subparsers(dest="target_command", required=True)
@@ -302,6 +311,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd.append("--force-resume")
         if args.no_jsonl:
             cmd.append("--no-jsonl")
+        if args.discard_stale:
+            cmd.append("--discard-stale")
         env = os.environ.copy()
         env["CHECKPOINT_DB"] = args.db
         if not args.detach:

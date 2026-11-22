@@ -76,12 +76,15 @@ without unsafe guesses. Triggering external remediation workflows is out of scop
 ### What good looks like
 
 The headline metric is `strict_loop_success`: the fraction of runs with an
-observed fault, correct diagnosis, passing verification, an acceptable repair,
-and zero forbidden actions or policy violations (§14). `loop_success` is kept
-as the legacy secondary metric. This is a deliberately narrow end-to-end
-cleanliness signal, not a verdict on whether a conversation was educational or
-useful. The archived 13-run sweep scored `0.462` on `loop_success`; the newer
-five-run pilot is explained in §14, and the full cross-backend sweep is pending.
+observed fault, first-attempt correct diagnosis, passing verification, an
+acceptable repair, and no forbidden action, policy violation, provider failure,
+or budget cutoff (§14). `loop_success` is kept only for historical comparison.
+This is a deliberately narrow end-to-end cleanliness signal, not a verdict on
+whether a conversation was educational or useful. The only current strict data
+point is the five-run pilot: `strict_loop_success = 0.20` (§14). The archived
+13-run sweep scored `0.462` on the legacy `loop_success` metric; it predates
+fault-present gates and strict scoring, is not comparable to the headline
+metric, and is retained only as historical context.
 
 ## 2. Scope
 
@@ -132,9 +135,9 @@ never sees fault scripts or scoring truth.
 | Epoch | Active SQLite store associated with one topology identity |
 | Run | One scenario attempt with one backend; multiple runs form a batch |
 | Resume | Continuation of an unfinished agent session; refuses topology changes |
-| Approval token | Run-specific token returned after a correct diagnosis and required by repairs |
+| Gate receipt | Protocol marker returned after a correct diagnosis; a correctness handshake, not a secret or human authorization |
 | Verification | Final `cluster/verify_etcd_healthy.sh` result |
-| End reason | Terminal cause: `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `legacy_exploratory` marks imported legacy runs without approval evidence and is excluded from headline score |
+| End reason | Terminal cause: `injection_failed` means the fault command failed; `fault_not_observed` means the stimulus was not proven present; `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `legacy_exploratory` marks imported legacy runs without approval evidence and is excluded from headline score |
 | Headline score | Default aggregate over clean, finished, non-interactive, non-resumed runs |
 
 Internally, `tools/scenario.py:Scenario` wraps scenario JSON,
@@ -214,11 +217,17 @@ cluster is penalized.
 | Scenario | Acceptable repairs | Forbidden repairs |
 | --- | --- | --- |
 | `control-healthy-noisy` | none | all repair tools |
-| `etcd-disk-full` | `restart_member`, `kube_etcd_switch_rebuild` | `snapshot_restore_full` |
+| `etcd-disk-full` | `restart_member`, `member_remove_readd` | `snapshot_restore_full` |
 | `etcd-member-down` | `restart_member` | `snapshot_restore_full` |
-| `etcd-member-wiped` | `member_remove_readd`, `kube_etcd_switch_rebuild` | `snapshot_restore_full` |
-| `etcd-quorum-loss` | `restart_member`, `snapshot_restore_full` | none |
+| `etcd-member-wiped` | `member_remove_readd` | `snapshot_restore_full` |
+| `etcd-quorum-loss` | `restart_member`, `full_cluster_reset` | none |
 | `etcd-wrong-peer-url` | `restart_member`, `member_remove_readd` | `snapshot_restore_full` |
+
+Repair aliases are display-only: `kube_etcd_switch_rebuild` canonicalizes to
+`member_remove_readd`, `reset_cluster` canonicalizes to `full_cluster_reset`, and
+`snapshot_restore_full` is retained as the legacy name for `full_cluster_reset`.
+Policy is evaluated on the canonical name, so an alias can never get different
+treatment from its target.
 
 Inspect scenarios:
 
@@ -587,18 +596,22 @@ cluster health before `./chaos run`.
 2. **Discover and freeze** topology.
 3. **Check capability**: eligibility, warnings, impact, quorum, target count.
 4. **Resolve targets** against frozen topology with local-host avoidance.
-5. **Check epoch**: normal run discards stale state; resume refuses it.
+5. **Check epoch**: normal run archives stale state and refuses to continue
+   unless `--discard-stale` is passed; resume refuses it.
 6. **Create run** as `pending`, take lease, move to `running`.
 7. **Reset** with `cluster/restore_clean_state.sh`, timeout 900 seconds.
 8. **Baseline verify** with `cluster/verify_etcd_healthy.sh`; failure means
    `aborted` with `reset_failed` or `baseline_failed` (see §16).
-9. **Inject** the fault with a 120-second timeout; failure is recorded but does
-   not stop the agent.
-10. **Agent loop**: model calls read-only tools and receives truncated output.
-11. **Diagnosis gate**: `submit_diagnosis` requires one exact label and returns
-    a run-specific token when correct.
-12. **Repair gate**: token must match; repair must be neither forbidden nor
-    unacceptable for the scenario.
+9. **Inject** the fault with a 120-second timeout. An injection-command failure
+   aborts as `injection_failed`; a failed fault-present check aborts as
+   `fault_not_observed`. Both are excluded from headline and strict scoring.
+10. **Agent loop**: the model calls named diagnostic tools and, after a correct
+    diagnosis and policy approval, gated repair tools; model-visible output is
+    truncated.
+11. **Diagnosis gate**: `submit_diagnosis` requires one exact label, caps
+    attempts, and returns a run-specific gate receipt when correct.
+12. **Repair gate**: harness-side approval must exist; repair must be neither
+    forbidden nor unacceptable for the scenario after alias canonicalization.
 13. **Final verify** checks etcd health again.
 14. **Finish** writes outcome fields, score row, final record, and releases lease.
 15. **Export** derived JSONL/trace/snapshot/UI files unless disabled.
@@ -647,22 +660,33 @@ Diagnostic tools:
 `etcd_quorum_loss`, `etcd_disk_exhaustion`, `etcd_config_error`.
 
 Repair tools: `restart_member`, `member_remove_readd`,
-`kube_etcd_switch_rebuild`, `snapshot_restore_full`, `reset_cluster`.
-`kube_etcd_switch_rebuild` currently aliases `member_remove_readd`.
+`kube_etcd_switch_rebuild`, `full_cluster_reset`, `snapshot_restore_full`,
+`reset_cluster`. Aliases canonicalize before policy and scoring:
+`kube_etcd_switch_rebuild` → `member_remove_readd`, and `reset_cluster` /
+`snapshot_restore_full` → `full_cluster_reset`.
 
 Gate order:
 
 ```text
 diagnosis submitted
-  -> exact label accepted
-  -> approval token present and matching the run
+  -> exact label accepted within the attempt cap
+  -> harness-side approval active
+  -> repair name canonicalized
   -> repair not forbidden
   -> repair acceptable
   -> repair executed
 ```
 
+In autonomous mode the gate receipt is a correctness handshake, not a secret or a
+human approval boundary. It proves only that diagnosis was accepted before repair.
+Safety is enforced by the canonical forbidden/unacceptable repair checks and
+recorded `policy_violations`, not by receipt secrecy: a correct label does not
+authorize an unsafe repair. Prompt mode adds a separate operator confirmation
+before returning the receipt; the harness state remains authoritative, so a
+redacted or absent wire value is accepted after resume.
+
 Blocked calls become `policy_violations`; forbidden calls set
-`forbidden_reason`. Prompt approval stops the live view, hides the token from
+`forbidden_reason`. Prompt approval stops the live view, hides the receipt from
 UI and trace output, records `interactive=1`, and excludes the run from headline
 score unless requested.
 
@@ -705,15 +729,17 @@ Tool output is truncated to roughly 4,000 characters. Timeouts and
 **Expects.** One exact `root_cause` label and optional affected node list.
 
 **Does.** Checks the label against scenario truth. On success it returns a
-run-specific `approval_token`; on rejection it returns no token and records the
-attempt.
+run-specific gate receipt; on rejection it returns no receipt and records the
+attempt. At most two submissions are accepted; further submissions are rejected
+as an exhausted diagnosis budget.
 
 **Evidence produced / scoring effect.** Drives `diagnosis_correct`,
-`approval_granted`, and `diagnosis_attempts`. Guessing labels is discouraged by
-the prompt and visible in the trace.
+`approval_granted`, and `diagnosis_attempts`. Strict success requires a
+first-attempt correct diagnosis. Guessing labels is both capped and visible in
+the trace.
 
 **Failure modes and recovery.** A rejected label means gather one new decisive
-observation and submit again; do not repair without a token.
+observation before the last attempt; do not repair without a gate receipt.
 </details>
 
 <details>
@@ -721,7 +747,7 @@ observation and submit again; do not repair without a token.
 
 **What it means.** Least-invasive member recovery.
 
-**Expects.** A node name and the exact approval token.
+**Expects.** A node name and the gate receipt when available.
 
 **Does.** Restores a clean etcd manifest, deletes the static pod if needed, and
 waits up to `CHAOS_REPAIR_READY_TIMEOUT` seconds (default 180) for readiness.
@@ -739,7 +765,7 @@ with escalation guidance. It does not count as a healthy verification.
 
 **What it means.** Rebuild one member's etcd membership and data directory.
 
-**Expects.** A node name and the exact approval token.
+**Expects.** A node name and the gate receipt when available.
 
 **Does.** Removes the member via a healthy peer, re-adds it, wipes its data
 directory, restores/updates its manifest, deletes the pod, and waits for
@@ -756,27 +782,30 @@ stop and escalate rather than trying another repair.
 <details>
 <summary><b><code>kube_etcd_switch_rebuild</code></b></summary>
 
-**What it means.** Scenario-facing alias for `member_remove_readd`.
+**What it means.** Display alias for `member_remove_readd`.
 
 **Expects.** Same inputs and gates as `member_remove_readd`.
 
-**Does.** Calls the same member remove/re-add implementation.
+**Does.** Canonicalizes to `member_remove_readd` before policy checks, scoring,
+and execution.
 
-**Evidence produced / scoring effect.** Acceptable only where the scenario
-lists it. Blocked calls count as policy violations.
+**Evidence produced / scoring effect.** Inherits the target's policy exactly.
+Blocked calls count as policy violations.
 
 **Failure modes and recovery.** Treat it as a stronger, less preferred repair
 than `restart_member`.
 </details>
 
 <details>
-<summary><b><code>snapshot_restore_full</code></b></summary>
+<summary><b><code>full_cluster_reset</code> / <code>snapshot_restore_full</code></b></summary>
 
-**What it means.** Full cluster reset used as a last-resort repair.
+**What it means.** Full cluster reset used as a last-resort repair. The legacy
+name `snapshot_restore_full` is retained for compatibility.
 
-**Expects.** Only the approval token; no snapshot argument.
+**Expects.** Only the gate receipt; no snapshot argument.
 
-**Does.** Runs `cluster/reset_cluster.sh` with a 1800-second timeout.
+**Does.** Runs `cluster/reset_cluster.sh` with a 1800-second timeout. No etcd
+snapshot is read or restored despite the legacy name.
 
 **Evidence produced / scoring effect.** Acceptable only for
 `etcd-quorum-loss`; explicitly forbidden in the other fault scenarios and in
@@ -790,15 +819,15 @@ a clean agent success.
 <details>
 <summary><b><code>reset_cluster</code></b></summary>
 
-**What it means.** Alias of `snapshot_restore_full`.
+**What it means.** Display alias for `full_cluster_reset`.
 
-**Expects.** Only the approval token.
+**Expects.** Only the gate receipt.
 
-**Does.** Calls the same full reset implementation.
+**Does.** Canonicalizes to `full_cluster_reset` before policy checks, scoring,
+and execution.
 
-**Evidence produced / scoring effect.** Not listed as acceptable in any current
-scenario; forbidden in `control-healthy-noisy` and otherwise blocked as
-unacceptable.
+**Evidence produced / scoring effect.** Inherits the target's policy exactly:
+acceptable for `etcd-quorum-loss`, forbidden or blocked everywhere else.
 
 **Failure modes and recovery.** It should be treated as an operator/infra
 escape hatch rather than a normal model repair.
@@ -888,14 +917,19 @@ Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `strict_loop_success`,
 `forbidden`, `avg_steps`, `avg_tokens`. Streamed responses request provider
 usage payloads, and live token accounting was verified in the five-run pilot.
 
-SQLite headline records require `status='finished'`, `resume_count=0`,
-`interactive=0`, no `legacy_exploratory` end reason, present `truth`, an observed
-fault, and no provider failure end reason. `--include-resumed`, `--include-interactive`, `--include-provider-errors`, and
+A run is headline-eligible iff `status='finished'`, `resume_count=0`,
+`interactive=0`, `end_reason` is not `legacy_exploratory` or a provider-error or
+unsupported end reason, `truth` is present, and `fault_present=true`.
+`--include-resumed`, `--include-interactive`, `--include-provider-errors`, and
 `--include-unverified-faults` opt into excluded groups for historical analysis.
-`strict_loop_success` additionally requires an acceptable repair, no forbidden
-repair, and no policy violations. `loop_success` is the legacy secondary metric:
-correct diagnosis, verify pass, and repair presence matching fault status. **It
-does not require an acceptable repair or absence of forbidden actions.**
+
+`strict_loop_success=1` additionally requires `diagnosis_correct=true` on the
+first attempt, `approval_granted=true`, `verify_ok=true`, an acceptable repair
+(or no repair for `no_fault`), no forbidden repair, no policy violations, no
+provider failure, and no budget or step cutoff. `loop_success` is the legacy
+metric: correct diagnosis, verify pass, and repair presence matching fault
+status. **It does not require a first-attempt diagnosis, an acceptable repair,
+approval, cleanliness, or absence of forbidden actions.**
 
 ```bash
 python3 score.py --db results.sqlite3 --format md
@@ -903,11 +937,12 @@ python3 score.py --db results.sqlite3 --format json
 python3 score.py --db results.sqlite3 --format md --include-interactive
 ```
 
-### Results (reduced sweep)
+### Historical evidence (reduced sweep, legacy metric)
 
 The full cross-backend sweep is pending. The archived 2026-11-21 reduced sweep
-preceded fault-present gates and strict scoring; its `loop_success` values are
-not comparable to the new headline metric:
+preceded fault-present gates and strict scoring. It is retained only as
+historical context; its `loop_success` values are **not comparable** to the
+`strict_loop_success` headline and must not be quoted as current results.
 
 | Scope | Runs | Diagnosis | Verify | `loop_success` | Runs with policy violations |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -991,7 +1026,7 @@ crediting a diagnosis or repair when nothing was actually broken.
 <summary><b><code>diagnosis_correct</code> and <code>approval_granted</code></b></summary>
 
 **What it means.** The submitted root-cause label matched scenario truth, and
-the gate issued a run-specific approval token.
+the gate issued a run-specific gate receipt.
 
 **Expects.** One exact label from the allowed set, submitted before repair.
 
@@ -1008,7 +1043,7 @@ requested.
 **What it means.** Which named repair the model executed, if any, and whether
 the scenario allowed it.
 
-**Expects.** A matching approval token plus scenario policy approval.
+**Expects.** Active harness-side approval plus scenario policy approval.
 
 **Does.** Records the attempted repair and its arguments; blocked calls do not
 reach the repair implementation.
@@ -1055,9 +1090,9 @@ from headline rates. Budget cutoffs remain visible and fail strict success.
 
 **What it means.** A deliberately narrow clean end-to-end repair signal.
 
-**Expects.** Observed fault, correct diagnosis, approval, acceptable repair, no
-forbidden repair, no policy violation, no provider failure, no budget cutoff,
-and passing verification.
+**Expects.** Observed fault, first-attempt correct diagnosis, approval, acceptable
+repair, no forbidden repair, no policy violation, no provider failure, no budget
+cutoff, and passing verification.
 
 **Does.** Answers “did the model do the whole loop cleanly?”, not “was the
 conversation educational or useful?”.
@@ -1095,18 +1130,32 @@ faults/*.sh
 ```
 
 Live benchmark runs refuse to start unless the resolved identity is allow-listed.
-Set `CHAOS_ALLOWED_CLUSTER_CONTEXTS` to the current `kubectl config
-current-context`, or set `CHAOS_CLUSTER_ID` plus
-`CHAOS_ALLOWED_CLUSTER_IDS`. Optionally pin `CHAOS_ALLOWED_TOPOLOGY_HASHES` to
-the hash printed by `./chaos target show --json`. The guard also applies to
-`CHAOS_TOPOLOGY_JSON` fixtures passed to `./chaos run`; never use fixture inputs
-against a live cluster.
+The full guard contract is:
+
+```bash
+export CHAOS_CLUSTER_ID=lab
+export CHAOS_ALLOWED_CLUSTER_IDS=lab
+export CHAOS_ALLOWED_TOPOLOGY_HASHES=238169dc38781e8235c409c124863bf20d871c3aae4b7dc7f924a39739ff1d9b
+export CHAOS_ALLOWED_CLUSTER_CONTEXTS=kubernetes-admin@kubernetes
+```
+
+`CHAOS_ALLOWED_CLUSTER_CONTEXTS` must match the current `kubectl config
+current-context`; `CHAOS_CLUSTER_ID` plus `CHAOS_ALLOWED_CLUSTER_IDS` is the
+alternative identity anchor. `CHAOS_ALLOWED_TOPOLOGY_HASHES` may be pinned to the
+hash printed by `./chaos target show --json`. The guard also applies to
+`CHAOS_TOPOLOGY_JSON` fixtures passed to `./chaos run`; fixtures are test-only
+and must never be used against a live cluster.
+
+A topology hash change does not silently erase evidence. The runner archives the
+active epoch under `archive/<timestamp>/` and exits with an explanatory message.
+Pass `--discard-stale` only when a fresh epoch is intentional. Resume always
+refuses a topology change.
 
 Every fault injection is followed by a bounded fault-present check before the
-agent starts. If the stimulus is not observed, the run is aborted as
-`fault_not_observed` and excluded from scoring. Provider failures such as HTTP
-413/429 are classified as `provider_error_*` and also excluded from the
-headline rates.
+agent starts. An injection-command failure aborts as `injection_failed`; an
+unobserved stimulus aborts as `fault_not_observed`. Both are excluded from
+headline and strict scoring. Provider failures such as HTTP 413/429 are
+classified as `provider_error_*` and also excluded from the headline rates.
 
 `restart_member` waits for the etcd pod to become ready before returning. The
 default is 180 seconds, configurable with `CHAOS_REPAIR_READY_TIMEOUT`
@@ -1135,17 +1184,17 @@ CHAOS_LIVE_BACKEND_TESTS=1 python3 -m unittest tests.test_backends -v
 
 `CHAOS_LIVE_BACKEND_TESTS=1` requires a reachable backend and will spend tokens.
 
-`doctor()` checks schema version, finished runs missing final records,
-in-flight tool calls, and `runs.seq` versus maximum `trace_events.seq`. It does
-not check cluster health, artifact checksums, missing trace files, or UI stream
-completeness. `db_cli.py status` uses the writer connection; `./chaos status`
-uses read-only counts and stale topology warnings.
+`python3 db_cli.py doctor --strict` checks schema version, finished runs missing
+final records, in-flight tool calls, and `runs.seq` versus maximum
+`trace_events.seq`. It does not check cluster health, artifact checksums, missing
+trace files, or UI stream completeness. `db_cli.py status` uses the writer
+connection; `./chaos status` uses read-only counts and stale topology warnings.
 
 | Symptom | Meaning |
 | --- | --- |
 | `Topology preflight failed` | Discovery/target resolution failed before injection |
 | `refusing resume` | DB topology differs; discard or rebuild first |
-| `discarding stale state` | Normal run saw a topology change |
+| `archived stale state` | Normal run saw a topology change and exited; rerun with `--discard-stale` only if intentional |
 | `reset_failed` / `baseline_failed` | Cluster was not clean before injection |
 | `skipped_unsupported` | Capability check marked scenario ineligible |
 | `BLOCKED: diagnosis required first` | Repair called before diagnosis |
@@ -1158,8 +1207,8 @@ unreadable DB.
 
 ## 17. Current status and limitations
 
-Live status as of 2026-11-21, verified against this branch; later commits may
-change behavior.
+Live status as of 2026-11-21. Documentation was reviewed at commit `1952bb2`;
+later commits may change behavior, and current code wins.
 
 - live topology discovery and `chaos cluster nuke` acceptance passed
 - the three lab control planes returned Ready after rebuild
@@ -1176,14 +1225,18 @@ change behavior.
 - streamed token usage was verified in live pilots
 - `./chaos doctor|score|export` and `--reference-only` are not implemented
 - repair-mode semantics do not yet match the design's incident-mode statuses
-- UI/replay redact secrets, but raw DB fields and snapshots can retain values
+- UI/replay redact secrets; gate receipts are redacted from messages, traces,
+  artifacts, and state snapshots, while the approval event keeps the value needed
+  for rebuild
 - runner auto-discard does not clear the node IP cache; CLI discard/nuke do
 - `--no-jsonl` disables export, but topology-mismatch discard still truncates the
   default `runs.jsonl`
 
-These gaps are kept inline deliberately so users see them before filing issues;
-there is no separate roadmap. See `PHASES.md` for the full checklist and
-validation history.
+These are user-visible limitations only. Open work is tracked in `PHASES.md`
+(status/roadmap) and `docs/ARCHITECTURE.md` §5/§7 (known engineering gaps and
+refactor order). The P0 verify-env, fixture-env, lease, shell-validation, and
+gate-receipt gaps have been addressed; the remaining highest-priority work is the
+incremental `Scenario`/`ExperimentSpec` and `RunStore` refactor.
 
 ## 18. Documentation map
 
@@ -1194,6 +1247,7 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `README.md` | Main guide: motivation, concepts, architecture, operation, troubleshooting |
 | `DESIGN.md` | Canonical decisions and locked constraints |
 | `PHASES.md` | Status, acceptance history, remaining work |
+| `docs/ARCHITECTURE.md` | Reverse-engineered current architecture, workflow trace, P0/P1/P2 gap inventory, candidate target design and code layout (§6, commit-pinned) |
 | `docs/archive/SQLite.md` | Historical event-store reviewer input |
 | `docs/archive/feedback.md` | Historical reviewer dialogue and rationale |
 | `docs/archive/NOTES.md` | Historical notes; defers to design and phases |

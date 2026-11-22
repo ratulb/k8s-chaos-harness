@@ -45,11 +45,11 @@ class TestDbCli(unittest.TestCase):
         self.assertTrue(self.db_path.exists())
 
         migrate = json.loads(self._cli("migrate").stdout)
-        self.assertEqual(migrate["schema_version"], 4)
+        self.assertEqual(migrate["schema_version"], 5)
 
         doctor = json.loads(self._cli("doctor", "--strict").stdout)
         self.assertTrue(doctor["ok"], doctor["issues"])
-        self.assertEqual(doctor["schema_version"], 4)
+        self.assertEqual(doctor["schema_version"], 5)
         self.assertIn("state_snapshots", doctor["counts"])
         self.assertIn("ui_stream", doctor["counts"])
 

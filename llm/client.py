@@ -145,8 +145,9 @@ class LLMClient:
         if tool_calls:
             message["tool_calls"] = [tool_calls[key] for key in sorted(tool_calls)]
         return {
-            "choices": [{"message": message, "finish_reason": "stop"}],
+            "choices": [{"message": message, "finish_reason": "reconstructed"}],
             "usage": usage or {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "stream_fallback": False,
         }
 
     def chat(
@@ -172,4 +173,9 @@ class LLMClient:
             except Exception:
                 pass
         with self._open_completion(payload, timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
+            data = json.loads(resp.read().decode("utf-8"))
+        data["stream_fallback"] = on_chunk is not None
+        choices = data.get("choices") or []
+        if choices and not choices[0].get("finish_reason"):
+            choices[0]["finish_reason"] = "reconstructed" if data["stream_fallback"] else "unknown"
+        return data

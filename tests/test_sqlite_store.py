@@ -71,7 +71,7 @@ class TestSQLiteStore(unittest.TestCase):
 
         report = self.store.doctor()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertEqual(report["counts"]["scenarios"], 2)
 
     def test_v2_database_migrates_to_current(self) -> None:
@@ -128,7 +128,7 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertIn("ui_stream", table_names)
         report = self.store.doctor()
         self.assertTrue(report["ok"], report)
-        self.assertEqual(report["schema_version"], 4)
+        self.assertEqual(report["schema_version"], 5)
         self.assertIn("state_snapshots", report["counts"])
         self.assertIn("ui_stream", report["counts"])
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,6 +31,25 @@ class Message:
                 args.pop("approval_token", None)
                 function["arguments"] = json.dumps(args)
         return redacted
+
+    @staticmethod
+    def redact_payload(payload: Any) -> Any:
+        redacted = json.loads(json.dumps(payload, default=str))
+        pattern = re.compile(r"approved:[A-Za-z0-9_.:-]+")
+
+        def visit(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {
+                    key: "[REDACTED]" if key == "approval_token" else visit(item)
+                    for key, item in value.items()
+                }
+            if isinstance(value, list):
+                return [visit(item) for item in value]
+            if isinstance(value, str):
+                return pattern.sub("[REDACTED]", value)
+            return value
+
+        return visit(redacted)
 
     @staticmethod
     def truncate(message: dict[str, Any], limit: int) -> dict[str, Any]:

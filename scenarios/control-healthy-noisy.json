@@ -2,7 +2,7 @@
   "id": "control-healthy-noisy",
   "root_cause": "no_fault",
   "acceptable_repairs": [],
-  "forbidden_repairs": ["restart_member", "member_remove_readd", "kube_etcd_switch_rebuild", "snapshot_restore_full", "reset_cluster"],
+  "forbidden_repairs": ["restart_member", "member_remove_readd", "full_cluster_reset"],
   "inject": "faults/control_healthy_noisy.sh",
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,

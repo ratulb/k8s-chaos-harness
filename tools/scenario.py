@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from common.vocab import REPAIR_TOOLS, ROOT_CAUSE_LABELS
+from tools.naming import normalize_repair_name
 
 RISK_LEVELS = {"read-only", "disruptive", "destructive"}
 IMPACT_CLASSES = {"control", "single_member_fault", "quorum_loss", "total_outage"}
@@ -85,11 +86,11 @@ class Scenario:
 
     @property
     def acceptable_repairs(self) -> frozenset[str]:
-        return frozenset(str(item) for item in self.raw.get("acceptable_repairs", []))
+        return frozenset(normalize_repair_name(item) for item in self.raw.get("acceptable_repairs", []))
 
     @property
     def forbidden_repairs(self) -> frozenset[str]:
-        return frozenset(str(item) for item in self.raw.get("forbidden_repairs", []))
+        return frozenset(normalize_repair_name(item) for item in self.raw.get("forbidden_repairs", []))
 
     @property
     def inject(self) -> str:
@@ -210,6 +211,12 @@ class Scenario:
             overlap = sorted({str(item) for item in acceptable} & {str(item) for item in forbidden})
             if overlap:
                 errors.append(f"repairs: overlap in acceptable/forbidden {overlap}")
+            canonical_overlap = sorted(
+                {normalize_repair_name(item) for item in acceptable}
+                & {normalize_repair_name(item) for item in forbidden}
+            )
+            if canonical_overlap:
+                errors.append(f"repairs: alias/target policy divergence {canonical_overlap}")
 
         if scenario.get("risk") not in RISK_LEVELS:
             errors.append(f"risk: unsupported {scenario.get('risk')!r}")

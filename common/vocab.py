@@ -22,6 +22,7 @@ MEMBER_REMOVE_READD = "member_remove_readd"
 KUBE_ETCD_SWITCH_REBUILD = "kube_etcd_switch_rebuild"
 SNAPSHOT_RESTORE_FULL = "snapshot_restore_full"
 RESET_CLUSTER = "reset_cluster"
+FULL_CLUSTER_RESET = "full_cluster_reset"
 
 REPAIR_TOOLS = frozenset({
     RESTART_MEMBER,
@@ -29,6 +30,7 @@ REPAIR_TOOLS = frozenset({
     KUBE_ETCD_SWITCH_REBUILD,
     SNAPSHOT_RESTORE_FULL,
     RESET_CLUSTER,
+    FULL_CLUSTER_RESET,
 })
 
 DESTRUCTIVE_TOOLS = frozenset({
@@ -36,6 +38,7 @@ DESTRUCTIVE_TOOLS = frozenset({
     KUBE_ETCD_SWITCH_REBUILD,
     SNAPSHOT_RESTORE_FULL,
     RESET_CLUSTER,
+    FULL_CLUSTER_RESET,
 })
 
 ROOT_CAUSE_LABELS = [

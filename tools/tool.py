@@ -14,6 +14,7 @@ from common.vocab import (
     ETCDCTL_ENDPOINT_HEALTH,
     ETCDCTL_ENDPOINT_STATUS,
     ETCDCTL_MEMBER_LIST,
+    FULL_CLUSTER_RESET,
     JOURNALCTL_TAIL,
     KUBECTL_DESCRIBE,
     KUBECTL_EVENTS,
@@ -41,6 +42,8 @@ class ToolOutcome:
     diagnosis: str | None = None
     diagnosis_raw: Any = None
     diagnosis_correct: bool | None = None
+    diagnosis_attempts: int = 0
+    diagnosis_first_attempt_correct: bool = False
     approval_token: str | None = None
     approval_source: str | None = None
     repair: str | None = None
@@ -211,22 +214,25 @@ _TOOLS = [
          _with_node(node_etcd, "df_path", ("path", ""))),
     Tool(LS_PATH, "List a path on a node.", _properties(node=_node_prop(), path={"type": "string"}), ("node", "path"),
          _with_node(node_etcd, "ls_path", ("path", ""))),
-    Tool(DIAGNOSIS_TOOL, "Submit one root cause label. Required before repairs; returns an approval token if correct.",
+    Tool(DIAGNOSIS_TOOL, "Submit one root cause label. Required before repairs; returns a gate receipt if correct. At most two attempts.",
          _properties(root_cause={"type": "string", "enum": ROOT_CAUSE_LABELS}, affected=_affected_prop),
          ("root_cause",), kind="diagnosis"),
     Tool(RESTART_MEMBER, "Restart an etcd member on a node. Requires approval_token from submit_diagnosis.",
          _properties(node=_node_prop(), approval_token={"type": "string"}), ("node", "approval_token"),
          _with_node(repairs, "restart_member"), kind="repair", mutating=True),
-    Tool(MEMBER_REMOVE_READD, "Remove and re-add an etcd member on a node. Requires approval_token.",
+    Tool(MEMBER_REMOVE_READD, "Remove and re-add an etcd member on a node. Requires gate receipt in approval_token.",
          _properties(node=_node_prop(), approval_token={"type": "string"}), ("node", "approval_token"),
          _with_node(repairs, "member_remove_readd"), kind="repair", mutating=True),
-    Tool(KUBE_ETCD_SWITCH_REBUILD, "Rebuild an etcd member via kube-etcd-switch. Requires approval_token.",
+    Tool(KUBE_ETCD_SWITCH_REBUILD, "Rebuild an etcd member via kube-etcd-switch. Requires gate receipt in approval_token.",
          _properties(node=_node_prop(), approval_token={"type": "string"}), ("node", "approval_token"),
          _with_node(repairs, "kube_etcd_switch_rebuild"), kind="repair", mutating=True),
-    Tool(SNAPSHOT_RESTORE_FULL, "Restore etcd from full snapshot. Requires approval_token.",
+    Tool(FULL_CLUSTER_RESET, "Full cluster reset via cluster/reset_cluster.sh; no snapshot is restored. Requires gate receipt in approval_token.",
+         _properties(approval_token={"type": "string"}), ("approval_token",),
+         _with_default_node(repairs, "full_cluster_reset"), kind="repair", mutating=True),
+    Tool(SNAPSHOT_RESTORE_FULL, "Legacy alias for full_cluster_reset; no snapshot is restored. Requires gate receipt in approval_token.",
          _properties(approval_token={"type": "string"}), ("approval_token",),
          _with_default_node(repairs, "snapshot_restore_full"), kind="repair", mutating=True),
-    Tool(RESET_CLUSTER, "Reset the whole cluster. Requires approval_token.",
+    Tool(RESET_CLUSTER, "Reset the whole cluster. Requires gate receipt in approval_token.",
          _properties(approval_token={"type": "string"}), ("approval_token",),
          _with_default_node(repairs, "reset_cluster"), kind="repair", mutating=True),
 ]

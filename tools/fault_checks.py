@@ -162,9 +162,14 @@ def _quorum_lost(targets: list[str]) -> tuple[bool, str]:
     return False, f"etcd pods ready {ready}/{size}, quorum {quorum}"
 
 
-def check_fault_present(scenario: dict[str, Any], targets: list[str]) -> tuple[bool, str]:
+def check_fault_present(
+    scenario: dict[str, Any],
+    targets: list[str],
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str]:
     scenario_id = str(scenario.get("id", ""))
-    if os.environ.get("CHAOS_FAULT_CHECK_MODE") == "fixture":
+    check_env = os.environ if env is None else env
+    if check_env.get("CHAOS_FAULT_CHECK_MODE") == "fixture":
         return True, "fixture mode skips live fault check"
     target = targets[0] if targets else ""
     if scenario_id in {"control-healthy-noisy", "control_healthy_noisy"}:
@@ -198,14 +203,15 @@ def wait_for_fault(
     scenario: dict[str, Any],
     targets: list[str],
     timeout: float | None = None,
+    env: dict[str, str] | None = None,
 ) -> tuple[bool, str, float]:
     limit = timeout_for(scenario) if timeout is None else float(timeout)
     if limit <= 0:
-        present, detail = check_fault_present(scenario, targets)
+        present, detail = check_fault_present(scenario, targets, env)
         return present, detail, 0.0
     started = time.monotonic()
     while True:
-        present, detail = check_fault_present(scenario, targets)
+        present, detail = check_fault_present(scenario, targets, env)
         elapsed = time.monotonic() - started
         if present:
             return True, detail, elapsed

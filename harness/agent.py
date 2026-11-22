@@ -59,6 +59,7 @@ def run_scenario(
     approve: str = "policy",
     pause_reporter: Any = None,
     resume_reporter: Any = None,
+    run_env: dict[str, str] | None = None,
 ) -> dict:
     return build_agent().run(
         scenario,
@@ -80,6 +81,7 @@ def run_scenario(
         approve=approve,
         pause_reporter=pause_reporter,
         resume_reporter=resume_reporter,
+        run_env=run_env,
     )
 
 

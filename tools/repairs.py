@@ -110,8 +110,8 @@ python3 - <<'PY'
 import re
 p='/etc/kubernetes/manifests/etcd.yaml'
 s=open(p).read()
-s=re.sub(r'--initial-advertise-peer-urls=https://[^ ]+', '--initial-advertise-peer-urls=https://{ip}:2380', s)
-s=re.sub(r'--initial-cluster=.*', '--initial-cluster={initial_cluster}', s)
+s=re.sub(r'--initial-advertise-peer-urls=https://[^ ]+', '--initial-advertise-peer-urls=https://' + {ip!r} + ':2380', s)
+s=re.sub(r'--initial-cluster=.*', '--initial-cluster=' + {initial_cluster!r}, s)
 if '--initial-cluster-state' not in s:
     s=s.replace('--initial-cluster=' + {initial_cluster!r}, '--initial-cluster=' + {initial_cluster!r} + '\\n    - --initial-cluster-state=existing')
 else:
@@ -131,11 +131,15 @@ def kube_etcd_switch_rebuild(node: str) -> str:
     return member_remove_readd(node)
 
 
-def snapshot_restore_full() -> str:
+def full_cluster_reset() -> str:
     reset_script = Path(__file__).resolve().parent.parent / "cluster" / "reset_cluster.sh"
     subprocess.run([str(reset_script)], check=True, timeout=1800)
     return "cluster reset"
 
 
+def snapshot_restore_full() -> str:
+    return full_cluster_reset()
+
+
 def reset_cluster() -> str:
-    return snapshot_restore_full()
+    return full_cluster_reset()
