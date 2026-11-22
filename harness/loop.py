@@ -12,6 +12,7 @@ from common.results import Result
 from common.scoring import Score
 from harness.budget import Budget
 from harness.call import Call
+from harness.checkpoint import Checkpoint
 from harness.message import Message
 from harness.ports import ChatClient, RunStore
 from harness.prompt import SystemPrompt
@@ -99,31 +100,14 @@ class AgentLoop:
 
         store.update_run(ctx.run_id, status="running", phase="agent_running", end_reason=None)
 
-        def checkpoint() -> dict[str, Any]:
-            current = state.snapshot(
-                trace_path=str(trace_path),
-                seq=int(store.get_run(ctx.run_id)["seq"]),
-                steps=budget.steps,
-                tokens_used=budget.tokens_used,
-                diagnosis_nudged=budget.diagnosis_nudged,
-            )
-            store.set_state(ctx.run_id, current)
-            store.renew_lease(ctx.run_id)
-            store.update_run(
-                ctx.run_id,
-                diagnosis=state.diagnosis,
-                diagnosis_raw=state.diagnosis_raw,
-                diagnosis_correct=(state.diagnosis == scenario.root_cause) if state.diagnosis is not None else None,
-                approval_granted=state.approval_token is not None,
-                repair=state.repair,
-                repair_args_json=state.repair_args,
-                policy_violations_json=state.policy_violations,
-                forbidden_reason=state.forbidden_reason,
-                steps=budget.steps,
-                tokens_used=budget.tokens_used,
-                trace_path=str(trace_path),
-            )
-            return current
+        checkpointer = Checkpoint(
+            run_id=ctx.run_id,
+            store=store,
+            state=state,
+            scenario=scenario,
+            budget=budget,
+            trace_path=trace_path,
+        )
 
         diagnosis_executor = self.diagnosis_class(
             state,
@@ -132,7 +116,7 @@ class AgentLoop:
             pause_reporter=ctx.pause_reporter,
             resume_reporter=ctx.resume_reporter,
         )
-        repair_executor = self.repair_class(state, registry, store=store, log=log, checkpoint=checkpoint)
+        repair_executor = self.repair_class(state, registry, store=store, log=log, checkpoint=checkpointer.capture)
 
         log(
             {"type": "resume_started", "from_seq": snapshot.get("seq", 0)}
@@ -148,7 +132,7 @@ class AgentLoop:
         )
         if not ctx.resume:
             artifact("setup_output_full", {"output": ctx.setup_output})
-        checkpoint()
+        checkpointer.capture()
 
         client = self.client_factory(spec.backend)
         while not budget.exhausted:
@@ -201,7 +185,7 @@ class AgentLoop:
                 "finish_reason": response.finish_reason,
                 "stream_fallback": response.stream_fallback,
             })
-            checkpoint()
+            checkpointer.capture()
 
             tool_calls = msg.tool_calls
             if not tool_calls and not state.diagnosis_submitted:
@@ -209,7 +193,7 @@ class AgentLoop:
                     nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
                     messages.append(nudge)
                     store.append_message(ctx.run_id, nudge.role, nudge.content, backend="harness")
-                    checkpoint()
+                    checkpointer.capture()
                     continue
                 end_reason = "agent_stopped"
                 break
@@ -273,7 +257,7 @@ class AgentLoop:
                     "status": outcome.status,
                     "mutating": call.mutating,
                 })
-                checkpoint()
+                checkpointer.capture()
 
             if budget.should_nudge_diagnosis(state.diagnosis_submitted):
                 nudge = Message.user("Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response.")
@@ -281,7 +265,7 @@ class AgentLoop:
                 store.append_message(ctx.run_id, nudge.role, nudge.content, backend="harness")
                 budget.diagnosis_nudged = True
                 log({"type": "nudge", "step": budget.steps})
-                checkpoint()
+                checkpointer.capture()
 
         if not llm_error:
             end_reason = budget.exhausted_reason() or end_reason
@@ -332,7 +316,7 @@ class AgentLoop:
             "end_reason": end_reason,
         }
         log({"type": "record", "record": record})
-        final_state = checkpoint()
+        final_state = checkpointer.capture()
         score = Score.from_record(record, set(scenario.acceptable_repairs)).to_dict()
         store.finish_run(
             ctx.run_id, record, status="finished",

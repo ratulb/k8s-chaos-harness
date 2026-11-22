@@ -15,12 +15,16 @@ sys.path.insert(0, str(ROOT))
 from common.results import Approval, Refusal, Result, ResultKind
 from harness.budget import Budget
 from harness.call import Call
-from harness.agent import build_agent
+from harness.agent import Agent, build_agent
+from harness.checkpoint import Checkpoint
 from harness.loop import RunResult
 from harness.spec import ExperimentSpec, RunContext
+from harness.tooling import AgentState
+from llm.client import LLMClient
 from llm.response import LLMResponse
 from storage.sqlite_store import SQLiteStore
 from tools.scenario import Scenario
+from tools.tool import TOOL_REGISTRY
 
 
 class _Backend:
@@ -58,6 +62,50 @@ class DomainObjectTests(unittest.TestCase):
         self.assertFalse(refusal.ok)
         self.assertIs(refusal.kind, ResultKind.REFUSAL)
         self.assertEqual(refusal.unwrap().reason, "BLOCKED: no")
+
+    def test_agent_defaults_without_builder(self) -> None:
+        agent = Agent()
+        self.assertIs(agent.client_factory, LLMClient)
+        self.assertIs(agent.tool_registry, TOOL_REGISTRY)
+        self.assertEqual(agent, build_agent())
+
+    def test_checkpoint_captures_state_and_run_projection(self) -> None:
+        scenario = Scenario.from_dict({"root_cause": "no_fault"})
+        state = AgentState(
+            scenario=scenario,
+            run_id="checkpoint-run",
+            approve="policy",
+            diagnosis="no_fault",
+            diagnosis_submitted=True,
+            diagnosis_attempts=1,
+            approval_token="approved:checkpoint-run",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("checkpoint-run", scenario_id=scenario.id, backend="fake", truth=scenario.root_cause)
+            budget = Budget.from_snapshot({}, scenario)
+            budget.start_step()
+            budget.add_tokens(3)
+            trace_path = root / "traces" / "checkpoint-run.jsonl"
+            checkpoint = Checkpoint(
+                run_id="checkpoint-run",
+                store=store,
+                state=state,
+                scenario=scenario,
+                budget=budget,
+                trace_path=trace_path,
+            )
+            snapshot = checkpoint.capture()
+            saved = store.get_state("checkpoint-run")
+            row = store.get_run("checkpoint-run")
+            store.close()
+        self.assertEqual(snapshot["steps"], 1)
+        self.assertEqual(saved["tokens_used"], 3)
+        self.assertEqual(snapshot["approval_token"], "approved:checkpoint-run")
+        self.assertEqual(row["diagnosis"], "no_fault")
+        self.assertTrue(row["approval_granted"])
+        self.assertEqual(row["trace_path"], str(trace_path))
 
     def test_budget_uses_scenario_limits(self) -> None:
         scenario = Scenario.from_dict({"max_steps": 7, "max_tokens": 11, "diagnosis_deadline_steps": 2})

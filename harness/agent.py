@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
 
 from harness.engine import run_scenario as _legacy_run_scenario
@@ -16,10 +16,10 @@ from tools.tool import TOOL_REGISTRY, ToolContext, ToolOutcome, build_tool_regis
 
 @dataclass(frozen=True)
 class Agent:
-    client_factory: Callable[[Any], Any]
-    tool_registry: Any
-    diagnosis_class: Any
-    repair_class: Any
+    client_factory: Callable[[Any], Any] = field(default_factory=lambda: LLMClient)
+    tool_registry: Any = field(default_factory=lambda: TOOL_REGISTRY)
+    diagnosis_class: Any = field(default_factory=lambda: Diagnosis)
+    repair_class: Any = field(default_factory=lambda: Repair)
 
     def run(self, spec: ExperimentSpec, ctx: RunContext) -> RunResult:
         loop = AgentLoop(
@@ -32,12 +32,7 @@ class Agent:
 
 
 def build_agent() -> Agent:
-    return Agent(
-        client_factory=LLMClient,
-        tool_registry=TOOL_REGISTRY,
-        diagnosis_class=Diagnosis,
-        repair_class=Repair,
-    )
+    return Agent()
 
 
 def run_scenario(
@@ -62,7 +57,7 @@ def run_scenario(
     resume_reporter: Any = None,
     run_env: dict[str, str] | None = None,
 ) -> dict:
-    agent = build_agent()
+    agent = Agent()
     return _legacy_run_scenario(
         scenario,
         backend,

@@ -41,8 +41,8 @@ EXPERIMENT SETUP / RESUME
             |
             v
 AGENT COMPOSITION
-  harness/agent.py  Agent / build_agent()
-    wires: ChatClient adapter + TOOL_REGISTRY + Diagnosis + Repair
+  harness/agent.py  Agent() defaults / build_agent() shim
+    defaults: ChatClient adapter + TOOL_REGISTRY + Diagnosis + Repair
   harness/agent.py  run_scenario() legacy dict facade
             |
             v
@@ -54,7 +54,7 @@ TYPED BOUNDARY
 AGENT ORCHESTRATION
   harness/loop.py  AgentLoop.run(spec, ctx) -> RunResult
     - event/artifact logging through RunStore
-    - AgentState restore/checkpoint
+    - Checkpoint captures AgentState into RunStore
     - Message[] conversation
     - LLM loop
     - tool dispatch
@@ -67,6 +67,7 @@ DOMAIN / POLICY OBJECTS
   ExperimentSpec        harness/spec.py
   RunContext            harness/spec.py
   Budget / Call         harness/budget.py / harness/call.py
+  Checkpoint            harness/checkpoint.py
   LLMResponse           llm/response.py
   Result/Approval/Refusal common/results.py
   LLMError / Score      common/errors.py / common/scoring.py
@@ -108,7 +109,8 @@ some CLI code, and tool handlers still accept raw dicts for compatibility.
 | Prompt policy | `harness/prompt.py:9` | `SystemPrompt` renders topology-aware prompt. |
 | Tool catalog | `tools/tool.py:235` | Singleton `TOOL_REGISTRY`; dynamic schemas; late-bound repair handlers. |
 | Diagnosis/repair gates | `harness/tooling.py:104`, `harness/tooling.py:173` | Real domain policy; good seam. |
-| Agent wiring | `harness/agent.py` | `build_agent()` is a mini composition root; `Agent.run` delegates to `AgentLoop`. |
+| Agent wiring | `harness/agent.py` | `Agent()` has default factories; `build_agent()` is a compatibility shim; `Agent.run` delegates to `AgentLoop`. |
+| Checkpointing | `harness/checkpoint.py` | Owns state snapshot, lease renewal, and run-row projection. |
 | Orchestration loop | `harness/loop.py` | Owns budget, LLM responses, tool calls, verify, and `RunResult`. |
 | Persistence | `storage/sqlite_store.py` | Authoritative, event-log-first; sole writer of derived traces/exports. |
 | Scoring | `common/scoring.py` | One `Score` used by engine, `score.py`, and `replay.py`. |
@@ -183,7 +185,7 @@ harness.spec.ExperimentSpec + RunContext
          |
          v
 harness.agent.Agent.run(spec, ctx)
-  build_agent()
+  Agent() defaults
     ChatClient adapter (LLMClient)
     TOOL_REGISTRY
     Diagnosis
@@ -195,7 +197,7 @@ harness.loop.AgentLoop.run(spec, ctx) -> RunResult
   restore/create Message[]
   Budget / Call / LLMResponse
   SystemPrompt(topology).render()
-  checkpoint
+  Checkpoint.capture()
 
         |
         v
@@ -204,7 +206,7 @@ LLM LOOP
   response -> LLMResponse -> Message
   append to SQLite messages
   redact for event log
-  checkpoint
+  Checkpoint.capture()
         |
         +-- no tool calls + no diagnosis -> nudge
         +-- no tool calls + diagnosis -> stop
@@ -217,7 +219,7 @@ LLM LOOP
                 repair    -> Repair.execute() -> Tool.invoke_handler()
               ToolOutcome -> AgentState.apply()
               truncate tool result via Message.truncate()
-              artifact + event + checkpoint
+              artifact + event + Checkpoint.capture()
         |
         v
 budget/stop condition
@@ -487,8 +489,8 @@ Resume details:
     - Tests patch `agent.LLMClient` at `tests/test_gate.py:58-59` and
       `tests/test_resume.py:122`.
     - Engine imports its own `LLMClient` at `harness/engine.py:13`.
-    - This works only because `build_agent()` reads the patched module global
-      at call time.
+    - This works because `Agent()` default factories read the patched module
+      global at construction time; `build_agent()` keeps the old call site.
 
 14. **Whole-flow testability is weak**
     - `run_benchmark.main()` and `chaos_cli.main()` mix `sys.argv`,
@@ -604,7 +606,7 @@ adapters/
 
 composition/
   run_benchmark.main()
-  build_agent()
+  Agent() defaults / build_agent() shim
   chaos_cli.main()
 ```
 

@@ -19,7 +19,7 @@ from llm.client import LLMClient
 from tools import fault_checks, topology as topology_tools
 from tools import safety as safety_tools
 from tools.scenario_schema import load_scenario_object
-from harness.agent import build_agent
+from harness.agent import Agent
 from harness.reporter import UiReporter
 from harness.spec import ExperimentSpec, RunContext
 from harness.ui import LiveView
@@ -253,7 +253,7 @@ def _run_fresh(
         lease_owner=owner,
     )
     try:
-        rec = build_agent().run(spec, ctx).to_record()
+        rec = Agent().run(spec, ctx).to_record()
     finally:
         if view:
             view.stop()
@@ -332,7 +332,7 @@ def _run_resume(
         lease_owner=owner,
     )
     try:
-        rec = build_agent().run(spec, ctx).to_record()
+        rec = Agent().run(spec, ctx).to_record()
     finally:
         if view:
             view.stop()
