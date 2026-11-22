@@ -11,6 +11,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from common.errors import LLMError
+
 
 @dataclass
 class Backend:
@@ -79,15 +81,15 @@ class LLMClient:
                 if e.code in (429, 500, 502, 503, 504) and attempt < 8:
                     time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
-                raise
+                raise LLMError.from_exception(e) from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last = e
                 if attempt < 8:
                     time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
-                raise
+                raise LLMError.from_exception(e) from e
         if last is not None:
-            raise last
+            raise LLMError.from_exception(last)
         raise RuntimeError("completion request failed")
 
     def _chat_stream(

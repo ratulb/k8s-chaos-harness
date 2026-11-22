@@ -8,8 +8,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+from tools.scenario import Scenario, ValidationReport
 from tools.scenario_schema import (
     load_scenario,
+    load_scenario_object,
     scenario_ids,
     validate_scenario,
 )
@@ -23,6 +25,31 @@ class TestScenarioSchema(unittest.TestCase):
             with self.subTest(scenario=scenario_id):
                 scenario = load_scenario(ROOT, scenario_id)
                 self.assertEqual(validate_scenario(scenario, ROOT, expected_id=scenario_id), [])
+
+    def test_scenario_object_loads_and_validates(self) -> None:
+        for scenario_id in scenario_ids(ROOT):
+            with self.subTest(scenario=scenario_id):
+                scenario = load_scenario_object(ROOT, scenario_id)
+                self.assertIsInstance(scenario, Scenario)
+                self.assertEqual(scenario.id, scenario_id)
+                self.assertTrue(scenario.validate(ROOT, expected_id=scenario_id).ok)
+
+    def test_scenario_object_exposes_typed_behavior(self) -> None:
+        scenario = load_scenario_object(ROOT, "etcd-member-down")
+        self.assertEqual(scenario.root_cause, "etcd_member_unreachable")
+        self.assertEqual(scenario.target_nodes, ["second"])
+        self.assertTrue(scenario.allows_repair("restart_member"))
+        self.assertFalse(scenario.allows_repair("snapshot_restore_full"))
+        self.assertFalse(scenario.is_destructive())
+        self.assertEqual(scenario.to_dict(), load_scenario(ROOT, "etcd-member-down"))
+
+    def test_scenario_validation_report_is_reusable(self) -> None:
+        data = copy.deepcopy(load_scenario(ROOT, "etcd-member-down"))
+        del data["risk"]
+        report = Scenario.from_dict(data).validate(ROOT, expected_id="etcd-member-down")
+        self.assertIsInstance(report, ValidationReport)
+        self.assertFalse(report.ok)
+        self.assertTrue(any("risk: missing" in error for error in report.to_list()))
 
     def test_metadata_fields_are_present(self) -> None:
         for scenario_id in scenario_ids(ROOT):

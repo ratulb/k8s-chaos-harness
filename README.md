@@ -121,7 +121,7 @@ never sees fault scripts or scoring truth.
 
 | Concept | Meaning |
 | --- | --- |
-| Scenario | JSON spec: fault, truth label, target, allowed/forbidden repairs, budget, risk, verification |
+| Scenario | JSON spec on disk; in memory a `Scenario` object with validation, target/repair policy, and derived helpers |
 | Selector | Node name, ordinal such as `second`, or `quorum_losing_set`, resolved against frozen topology |
 | Capability check | Eligibility, warnings, impact class, quorum, and target count for current topology |
 | Frozen topology | Snapshot of nodes, control planes, etcd members, quorum, and probe node captured before a run |
@@ -133,6 +133,12 @@ never sees fault scripts or scoring truth.
 | Verification | Final `cluster/verify_etcd_healthy.sh` result |
 | End reason | Terminal cause: `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `legacy_exploratory` marks imported legacy runs without approval evidence and is excluded from headline score |
 | Headline score | Default aggregate over clean, finished, non-interactive, non-resumed runs |
+
+Internally, `tools/scenario.py:Scenario` wraps scenario JSON,
+`common/errors.py:LLMError` carries structured provider failures, and
+`common/vocab.py` is the single source for tool names, destructive tool names,
+and root-cause labels. JSON files, JSONL exports, and SQLite rows remain the
+wire/storage contracts; these objects do not replace them.
 
 ## 5. Cluster and topology
 

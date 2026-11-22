@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -16,6 +17,10 @@ sys.path.insert(0, str(ROOT))
 import chaos_cli
 import run_benchmark
 import score
+from common.errors import LLMError, classify_llm_error
+from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
+from storage import sqlite_store
+from tools import schemas
 from harness import agent
 from storage.sqlite_store import SQLiteStore
 from tools import fault_checks, safety
@@ -120,6 +125,21 @@ class TestHardening(unittest.TestCase):
         self.assertEqual(agent._classify_llm_error("HTTP Error 429: Too Many Requests"), "provider_error_429")
         self.assertEqual(agent._classify_llm_error("HTTP Error 502: Bad Gateway"), "provider_error_5xx")
         self.assertEqual(agent._classify_llm_error("boom"), "error")
+
+    def test_llm_error_object_classifies_structured_failures(self) -> None:
+        error = LLMError.from_exception(urllib.error.HTTPError("http://x", 429, "slow down", {}, None))
+        self.assertEqual(error.kind, "http")
+        self.assertEqual(error.status_code, 429)
+        self.assertEqual(error.end_reason, "provider_error_429")
+        self.assertEqual(classify_llm_error(error), "provider_error_429")
+        self.assertEqual(classify_llm_error(TimeoutError("late")), "error")
+
+    def test_shared_tool_vocabulary_has_one_source(self) -> None:
+        self.assertIs(schemas.REPAIR_TOOLS, REPAIR_TOOLS)
+        self.assertIs(sqlite_store.REPAIR_TOOLS, REPAIR_TOOLS)
+        self.assertIs(schemas.DIAGNOSIS_TOOL, DIAGNOSIS_TOOL)
+        self.assertIs(sqlite_store.DIAGNOSIS_TOOL, DIAGNOSIS_TOOL)
+        self.assertIs(sqlite_store.DESTRUCTIVE_TOOLS, DESTRUCTIVE_TOOLS)
 
     def test_safety_guard_enforces_live_and_fixture_runs(self) -> None:
         with patch.dict(os.environ, {}, clear=True), patch("tools.safety.current_context", return_value="prod"):

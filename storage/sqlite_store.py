@@ -19,19 +19,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
+from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
 from tools.naming import normalize_backend
 
 SCHEMA_VERSION = 4
-
-DIAGNOSIS_TOOL = "submit_diagnosis"
-REPAIR_TOOLS = {
-    "restart_member",
-    "member_remove_readd",
-    "kube_etcd_switch_rebuild",
-    "snapshot_restore_full",
-    "reset_cluster",
-}
-DESTRUCTIVE_TOOLS = {"snapshot_restore_full", "reset_cluster", "member_remove_readd", "kube_etcd_switch_rebuild"}
 
 RUN_COLUMNS = {
     "run_id": "TEXT PRIMARY KEY",

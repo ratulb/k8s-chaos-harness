@@ -7,11 +7,12 @@ import time
 from pathlib import Path
 from typing import Any
 
+from common.errors import classify_llm_error as _classify_provider_error
+from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS, ROOT_CAUSE_LABELS
 from llm.client import LLMClient
 from tools import cluster_config
 from tools import topology as topology_tools
-from tools.schemas import build_tools, REPAIR_TOOLS, DIAGNOSIS_TOOL, ROOT_CAUSE_LABELS
-from storage.sqlite_store import DESTRUCTIVE_TOOLS
+from tools.schemas import build_tools
 from tools import k8s, node_etcd as netcd
 from tools.repairs import (
     restart_member, member_remove_readd, kube_etcd_switch_rebuild,
@@ -30,15 +31,8 @@ REPAIR_TIMEOUT_FOLLOWUP = (
 )
 
 
-def _classify_llm_error(error: str) -> str:
-    text = str(error).lower()
-    if "413" in text or "payload too large" in text:
-        return "provider_error_413"
-    if "429" in text or "too many requests" in text:
-        return "provider_error_429"
-    if any(code in text for code in ("500", "502", "503", "504")):
-        return "provider_error_5xx"
-    return "error"
+def _classify_llm_error(error: object) -> str:
+    return _classify_provider_error(error)
 
 
 def _check_node(value: str, default: str | None = None) -> tuple[str | None, str]:

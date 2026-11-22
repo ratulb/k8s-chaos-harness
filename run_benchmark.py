@@ -17,7 +17,7 @@ from llm.backends import BACKEND_NAMES, build_backend
 from llm.client import LLMClient
 from tools import fault_checks, topology as topology_tools
 from tools import safety as safety_tools
-from tools.scenario_schema import load_scenario, validate_scenario
+from tools.scenario_schema import load_scenario_object
 from harness.agent import run_scenario
 from harness.reporter import UiReporter
 from harness.ui import LiveView
@@ -386,26 +386,27 @@ def main() -> None:
     runs_path = None if args.no_jsonl else runs_file
     runs_discard_path = runs_file
 
-    scenario = load_scenario(root, args.scenario)
-    errors = validate_scenario(scenario, root, expected_id=args.scenario)
+    scenario_obj = load_scenario_object(root, args.scenario)
+    errors = scenario_obj.validate(root, expected_id=args.scenario).to_list()
     if errors:
         print("Invalid scenario:", file=sys.stderr)
         for error in errors:
             print(f"- {error}", file=sys.stderr)
         sys.exit(2)
+    scenario = scenario_obj.to_dict()
 
     try:
         topology_data = topology_tools.discover_topology()
         destructive_guard = safety_tools.require_destructive_guard(topology_data)
         topology_tools.freeze_topology(topology_data)
         capability = topology_tools.capability_check(scenario, topology_data, args.mode)
-        targets = scenario.get("target_nodes", [])
+        targets = scenario_obj.target_nodes
         resolved = topology_tools.resolve_targets(
             topology_data,
             targets,
-            avoid_local=bool(scenario.get("avoid_local_target")),
+            avoid_local=scenario_obj.avoid_local_target,
         )
-        min_targets = int(scenario.get("selector_requirements", {}).get("min_targets", 0))
+        min_targets = int(scenario_obj.raw.get("selector_requirements", {}).get("min_targets", 0))
         if len(resolved) < min_targets:
             raise RuntimeError(f"scenario requires at least {min_targets} target node(s); resolved {resolved}")
     except Exception as e:
