@@ -112,6 +112,9 @@ Legend: the operator, `./chaos`, and `run_benchmark.py` are orchestration;
 cluster scripts, the LLM backend, tool registry/gates, SQLite, and reports are
 external systems or outputs.
 
+A reverse-engineered architecture, workflow trace, and design-gap inventory is
+in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 SQLite is both the coordination layer and the history. The runner writes
 
 intents and results; the UI, attach, scoring, and replay read them. The model
