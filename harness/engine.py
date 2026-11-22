@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from common.errors import LLMError
+from harness.message import Message
 from harness.prompt import SystemPrompt
 from harness.tooling import AgentState, Diagnosis, Repair
 from llm.client import LLMClient
@@ -16,20 +17,7 @@ from tools.truncate import truncate
 
 
 def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
-    redacted = json.loads(json.dumps(message))
-    for call in redacted.get("tool_calls") or []:
-        function = call.get("function") or {}
-        raw = function.get("arguments")
-        if not raw:
-            continue
-        try:
-            args = json.loads(raw)
-        except (TypeError, ValueError):
-            continue
-        if isinstance(args, dict) and "approval_token" in args:
-            args.pop("approval_token", None)
-            function["arguments"] = json.dumps(args)
-    return redacted
+    return Message.redact(message)
 
 
 def run_scenario(
@@ -99,16 +87,16 @@ def run_scenario(
 
     snapshot = store.get_state(run_id) if (store is not None and resume) else {}
     state = AgentState.from_snapshot(snapshot, scenario, run_id, approve)
-    messages: list[dict[str, Any]] = store.load_messages(run_id) if (store is not None and resume) else []
+    messages: list[Message] = [Message.from_dict(item) for item in store.load_messages(run_id)] if (store is not None and resume) else []
     if not messages:
         prompt = SystemPrompt(topology_tools.frozen_topology())
         messages = [
-            {"role": "system", "content": prompt.render()},
-            {"role": "user", "content": "Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."},
+            Message.system(prompt.render()),
+            Message.user("Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed."),
         ]
         if store is not None:
             for message in messages:
-                store.append_message(run_id, message["role"], message["content"], backend=getattr(backend, "name", "harness"))
+                store.append_message(run_id, message.role, message.content, backend=getattr(backend, "name", "harness"))
 
     steps = int(snapshot.get("steps", 0))
     tokens_used = int(snapshot.get("tokens_used", 0))
@@ -170,7 +158,7 @@ def run_scenario(
         started = time.time()
         try:
             resp = client.chat(
-                messages,
+                [message.to_dict() for message in messages],
                 tools=registry.schemas(),
                 temperature=0.2,
                 max_tokens=2048,
@@ -200,27 +188,27 @@ def run_scenario(
             )
         artifact("llm_response_full", resp)
         tokens_used += total_tokens
-        msg = resp["choices"][0]["message"]
+        msg = Message.from_dict(resp["choices"][0]["message"])
         messages.append(msg)
         if store is not None:
             store.append_message(
                 run_id,
-                "assistant",
-                msg.get("content"),
-                msg.get("tool_calls"),
+                msg.role,
+                msg.content,
+                msg.tool_calls,
                 tokens=total_tokens,
                 backend=getattr(backend, "name", "unknown"),
             )
-        log({"type": "assistant", "message": _redact_message(msg) if approve == "prompt" else msg})
+        log({"type": "assistant", "message": Message.redact(msg.to_dict()) if approve == "prompt" else msg.to_dict()})
         checkpoint()
 
-        tool_calls = msg.get("tool_calls") or []
+        tool_calls = msg.tool_calls
         if not tool_calls and not state.diagnosis_submitted:
             if steps < max_steps:
-                nudge = {"role": "user", "content": "You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label."}
+                nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
                 messages.append(nudge)
                 if store is not None:
-                    store.append_message(run_id, "user", nudge["content"], backend="harness")
+                    store.append_message(run_id, nudge.role, nudge.content, backend="harness")
                 checkpoint()
                 continue
             end_reason = "agent_stopped"
@@ -265,22 +253,22 @@ def run_scenario(
                 artifact("tool_output_full", {"tool": name, "args": args, "result": result})
 
             raw_result = result
-            result = truncate(raw_result, 4000)
+            tool_message = Message.from_dict(Message.truncate(Message.tool(raw_result, tc["id"]).to_dict(), 4000))
+            result = str(tool_message.content or "")
             trunc = len(result) < len(raw_result)
             if store is not None:
                 store.finish_tool_call(run_id, call_id, call_status, raw_result, result, trunc, approved_by, call_error)
-            tool_msg = {"role": "tool", "tool_call_id": tc["id"], "content": result}
-            messages.append(tool_msg)
+            messages.append(tool_message)
             if store is not None:
-                store.append_message(run_id, "tool", result, tool_call_id=tc["id"], backend=getattr(backend, "name", "unknown"))
+                store.append_message(run_id, tool_message.role, tool_message.content, tool_call_id=tool_message.tool_call_id, backend=getattr(backend, "name", "unknown"))
             log({"type": "tool", "name": name, "args": log_args, "result": result, "status": call_status, "mutating": mutating})
             checkpoint()
 
         if not state.diagnosis_submitted and not diagnosis_nudged and steps >= diagnosis_deadline:
-            nudge = {"role": "user", "content": "Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response."}
+            nudge = Message.user("Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response.")
             messages.append(nudge)
             if store is not None:
-                store.append_message(run_id, "user", nudge["content"], backend="harness")
+                store.append_message(run_id, nudge.role, nudge.content, backend="harness")
             diagnosis_nudged = True
             log({"type": "nudge", "step": steps})
             checkpoint()
