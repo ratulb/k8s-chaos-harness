@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 
@@ -15,7 +16,16 @@ def _kubectl(args: list[str], timeout: int = 45) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
 
 
-def _wait_for_etcd(node: str, timeout: int = 90) -> str:
+def repair_ready_timeout() -> int:
+    raw = os.environ.get("CHAOS_REPAIR_READY_TIMEOUT", "180")
+    try:
+        return max(30, int(raw))
+    except ValueError:
+        return 180
+
+
+def _wait_for_etcd(node: str, timeout: int | None = None) -> str:
+    timeout = repair_ready_timeout() if timeout is None else timeout
     deadline = time.time() + timeout
     while time.time() < deadline:
         proc = _kubectl(["kubectl", "get", "pod", f"etcd-{node}", "-n", "kube-system", "-o", "jsonpath={.status.containerStatuses[0].ready}"])

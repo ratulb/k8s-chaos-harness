@@ -20,6 +20,16 @@ from tools.repairs import (
 from tools.truncate import truncate
 
 
+BLOCKED_REPAIR_FOLLOWUP = (
+    " Stop attempting repairs. Report this limitation and escalate to the operator "
+    "in your final response."
+)
+REPAIR_TIMEOUT_FOLLOWUP = (
+    " Repair did not complete. Do not spend the remaining budget on broad debugging; "
+    "report the timeout and escalate to the operator in your final response."
+)
+
+
 def _classify_llm_error(error: str) -> str:
     text = str(error).lower()
     if "413" in text or "payload too large" in text:
@@ -135,7 +145,9 @@ Investigate briefly: use at most four assistant turns of read-only tools, then c
 A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
 A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. {quorum_line}
 A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
-Choose only repairs allowed by the scenario. Keep steps efficient."""
+Choose only repairs allowed by the scenario. Keep steps efficient.
+If a repair call is BLOCKED, forbidden, or rejected, do not try another repair; report the limitation and escalate to the operator.
+If a repair reports a timeout, make at most one read-only health check, then report that the repair did not complete and escalate to the operator."""
 
 
 def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
@@ -435,7 +447,7 @@ def run_scenario(
                 elif name not in acceptable:
                     reason = "BLOCKED: repair not acceptable for this scenario"
                 if reason:
-                    result = reason
+                    result = reason + BLOCKED_REPAIR_FOLLOWUP
                     call_status = "denied"
                     call_error = reason
                     policy_violations.append(f"{name}: {reason}")
@@ -450,6 +462,8 @@ def run_scenario(
                     checkpoint()
                     try:
                         result = _exec_repair(name, args)
+                        if result.startswith("timeout waiting for"):
+                            result += REPAIR_TIMEOUT_FOLLOWUP
                         repair = name
                         repair_args = safe_args
                     except Exception as e:

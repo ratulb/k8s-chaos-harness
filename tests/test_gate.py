@@ -16,7 +16,7 @@ from unittest.mock import Mock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harness.agent as agent
-from tools import cluster_config
+from tools import cluster_config, repairs
 
 
 class FakeBackend:
@@ -73,6 +73,8 @@ class TestRepairGate(unittest.TestCase):
                         "true",
                         trace_dir=d,
                     )
+                    with open(rec["trace"], encoding="utf-8") as fh:
+                        trace_text = fh.read()
         finally:
             agent.LLMClient = original
             cluster_config.nodes.cache_clear()
@@ -84,6 +86,8 @@ class TestRepairGate(unittest.TestCase):
         self.assertIsNone(rec["repair"])
         self.assertIn("forbidden", rec["forbidden_reason"])
         self.assertTrue(any("forbidden" in v for v in rec["policy_violations"]))
+        self.assertIn("Stop attempting repairs", trace_text)
+        self.assertIn("escalate to the operator", trace_text)
 
     def test_repair_before_diagnosis_blocked(self):
         # No node names are hardcoded: resolve a synthetic role through the
@@ -208,6 +212,53 @@ class TestRepairGate(unittest.TestCase):
         self.assertIsNone(rec["repair"])
         repair.assert_not_called()
         self.assertTrue(any("approval not granted" in v for v in rec["policy_violations"]))
+
+    def test_repair_timeout_result_asks_for_escalation(self):
+        responses = [
+            assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
+            assistant([tool_call("restart_member", {"approval_token": "approved:gate-timeout"})]),
+            assistant([]),
+        ]
+        original = agent.LLMClient
+        agent.LLMClient = lambda backend: FakeClient(responses)
+        cluster_config.nodes.cache_clear()
+        try:
+            with patch.dict(os.environ, {"K8S_NODES": "node-a,node-b,node-c"}):
+                with patch.object(agent, "_exec_repair", return_value="timeout waiting for etcd-node-a"):
+                    with tempfile.TemporaryDirectory() as d:
+                        rec = agent.run_scenario(
+                            {
+                                "id": "gate-timeout",
+                                "root_cause": "etcd_member_unreachable",
+                                "acceptable_repairs": ["restart_member"],
+                                "forbidden_repairs": [],
+                            },
+                            FakeBackend(),
+                            "gate-timeout",
+                            "true",
+                            "true",
+                            trace_dir=d,
+                        )
+                        with open(rec["trace"], encoding="utf-8") as fh:
+                            trace_text = fh.read()
+        finally:
+            agent.LLMClient = original
+            cluster_config.nodes.cache_clear()
+
+        self.assertEqual(rec["repair"], "restart_member")
+        self.assertIn("Repair did not complete", trace_text)
+        self.assertIn("escalate to the operator", trace_text)
+
+    def test_prompt_has_blocked_and_timeout_guidance(self):
+        prompt = agent.system_prompt()
+        self.assertIn("If a repair call is BLOCKED", prompt)
+        self.assertIn("If a repair reports a timeout", prompt)
+
+    def test_repair_ready_timeout_is_configurable(self):
+        with patch.dict(os.environ, {"CHAOS_REPAIR_READY_TIMEOUT": "240"}):
+            self.assertEqual(repairs.repair_ready_timeout(), 240)
+        with patch.dict(os.environ, {"CHAOS_REPAIR_READY_TIMEOUT": "bad"}):
+            self.assertEqual(repairs.repair_ready_timeout(), 180)
 
 
 if __name__ == "__main__":
