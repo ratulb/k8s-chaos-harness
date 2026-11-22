@@ -16,10 +16,6 @@ from tools.tool import TOOL_REGISTRY, ToolContext, ToolOutcome
 from tools.truncate import truncate
 
 
-def _redact_message(message: dict[str, Any]) -> dict[str, Any]:
-    return Message.redact(message)
-
-
 def run_scenario(
     scenario: dict,
     backend,

@@ -4,7 +4,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any, Callable
 
-from harness.engine import _redact_message, run_scenario as _run_scenario
+from harness.engine import run_scenario as _run_scenario
 from harness.message import Message
 from harness.prompt import SystemPrompt
 from harness.tooling import AgentState, Diagnosis, Repair, normalize_diagnosis
@@ -94,7 +94,6 @@ __all__ = [
     "TOOL_REGISTRY",
     "ToolContext",
     "ToolOutcome",
-    "_redact_message",
     "build_agent",
     "build_tool_registry",
     "normalize_diagnosis",
