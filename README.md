@@ -647,10 +647,11 @@ change behavior.
 - prompt approval is validated offline only
 - non-destructive live smoke passed after calibration
 - all five fault-present observers were calibrated live and passed
+- a five-run cross-backend pilot completed in an isolated DB
 - the full fresh cross-backend sweep remains pending
 - `--seed` is metadata, not sampling control
 - `--ui plain` and `--ui live` use the same renderer
-- streamed usage capture is implemented, but live token accounting is pending verification
+- streamed token usage was verified in live pilots
 - `./chaos doctor|score|export` and `--reference-only` are not implemented
 - repair-mode semantics do not yet match the design's incident-mode statuses
 - UI/replay redact secrets, but raw DB fields and snapshots can retain values
