@@ -7,6 +7,7 @@ from typing import Any, Callable
 
 from harness.budget import Budget
 from harness.ports import RunStore
+from harness.run_runtime import RunRuntime
 from harness.tooling import AgentState
 from tools.scenario import Scenario
 
@@ -44,6 +45,7 @@ class Checkpoint:
     run_id: str
     store: RunStore
     state: AgentState
+    run: RunRuntime
     scenario: Scenario
     budget: Budget
     trace_path: Path | str
@@ -59,13 +61,18 @@ class Checkpoint:
             tokens_used=self.budget.tokens_used,
             diagnosis_nudged=self.budget.diagnosis_nudged,
         )
+        snapshot["run"] = self.run.to_snapshot()
         self.store.set_state(self.run_id, snapshot)
-        self.store.renew_lease(self.run_id)
+        if self.run.renew_lease:
+            self.store.renew_lease(self.run_id)
         self.store.update_run(self.run_id, **self.projection())
         return snapshot
 
     def projection(self) -> dict[str, Any]:
+        run_projection = self.run.projection()
+        run_projection.pop("end_reason", None)
         return {
+            **run_projection,
             "diagnosis": self.state.diagnosis,
             "diagnosis_raw": self.state.diagnosis_raw,
             "diagnosis_correct": self.state.diagnosis_correct if self.state.diagnosis_submitted else None,

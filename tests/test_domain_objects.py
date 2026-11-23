@@ -20,6 +20,7 @@ from harness.call import Call, CallExecution
 from harness.checkpoint import Checkpoint, LeaseRenewer
 from harness.journal import Journal
 from harness.loop import RunResult
+from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
 from harness.tooling import AgentState, Diagnosis
 from harness.verification import Verification
@@ -32,6 +33,11 @@ from tools.tool import TOOL_REGISTRY, Tool, ToolContext
 
 class _Backend:
     name = "fake"
+
+
+class _UnusedClient:
+    def chat(self, messages: list[dict], **kwargs: object) -> dict:
+        raise AssertionError("terminal run states must stop before LLM calls")
 
 
 class _Client:
@@ -88,11 +94,20 @@ class DomainObjectTests(unittest.TestCase):
             budget = Budget.from_snapshot({}, scenario)
             budget.start_step()
             budget.add_tokens(3)
+            run = RunRuntime("checkpoint-run", log=lambda event: store.add_event("checkpoint-run", event["type"], event))
+            run.create()
+            run.lease()
+            run.begin_reset()
+            run.reset_ok()
+            run.baseline_ok()
+            run.inject_ok()
+            run.fault_observed()
             trace_path = root / "traces" / "checkpoint-run.jsonl"
             checkpoint = Checkpoint(
                 run_id="checkpoint-run",
                 store=store,
                 state=state,
+                run=run,
                 scenario=scenario,
                 budget=budget,
                 trace_path=trace_path,
@@ -104,6 +119,7 @@ class DomainObjectTests(unittest.TestCase):
         self.assertEqual(snapshot["steps"], 1)
         self.assertEqual(saved["tokens_used"], 3)
         self.assertEqual(snapshot["gate"]["events"][0]["type"], "diagnosis_submitted")
+        self.assertEqual(snapshot["run"]["state"]["phase"], "agent_running")
         self.assertEqual(saved["receipt"], "approved:checkpoint-run")
         self.assertEqual(row["diagnosis"], "no_fault")
         self.assertTrue(row["approval_granted"])
@@ -178,6 +194,44 @@ class DomainObjectTests(unittest.TestCase):
             trace = (root / "traces" / "typed-run.jsonl").read_text(encoding="utf-8")
             self.assertIn("gate.diagnosis_submitted", trace)
             self.assertNotIn("approved:typed-run", trace)
+
+    def test_agent_loop_obeys_terminal_run_state_before_agent(self) -> None:
+        scenario = Scenario.from_dict({
+            "id": "control-setup-failed",
+            "root_cause": "no_fault",
+            "acceptable_repairs": [],
+            "forbidden_repairs": [],
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run(
+                "setup-failed",
+                scenario_id=scenario.id,
+                backend="fake",
+                truth=scenario.root_cause,
+            )
+            spec = ExperimentSpec(
+                scenario=scenario,
+                backend=_Backend(),
+                inject_cmd="",
+                verify_cmd="true",
+                trace_dir=str(root / "traces"),
+                run_env=os.environ.copy(),
+            )
+            ctx = RunContext(run_id="setup-failed", store=store, reset_ok=False)
+            with patch("harness.verification.subprocess.run") as completed:
+                completed.return_value.returncode = 0
+                completed.return_value.stdout = "ok"
+                completed.return_value.stderr = ""
+                agent = replace(build_agent(), client_factory=lambda _backend: _UnusedClient())
+                result: RunResult = agent.run(spec, ctx)
+            row = store.get_run("setup-failed")
+            store.close()
+        self.assertEqual(result.end_reason, "reset_failed")
+        self.assertEqual(result.record["fault_present"], False)
+        self.assertEqual(result.state["run"]["state"]["phase"], "aborted")
+        self.assertEqual(row["status"], "aborted")
 
     def test_response_commits_its_own_audit_trail(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

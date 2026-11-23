@@ -13,6 +13,7 @@ from harness.journal import Journal
 from harness.message import Message
 from harness.ports import ChatClient, RunStore
 from harness.prompt import SystemPrompt
+from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
 from harness.tooling import AgentState, Diagnosis, Repair
 from harness.verification import Verification
@@ -53,9 +54,33 @@ class AgentLoop:
         trace_path = Path(spec.trace_dir) / f"{ctx.run_id}.jsonl"
         backend_name = getattr(spec.backend, "name", "unknown")
         journal = Journal(run_id=ctx.run_id, store=store, reporter=ctx.reporter)
+        run_row = store.get_run(ctx.run_id)
 
         snapshot = store.get_state(ctx.run_id) if ctx.resume else {}
         state = AgentState.from_snapshot(snapshot, scenario, ctx.run_id, spec.approve, log=journal.event)
+        run = RunRuntime.from_snapshot(ctx.run_id, snapshot.get("run"), log=journal.event)
+        if not run.events:
+            run = RunRuntime.from_run(ctx.run_id, run_row, log=journal.event)
+        if not ctx.resume:
+            run.create()
+            run.lease(run_row.get("lease_owner") or "harness", run_row.get("lease_expires_at"))
+            run.begin_reset()
+            if not ctx.reset_ok:
+                run.reset_failed("reset_failed")
+            else:
+                run.reset_ok()
+                if not ctx.baseline_ok:
+                    run.baseline_failed("baseline_failed")
+                else:
+                    run.baseline_ok()
+                    if not ctx.inject_ok:
+                        run.inject_failed("injection_failed")
+                    else:
+                        run.inject_ok()
+                        if ctx.fault_present:
+                            run.fault_observed()
+                        else:
+                            run.fault_not_observed()
         messages: list[Message] = [Message.from_dict(item) for item in store.load_messages(ctx.run_id)] if ctx.resume else []
         if not messages:
             prompt = SystemPrompt(topology_tools.frozen_topology())
@@ -70,12 +95,15 @@ class AgentLoop:
         llm_error = False
         end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
 
-        store.update_run(ctx.run_id, status="running", phase="agent_running", end_reason=None)
+        start_projection = run.projection()
+        start_projection.pop("end_reason", None)
+        store.update_run(ctx.run_id, **start_projection, end_reason=None)
 
         checkpointer = Checkpoint(
             run_id=ctx.run_id,
             store=store,
             state=state,
+            run=run,
             scenario=scenario,
             budget=budget,
             trace_path=trace_path,
@@ -104,7 +132,7 @@ class AgentLoop:
                 "reset_ok": ctx.reset_ok,
                 "baseline_ok": ctx.baseline_ok,
                 "inject_ok": ctx.inject_ok,
-                "fault_present": ctx.fault_present,
+                "fault_present": run.fault_present,
                 "output": truncate(ctx.setup_output, 2000),
             },
         )
@@ -113,8 +141,8 @@ class AgentLoop:
         checkpointer.capture()
 
         client = self.client_factory(spec.backend)
-        with LeaseRenewer(lambda: store.renew_lease(ctx.run_id)):
-            while not budget.exhausted:
+        with LeaseRenewer(lambda: store.renew_lease(ctx.run_id) if run.renew_lease else None):
+            while not budget.exhausted and not run.terminal:
                 budget.start_step()
                 outcome = LLMOutcome.invoke(
                     client,
@@ -171,14 +199,29 @@ class AgentLoop:
                     checkpointer.capture()
 
         if not llm_error:
-            end_reason = budget.exhausted_reason() or end_reason
+            end_reason = run.end_reason or budget.exhausted_reason() or end_reason
 
-        store.update_run(ctx.run_id, phase="verifying", end_reason=end_reason)
+        if llm_error:
+            if str(end_reason).startswith("provider_error"):
+                run.provider_error_all()
+            else:
+                run.agent_terminal(str(end_reason))
+        elif not run.terminal:
+            gate_terminal = state.gate.state.phase.value if state.gate else ""
+            run.agent_done(gate_terminal=gate_terminal, gate_reason=end_reason)
+
+        verify_projection = run.projection()
+        verify_projection.pop("end_reason", None)
+        store.update_run(ctx.run_id, **verify_projection, end_reason=end_reason)
         journal.event({"type": "verify_started", "verify_timeout": spec.verify_timeout})
         verification = Verification.run(spec)
         verification.commit(journal)
         verify_ok = verification.ok
         verify_output = verification.output
+        if verify_ok:
+            run.verified()
+        else:
+            run.verification_failed()
 
         record = {
             "run_id": ctx.run_id,
@@ -187,7 +230,7 @@ class AgentLoop:
             "reset_ok": ctx.reset_ok,
             "baseline_ok": ctx.baseline_ok,
             "inject_ok": ctx.inject_ok,
-            "fault_present": ctx.fault_present,
+            "fault_present": run.fault_present,
             "diagnosis": state.diagnosis,
             "diagnosis_raw": state.diagnosis_raw,
             "truth": scenario.root_cause,
@@ -209,7 +252,7 @@ class AgentLoop:
         final_state = checkpointer.capture()
         score = Score.from_record(record, set(scenario.acceptable_repairs)).to_dict()
         store.finish_run(
-            ctx.run_id, record, status="finished",
+            ctx.run_id, record, status=run.state.status,
             end_reason=end_reason, state=final_state, score=score,
         )
         if ctx.derive_trace:

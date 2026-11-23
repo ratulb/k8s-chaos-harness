@@ -20,6 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from harness.run_runtime import RunRuntime
 from storage.sqlite_store import RUN_COLUMNS, SQLiteStore, active_topology_hash, discard_state
 
 
@@ -220,6 +221,29 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertEqual(state["tokens_used"], 7)
         self.assertEqual(state["diagnosis"], "etcd_member_unreachable")
         self.assertEqual(state["receipt"], "approved:run-1")
+        self.assertEqual(state["run"]["state"]["phase"], "agent_running")
+
+    def test_state_rebuild_folds_canonical_run_events(self) -> None:
+        self._make_run()
+        logged: list[dict] = []
+        run = RunRuntime("run-1", log=logged.append)
+        run.create()
+        run.lease()
+        run.begin_reset()
+        run.reset_ok()
+        run.baseline_ok()
+        run.inject_ok()
+        run.fault_observed()
+        run.agent_done(gate_terminal="repaired")
+        run.verified()
+        for event in logged:
+            self.store.add_event("run-1", event["type"], event)
+        self.store.set_state("run-1", {"seq": 999, "phase": "queued"})
+
+        state = self.store.get_state("run-1")
+        self.assertEqual(state["run"]["state"]["phase"], "finished")
+        self.assertEqual(state["phase"], "finished")
+        self.assertTrue(state["verify_ok"])
 
     def test_state_snapshots_and_ui_stream(self) -> None:
         self._make_run()

@@ -286,7 +286,7 @@ or destructive validation.
       repair outcomes, and `GateState` are canonical
 - [x] Receipt is derived from `GateState` and `run_id`, never transported in tool
       arguments
-- [ ] `RunState` owns run lifecycle, lease, resume triage, verification, and
+- [x] `RunState` owns run lifecycle, lease, resume triage, verification, and
       terminal outcome
 - [ ] `ToolState` owns tool status and outcome; prefix strings are evidence for
       humans, not authority

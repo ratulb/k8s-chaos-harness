@@ -25,6 +25,7 @@ from common.scoring import SCORER_VERSION
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
 from harness.gate_runtime import GateRuntime
 from harness.message import Message
+from harness.run_runtime import RunRuntime
 from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend, normalize_repair_name
 
 SCHEMA_VERSION = 5
@@ -1217,15 +1218,22 @@ class SQLiteStore:
         return [dict(row) for row in rows]
 
     def rebuild_state(self, run_id: str) -> dict[str, Any]:
-        """Derive agent resume state from the authoritative gate event log."""
+        """Derive agent resume state from the authoritative gate and run event logs."""
         row = self.get_run(run_id)
         events = self.load_events(run_id)
         calls = self.load_tool_calls(run_id)
         tokens_in, tokens_out = self.token_totals(run_id)
         gate = GateRuntime.from_events(run_id, events)
+        run = RunRuntime.from_events(run_id, events)
+        if not run.events:
+            run = RunRuntime.from_run(run_id, row)
+        run_projection = run.projection()
+        run_projection.pop("end_reason", None)
         gs = gate.state
         state: dict[str, Any] = {
             "gate": gate.to_snapshot(),
+            "run": run.to_snapshot(),
+            **run_projection,
             "diagnosis": gs.diagnosis_label,
             "diagnosis_raw": gate.diagnosis_raw,
             "diagnosis_submitted": gs.diagnosis_attempts > 0,
@@ -1269,6 +1277,7 @@ class SQLiteStore:
                 "diagnosis_correct", "diagnosis_attempts",
                 "diagnosis_first_attempt_correct", "repair", "repair_args",
                 "policy_violations", "forbidden_reason", "diagnosis_nudged",
+                "run", "status", "phase", "fault_present", "verify_ok",
             ):
                 cached[key] = rebuilt.get(key)
             return cached
