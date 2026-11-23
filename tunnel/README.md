@@ -1,9 +1,9 @@
-# Kaggle bootstrap
+# Remote Ollama tunnel
 
-Run `kaggle/bootstrap.sh` in a Kaggle notebook cell with `%%bash`.
+Run `tunnel/bootstrap.sh` on a remote host with an Ollama-compatible runtime.
 
-It installs sshd, Ollama, pulls `qwen3.8:27b`, and opens a zrok tunnel. Wait until
-the cell prints a line like:
+It installs sshd, Ollama, pulls the configured model, and opens a zrok tunnel.
+Wait until the output prints a line like:
 
 ```text
 zrok2 access private <token>
@@ -13,7 +13,7 @@ The token is ephemeral. Do not paste it into commits or issues.
 
 ## Open the tunnel locally
 
-Keep the Kaggle kernel/cell supervisor alive; if it exits, the tunnel closes.
+Keep the remote supervisor process alive; if it exits, the tunnel closes.
 
 **Terminal 1** — start the zrok private frontend. It defaults to
 `127.0.0.1:9191`:
@@ -22,7 +22,7 @@ Keep the Kaggle kernel/cell supervisor alive; if it exits, the tunnel closes.
 zrok2 access private <token>
 ```
 
-**Terminal 2** — forward the notebook's Ollama port through the SSH tunnel:
+**Terminal 2** — forward the remote Ollama port through the SSH tunnel:
 
 ```bash
 ssh -N \
@@ -54,7 +54,8 @@ OLLAMA_MODEL=qwen3.8:27b
 OLLAMA_API_KEY=ollama
 ```
 
-`OLLAMA_MODEL` must match the model tag pulled by the Kaggle cell. Then verify:
+`OLLAMA_MODEL` must match the model tag pulled by `tunnel/bootstrap.sh`. Then
+verify:
 
 ```bash
 curl http://127.0.0.1:11435/api/tags
@@ -70,10 +71,10 @@ Once those pass, run a benchmark with the self-hosted `ollama` backend:
 
 Notes:
 
-- The final hint printed by `kaggle/bootstrap.sh` omits the `-L
+- The final hint printed by `tunnel/bootstrap.sh` omits the `-L
   11435:127.0.0.1:11434` port forward; use the full command above.
-- The zrok supervisor is tied to `KERNEL_PID`. If the notebook kernel cell exits,
-  the tunnel closes and the token must be re-read/re-created.
+- The zrok supervisor is tied to `SESSION_PID`. If that process exits, the
+  tunnel closes and the token must be re-read/re-created.
 - `PUBLIC_KEY_URL` must serve the public key matching the local private key used
   with `-i`; otherwise SSH asks for a password.
-- Kaggle is not needed for SQLite/checkpointer development or offline tests.
+- A local Ollama instance works too; this tunnel is only needed for remote runtimes.

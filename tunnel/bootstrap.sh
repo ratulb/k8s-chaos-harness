@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# Run this in a Kaggle notebook cell with: %%bash
+# Run this on a remote host with an Ollama-compatible runtime.
 # It installs sshd, Ollama, pulls the model, and opens a zrok tunnel.
 
 set -euo pipefail
 
-# Kaggle exposes the NVIDIA driver under /opt/bin and /usr/local/nvidia.
+# Some GPU runtimes expose the NVIDIA driver under /opt/bin and /usr/local/nvidia.
 export PATH=/opt/bin:${PATH}
 export LD_LIBRARY_PATH=/usr/local/nvidia/lib64:${LD_LIBRARY_PATH:-}
 
 export PUBLIC_KEY_URL="${PUBLIC_KEY_URL:-https://raw.githubusercontent.com/ratulb/tenmo/refs/heads/main/pub_id}"
 export ZROK_TOKEN="${ZROK_TOKEN:-[ZROK_TOKEN]}"
 export MODEL="${MODEL:-qwen3.8:27b}"
-export KERNEL_PID="${KERNEL_PID:-$PPID}"
+export SESSION_PID="${SESSION_PID:-$PPID}"
 
 echo "=== SSH ==="
 if ! command -v sshd >/dev/null; then
@@ -59,7 +59,7 @@ fi
 
 cat > /tmp/zrok_supervisor.sh <<'EOF'
 #!/bin/bash
-KPID=$1
+SPID=$1
 echo $$ > /tmp/zrok_supervisor.pid
 cleanup() {
   [ -n "${ZPID:-}" ] && kill "$ZPID" 2>/dev/null
@@ -85,11 +85,11 @@ for i in $(seq 1 60); do
   sleep 1
 done
 
-while kill -0 "$KPID" 2>/dev/null && kill -0 "$ZPID" 2>/dev/null; do sleep 5; done
+while kill -0 "$SPID" 2>/dev/null && kill -0 "$ZPID" 2>/dev/null; do sleep 5; done
 EOF
 chmod +x /tmp/zrok_supervisor.sh
 
-setsid nohup /tmp/zrok_supervisor.sh "$KERNEL_PID" >/tmp/zrok_supervisor.log 2>&1 </dev/null &
+setsid nohup /tmp/zrok_supervisor.sh "$SESSION_PID" >/tmp/zrok_supervisor.log 2>&1 </dev/null &
 
 for i in $(seq 1 70); do
   [ -s "$TOKENFILE" ] && break
