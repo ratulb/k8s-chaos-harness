@@ -20,8 +20,11 @@ if [[ "$survivors" -lt 0 ]]; then
   survivors=0
 fi
 for i in $(seq 1 60); do
-  ready=$(kubectl --request-timeout=10s get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{c++} END{print c+0}' || echo 0)
-  if [[ "$ready" -le "$survivors" ]]; then
+  ready=$(kubectl --request-timeout=5s get nodes --no-headers 2>/dev/null | awk '$2=="Ready"{c++} END{print c+0}' || true)
+  if [[ ! "$ready" =~ ^[0-9]+$ ]]; then
+    ready=0
+  fi
+  if (( ready <= survivors )); then
     break
   fi
   sleep 1

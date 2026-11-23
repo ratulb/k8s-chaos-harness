@@ -175,7 +175,7 @@ def _run_fresh(
         return rec
 
     store.update_run(run_id, phase="injecting")
-    inject_ok, inject_out = _run(inject_cmd, 120, run_env, log_path)
+    inject_ok, inject_out = _run(inject_cmd, max(timeout, 120), run_env, log_path)
     setup_parts.append(f"INJECT: {inject_out}")
     setup_output = "\n".join(setup_parts)
     _artifact(store, run_id, "injection_output_full", inject_out)
@@ -383,9 +383,14 @@ def _abort_and_retry(
 
 
 def main() -> None:
+    try:
+        choices = backend_choices()
+    except ValueError as exc:
+        print(f"LLM configuration error: {exc}", file=sys.stderr)
+        sys.exit(2)
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", required=True)
-    ap.add_argument("--backend", required=True, choices=backend_choices())
+    ap.add_argument("--backend", required=True, choices=choices)
     ap.add_argument("--mode", choices=["benchmark", "repair"], default="benchmark")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -494,7 +499,11 @@ def main() -> None:
     spec_json = json.dumps(scenario_dict, sort_keys=True)
     scenario_version = store.ensure_scenario(scenario.id, spec_hash, spec_json)
 
-    backend = resolve_backend(args.backend)
+    try:
+        backend = resolve_backend(args.backend)
+    except ValueError as exc:
+        print(f"LLM configuration error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     inject_cmd = scenario.inject
     if not os.path.isabs(inject_cmd):
@@ -600,7 +609,7 @@ def main() -> None:
         if args.resume_of:
             rows = [store.get_run(args.resume_of)]
         else:
-            rows = store.resume_candidates(args.scenario, args.backend)[: max(1, args.runs)]
+            rows = store.resume_candidates(args.scenario, backend.name)[: max(1, args.runs)]
         if not rows:
             print("No resumable runs found", file=sys.stderr)
             sys.exit(1)

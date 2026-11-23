@@ -141,9 +141,22 @@ class LLMOutcome:
     def commit(self, journal: Journal, backend: str) -> LLMResponse | None:
         if self.failed:
             error_text = self.result.error or str(self.error or "unknown LLM error")
-            journal.store.add_llm_request(journal.run_id, backend, self.latency_ms, 0, 0, error_text)
-            journal.event({"type": "llm_error", "error": error_text})
-            journal.artifact("llm_error_full", {"error": error_text})
+            attempts = self.error.attempts if self.error is not None else ()
+            attempted = [
+                {"backend": item.backend, "model": item.model, "error": item.error}
+                for item in attempts
+            ]
+            used_backend = attempted[-1]["backend"] if attempted else backend
+            journal.store.add_llm_request(journal.run_id, used_backend, self.latency_ms, 0, 0, error_text)
+            journal.event({
+                "type": "llm_error",
+                "error": error_text,
+                "backend": used_backend,
+                "requested_backend": self.error.requested_backend if self.error else None,
+                "attempts": attempted,
+                "skipped_backends": list(self.error.skipped_backends) if self.error else [],
+            })
+            journal.artifact("llm_error_full", {"error": error_text, "backend": used_backend, "attempts": attempted})
             return None
         response = self.result.unwrap()
         response.commit(journal, backend, self.latency_ms)

@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import nullcontext, redirect_stdout
+from contextlib import nullcontext, redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -335,6 +335,14 @@ class TestChaosCli(unittest.TestCase):
         self.assertEqual(payload["status"], "rebuild_failed")
         self.assertEqual(payload["state"], "preserved")
         discard.assert_not_called()
+
+    def test_ping_reports_missing_llm_config_without_traceback(self) -> None:
+        stderr = io.StringIO()
+        with patch.dict(os.environ, {}, clear=True), redirect_stderr(stderr):
+            code = chaos_cli._ping("auto", "hello")
+        self.assertEqual(code, 1)
+        self.assertIn("LLM configuration error", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
 
 
 if __name__ == "__main__":

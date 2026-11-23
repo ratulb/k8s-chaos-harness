@@ -212,7 +212,11 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
 
 
 def _ping(backend_name: str, message: str | None) -> int:
-    backend = resolve_backend(backend_name)
+    try:
+        backend = resolve_backend(backend_name)
+    except ValueError as exc:
+        print(f"LLM configuration error: {exc}", file=sys.stderr)
+        return 1
     client = LLMClient(backend)
     if not client.health():
         hints = {
@@ -269,6 +273,11 @@ def _ping(backend_name: str, message: str | None) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    try:
+        choices = backend_choices()
+    except ValueError as exc:
+        print(f"LLM configuration error: {exc}", file=sys.stderr)
+        return 2
     ap = argparse.ArgumentParser(prog="chaos")
     ap.add_argument("--db", default=os.environ.get("CHECKPOINT_DB", str(ROOT / "results.sqlite3")))
     ap.add_argument("--runs-file", default=str(ROOT / "runs.jsonl"))
@@ -277,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ping = sub.add_parser("ping", help="Check the configured LLM brain with a one-shot prompt; no cluster needed")
     ping.add_argument("message", nargs="?", default=None)
-    ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", AUTO_BACKEND), choices=backend_choices())
+    ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", AUTO_BACKEND), choices=choices)
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
@@ -311,7 +320,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run = sub.add_parser("run")
     run.add_argument("--scenario", required=True)
-    run.add_argument("--backend", required=True, choices=backend_choices())
+    run.add_argument("--backend", required=True, choices=choices)
     run.add_argument("--mode", choices=["benchmark", "repair"], default="benchmark")
     run.add_argument("--approve", choices=["policy", "prompt"], default="policy")
     run.add_argument("--runs", type=int, default=1)

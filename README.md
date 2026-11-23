@@ -253,6 +253,8 @@ starts with the highest-priority configured endpoint; an explicit name stays the
 primary. All other configured endpoints are fallbacks unless
 `CHAOS_LLM_FALLBACK=0`. Failed candidates are skipped; the backend that answers
 is recorded in `llm_requests`, messages, and the `llm_response_full` artifact.
+If every candidate fails, `llm_error` events and `llm_error_full` artifacts list
+every attempted backend and error.
 
 | Backend | Meaning |
 | --- | --- |

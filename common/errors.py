@@ -5,13 +5,27 @@ from typing import Any
 
 
 @dataclass(frozen=True)
+class LLMAttempt:
+    backend: str
+    model: str
+    error: str
+
+
+@dataclass(frozen=True)
 class LLMError(Exception):
     kind: str
     message: str
     status_code: int | None = None
+    attempts: tuple[LLMAttempt, ...] = ()
+    requested_backend: str | None = None
+    skipped_backends: tuple[str, ...] = ()
 
     def __str__(self) -> str:
         return self.message
+
+    @property
+    def attempted_backends(self) -> tuple[str, ...]:
+        return tuple(item.backend for item in self.attempts)
 
     def classify(self) -> str:
         if self.status_code == 413:

@@ -310,6 +310,45 @@ class TestHardening(unittest.TestCase):
             self.assertIn("fault_check", kinds)
             store.close()
 
+    def test_fresh_run_uses_scenario_timeout_for_injection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            row = store.create_run(
+                "inject-timeout",
+                scenario_id="etcd-quorum-loss",
+                backend="fake",
+                truth="etcd_quorum_loss",
+            )
+            scenario = {
+                "id": "etcd-quorum-loss",
+                "root_cause": "etcd_quorum_loss",
+                "timeout_seconds": 300,
+                "fault_present_timeout_seconds": 1,
+            }
+            calls = []
+
+            def fake_run(cmd, timeout, env=None, log_path=None):
+                calls.append((cmd, timeout))
+                return True, "ok"
+
+            with patch("run_benchmark._run", side_effect=fake_run), \
+                 patch("run_benchmark.fault_checks.wait_for_fault", return_value=(False, "still healthy", 0.1)):
+                run_benchmark._run_fresh(
+                    store,
+                    row,
+                    scenario,
+                    SimpleNamespace(name="fake"),
+                    "echo inject",
+                    "echo verify",
+                    "",
+                    {},
+                    300,
+                    str(Path(tmp) / "traces"),
+                    None,
+                )
+            self.assertEqual([timeout for cmd, timeout in calls if cmd == "echo inject"], [300])
+            store.close()
+
     def test_menu_uses_chaos_run(self) -> None:
         script = chaos_cli._menu_script([{"id": "etcd-member-down", "label": "Etcd member down"}])
         self.assertIn('exec ./chaos run --scenario "$id" --backend "$BACKEND" "$@"', script)

@@ -8,10 +8,10 @@ import random
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
-from common.errors import LLMError
+from common.errors import LLMAttempt, LLMError
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -205,10 +205,15 @@ class LLMClient:
         request_payload = dict(payload)
         request_payload["model"] = backend.model
         if on_chunk is not None:
+            chunks: list[str] = []
             try:
-                return self._chat_stream(backend, request_payload, timeout, on_chunk, retries=retries)
+                data = self._chat_stream(backend, request_payload, timeout, chunks.append, retries=retries)
             except Exception:
-                pass
+                data = None
+            if data is not None:
+                for text in chunks:
+                    on_chunk(text)
+                return data
         with self._open_completion(backend, request_payload, timeout, retries=retries) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         data["stream_fallback"] = on_chunk is not None
@@ -243,27 +248,40 @@ class LLMClient:
         payload.update(kwargs)
 
         candidates = self._candidates()[: max(1, max_attempts)]
+        raw_candidates = self._raw_candidates()
         attempted_names = {candidate.name for candidate in candidates}
-        skipped = [candidate.name for candidate in self._raw_candidates() if candidate.name not in attempted_names]
+        skipped = [candidate.name for candidate in raw_candidates if candidate.name not in attempted_names]
+        attempts: list[LLMAttempt] = []
         last_error: BaseException | None = None
-        for index, backend in enumerate(candidates):
+        for backend in candidates:
             buffered: list[str] = []
             buffered_chunk = buffered.append if on_chunk is not None else None
             try:
                 data = self._chat_once(backend, payload, timeout, buffered_chunk, retries)
             except Exception as exc:
                 last_error = exc
+                attempts.append(LLMAttempt(backend.name, backend.model, str(exc)))
                 continue
             if on_chunk is not None:
                 for text in buffered:
                     on_chunk(text)
+            raw_index = next(
+                (index for index, item in enumerate(raw_candidates) if item.name == backend.name),
+                0,
+            )
             data["backend"] = backend.name
             data["model"] = backend.model
-            data["attempt"] = index + 1
+            data["attempt"] = raw_index + 1
             data["requested_backend"] = self.backend.name
-            data["fallback_from"] = [candidate.name for candidate in candidates[:index]]
+            data["fallback_from"] = [item.name for item in raw_candidates[:raw_index]]
             data["skipped_backends"] = skipped
             return data
         if last_error is not None:
-            raise last_error
+            error = LLMError.from_exception(last_error)
+            raise replace(
+                error,
+                attempts=tuple(attempts),
+                requested_backend=self.backend.name,
+                skipped_backends=tuple(skipped),
+            ) from last_error
         raise RuntimeError("completion request failed")

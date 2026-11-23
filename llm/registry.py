@@ -7,7 +7,7 @@ from typing import Any
 
 from llm.backends import configured_backends
 from llm.client import Backend
-from tools.naming import normalize_backend
+from tools.naming import LEGACY_BACKEND_ALIASES, normalize_backend
 
 AUTO_BACKEND = "auto"
 
@@ -38,6 +38,7 @@ def _custom_backends() -> list[Backend]:
         raise ValueError("CHAOS_LLM_ENDPOINTS must be a JSON list")
 
     out: list[Backend] = []
+    names: set[str] = set()
     for index, item in enumerate(specs):
         if not isinstance(item, dict):
             raise ValueError(f"CHAOS_LLM_ENDPOINTS[{index}] must be an object")
@@ -46,8 +47,11 @@ def _custom_backends() -> list[Backend]:
         model = str(item.get("model") or "").strip()
         if not name or not base_url or not model:
             raise ValueError(f"CHAOS_LLM_ENDPOINTS[{index}] requires name, base_url, and model")
-        if _env_flag(str(item.get("enabled", "1")), True) is False:
+        if name == AUTO_BACKEND or name in LEGACY_BACKEND_ALIASES or name in names:
+            raise ValueError(f"CHAOS_LLM_ENDPOINTS[{index}] has reserved or duplicate name {name!r}")
+        if not _env_flag(str(item.get("enabled", "1")), True):
             continue
+        names.add(name)
         key_env = str(item.get("api_key_env") or "").strip()
         api_key = os.environ.get(key_env, "") if key_env else str(item.get("api_key") or "")
         if not api_key and ("127.0.0.1" in base_url or "localhost" in base_url):
