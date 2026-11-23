@@ -20,6 +20,8 @@ class Journal:
         event_type = str(event.get("type", "unknown"))
         redacted = Message.redact_payload(event)
         self.emit(event_type, self.describe(event_type, redacted))
+        if event_type.split(".", 1)[0] in {"gate", "run", "tool"}:
+            return int(self.store.apply_machine_event(self.run_id, event_type, dict(redacted)))
         return int(self.store.add_event(self.run_id, event_type, dict(redacted)))
 
     def artifact(self, kind: str, payload: Any, content_type: str = "application/json") -> None:

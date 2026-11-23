@@ -21,6 +21,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from harness.run_runtime import RunRuntime
+from harness.tool_runtime import ToolLedger
 from storage.sqlite_store import RUN_COLUMNS, SQLiteStore, active_topology_hash, discard_state
 
 
@@ -168,11 +169,18 @@ class TestSQLiteStore(unittest.TestCase):
         self._make_run()
         # Intent is written before execution. Until finish_tool_call(), the row
         # exposes an unresolved boundary that resume logic can inspect.
+        ledger = ToolLedger(
+            "run-1",
+            log=lambda event: self.store.add_event("run-1", event["type"], event),
+        )
+        runtime = ledger.for_call("call-1", "member_remove_readd", True, True)
+        runtime.start()
         self.store.begin_tool_call(
             "run-1", "call-1", 2, "member_remove_readd", {"node": "node-b"}, True, True
         )
         self.assertTrue(self.store.has_unknown_mutating_tool_call("run-1"))
         self.store.update_tool_call_status("run-1", "call-1", "started")
+        runtime.success()
         self.store.finish_tool_call(
             "run-1",
             "call-1",
@@ -193,7 +201,15 @@ class TestSQLiteStore(unittest.TestCase):
     def test_state_cache_is_rebuilt_from_event_log_when_stale(self) -> None:
         self._make_run()
         self.store.append_message("run-1", "system", "prompt")
-        self.store.add_event("run-1", "assistant", {"message": {"role": "assistant"}})
+        run = RunRuntime("run-1", log=lambda event: self.store.add_event("run-1", event["type"], event))
+        run.create()
+        run.lease()
+        run.begin_reset()
+        run.reset_ok()
+        run.baseline_ok()
+        run.inject_ok()
+        run.fault_observed()
+        self.store.add_event("run-1", "assistant", {"message": {"role": "assistant"}, "tokens": 7})
         self.store.add_event("run-1", "gate.diagnosis_submitted", {
             "type": "gate.diagnosis_submitted",
             "payload": {
@@ -212,11 +228,11 @@ class TestSQLiteStore(unittest.TestCase):
         })
         self.store.add_llm_request("run-1", "fake", 12, 3, 4)
 
-        # Simulate a stale cache: state_seq 999 does not match runs.seq 2.
+        # Simulate a stale cache: state_seq 999 does not match the event seq.
         # get_state() must derive state from the authoritative log instead.
         self.store.set_state("run-1", {"seq": 999, "diagnosis": "wrong"})
         state = self.store.get_state("run-1")
-        self.assertEqual(state["seq"], 2)
+        self.assertEqual(state["seq"], 9)
         self.assertEqual(state["steps"], 1)
         self.assertEqual(state["tokens_used"], 7)
         self.assertEqual(state["diagnosis"], "etcd_member_unreachable")
@@ -268,6 +284,10 @@ class TestSQLiteStore(unittest.TestCase):
 
     def test_concurrent_writers_are_serialized(self) -> None:
         self._make_run()
+        created: list[dict] = []
+        RunRuntime("run-1", log=created.append).create()
+        for event in created:
+            self.store.add_event("run-1", event["type"], event)
 
         def write(worker: int) -> None:
             for index in range(25):
@@ -280,8 +300,8 @@ class TestSQLiteStore(unittest.TestCase):
         for thread in threads:
             thread.join()
         self.assertEqual(len(self.store.load_ui_stream("run-1")), 100)
-        self.assertEqual(len(self.store.load_events("run-1")), 100)
-        self.assertEqual(self.store.get_run("run-1")["seq"], 100)
+        self.assertEqual(len(self.store.load_events("run-1")), 101)
+        self.assertEqual(self.store.get_run("run-1")["seq"], 101)
         self.assertTrue(self.store.doctor()["ok"])
 
     def test_finish_run_writes_terminal_fields_score_and_artifact(self) -> None:
@@ -363,6 +383,60 @@ class TestSQLiteStore(unittest.TestCase):
             discard_state(self.db_path, Path(self.tmp.name) / "runs.jsonl", trace_dir)
         self.assertTrue(self.db_path.exists())
         self.assertEqual(active_topology_hash(self.db_path), "old-topology")
+
+    def test_illegal_transition_is_recorded_in_event_log(self) -> None:
+        self._make_run()
+        ledger = ToolLedger(
+            "run-1",
+            log=lambda event: self.store.add_event("run-1", event["type"], event),
+        )
+        runtime = ledger.for_call("bad-call", "probe")
+        runtime.success()
+        rejections = [
+            event for event in self.store.load_events("run-1")
+            if event["type"] == "state_transition_rejected"
+        ]
+        self.assertEqual(len(rejections), 1)
+        self.assertEqual(rejections[0]["payload"]["machine"], "tool")
+        self.assertEqual(rejections[0]["payload"]["event"], "success")
+        self.assertEqual(rejections[0]["payload"]["state_before"], "intended")
+
+    def test_state_cache_with_matching_seq_is_still_rebuilt(self) -> None:
+        self._make_run()
+        created: list[dict] = []
+        run = RunRuntime("run-1", log=created.append)
+        run.create()
+        run.lease()
+        run.begin_reset()
+        run.reset_ok()
+        run.baseline_ok()
+        run.inject_ok()
+        run.fault_observed()
+        for event in created:
+            self.store.add_event("run-1", event["type"], event)
+        self.store.add_event("run-1", "assistant", {"tokens": 4})
+        self.store.set_state("run-1", {
+            "seq": 8,
+            "diagnosis": "poisoned",
+            "approval_granted": True,
+            "run": {"state": {"phase": "finished"}},
+            "tools": {"ghost": {}},
+        })
+        state = self.store.get_state("run-1")
+        self.assertIsNone(state["diagnosis"])
+        self.assertFalse(state["approval_granted"])
+        self.assertEqual(state["run"]["state"]["phase"], "agent_running")
+        self.assertEqual(state["tools"], {})
+        self.assertEqual(state["steps"], 1)
+        self.assertEqual(state["tokens_used"], 4)
+
+    def test_doctor_detects_rows_without_canonical_events(self) -> None:
+        self.store.create_run("run-1", scenario_id="s", backend="fake")
+        self.store.begin_tool_call("run-1", "call-1", 1, "probe", {})
+        report = self.store.doctor()
+        self.assertFalse(report["ok"])
+        self.assertIn("run-1", report["runs_without_run_create"])
+        self.assertIn("run-1:call-1", report["tool_calls_without_tool_prepare"])
 
 
 if __name__ == "__main__":

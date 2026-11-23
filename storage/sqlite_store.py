@@ -982,6 +982,37 @@ class SQLiteStore:
             events.append(event)
         return events
 
+    def apply_machine_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int:
+        seq = self.add_event(run_id, event_type, payload)
+        state = self.rebuild_state(run_id)
+        projection_keys = (
+            "status", "phase", "end_reason", "fault_present", "verify_ok",
+            "diagnosis", "diagnosis_raw", "diagnosis_correct", "approval_granted",
+            "repair", "repair_args", "policy_violations", "forbidden_reason",
+        )
+        self.update_run(run_id, **{
+            RECORD_TO_COLUMN.get(key, key): state.get(key)
+            for key in projection_keys
+        })
+        with self._connect() as conn:
+            for call_id, tool in (state.get("tool_states") or {}).items():
+                conn.execute(
+                    """UPDATE tool_calls
+                       SET status=?, phase=?, result_code=?, reason=?, violation_kind=?
+                       WHERE run_id=? AND call_id=?""",
+                    (
+                        tool.get("status"),
+                        tool.get("phase"),
+                        tool.get("result_code"),
+                        tool.get("reason"),
+                        tool.get("violation_kind"),
+                        run_id,
+                        call_id,
+                    ),
+                )
+        self.set_state(run_id, state, source="event")
+        return seq
+
     def begin_tool_call(
         self,
         run_id: str,
@@ -1107,9 +1138,7 @@ class SQLiteStore:
         return calls
 
     def tool_ledger(self, run_id: str) -> ToolLedger:
-        ledger = ToolLedger.from_events(run_id, self.load_events(run_id))
-        ledger.merge_rows(self.load_tool_calls(run_id))
-        return ledger
+        return ToolLedger.from_events(run_id, self.load_events(run_id))
 
     def unfinished_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
         unfinished = self.tool_ledger(run_id).unfinished()
@@ -1275,17 +1304,12 @@ class SQLiteStore:
         return [dict(row) for row in rows]
 
     def rebuild_state(self, run_id: str) -> dict[str, Any]:
-        """Derive agent resume state from the authoritative gate and run event logs."""
+        """Derive agent resume state from the authoritative append-only event log."""
         row = self.get_run(run_id)
         events = self.load_events(run_id)
-        calls = self.load_tool_calls(run_id)
-        tokens_in, tokens_out = self.token_totals(run_id)
         gate = GateRuntime.from_events(run_id, events)
         run = RunRuntime.from_events(run_id, events)
         tools = ToolLedger.from_events(run_id, events)
-        tools.merge_rows(calls)
-        if not run.events:
-            run = RunRuntime.from_run(run_id, row)
         run_projection = run.projection()
         run_projection.pop("end_reason", None)
         gs = gate.state
@@ -1306,45 +1330,29 @@ class SQLiteStore:
             "diagnosis_first_attempt_correct": gs.first_attempt_correct,
             "repair": gate.accepted_repair,
             "repair_args": gate.repair_args,
-            "policy_violations": [],
+            "policy_violations": list(gate.policy_violations),
             "forbidden_reason": gate.forbidden_reason,
+            "rejections": [
+                dict(event.get("payload") or {})
+                for event in events
+                if event.get("type") == "state_transition_rejected"
+            ],
             "steps": sum(1 for event in events if event.get("type") == "assistant"),
-            "tokens_used": tokens_in + tokens_out,
+            "tokens_used": sum(
+                int(event.get("tokens") or 0)
+                for event in events
+                if event.get("type") == "assistant"
+            ),
             "diagnosis_nudged": gate.nudged,
             "trace_path": row.get("trace_path") or f"traces/{run_id}.jsonl",
             "seq": int(row.get("seq") or 0),
         }
-        with self._connect() as conn:
-            state["policy_violations"] = [
-                f"{row['tool']}: {row['reason']}"
-                for row in conn.execute(
-                    "SELECT tool, reason FROM policy_violations WHERE run_id=? ORDER BY seq", (run_id,)
-                )
-            ]
-            for call in calls:
-                if call["name"] in REPAIR_TOOLS and call["status"] == "denied" and call.get("error"):
-                    state["forbidden_reason"] = call["error"]
         return state
 
     def get_state(self, run_id: str) -> dict[str, Any]:
-        row = self.get_run(run_id)
-        cached = self._loads(row.get("state_json"), default={}) or {}
-        if cached and cached.get("seq") == row.get("state_seq") == row.get("seq"):
-            cached.setdefault("trace_path", row.get("trace_path") or f"traces/{run_id}.jsonl")
-            rebuilt = self.rebuild_state(run_id)
-            for key in (
-                "receipt", "approval_granted", "approval_source",
-                "diagnosis", "diagnosis_raw", "diagnosis_submitted",
-                "diagnosis_correct", "diagnosis_attempts",
-                "diagnosis_first_attempt_correct", "repair", "repair_args",
-                "policy_violations", "forbidden_reason", "diagnosis_nudged",
-                "run", "tools", "tool_states", "status", "phase", "fault_present", "verify_ok",
-            ):
-                cached[key] = rebuilt.get(key)
-            return cached
-        rebuilt = self.rebuild_state(run_id)
-        self.set_state(run_id, rebuilt, source="rebuild")
-        return rebuilt
+        state = self.rebuild_state(run_id)
+        self.set_state(run_id, state, source="rebuild")
+        return state
 
     def set_state(self, run_id: str, state: dict[str, Any], source: str = "checkpoint") -> None:
         cache = dict(state)
@@ -1760,6 +1768,45 @@ class SQLiteStore:
                        WHERE r.seq != COALESCE((SELECT MAX(seq) FROM trace_events e WHERE e.run_id=r.run_id), 0)"""
                 )
             ]
+            stale_state_cache = [
+                row["run_id"]
+                for row in conn.execute(
+                    "SELECT run_id FROM runs WHERE state_json IS NOT NULL AND state_seq IS NOT NULL AND state_seq != seq"
+                )
+            ]
+            missing_canonical_runs = [
+                row["run_id"]
+                for row in conn.execute(
+                    """SELECT r.run_id FROM runs r
+                       WHERE NOT EXISTS (
+                           SELECT 1 FROM trace_events e
+                           WHERE e.run_id=r.run_id AND e.type='run.create'
+                       )"""
+                )
+            ]
+            tool_rows = list(conn.execute("SELECT run_id, call_id FROM tool_calls"))
+            event_run_ids = [
+                row["run_id"] for row in conn.execute("SELECT DISTINCT run_id FROM trace_events")
+            ]
+        canonical_calls: dict[str, set[str]] = {}
+        rejections: list[dict[str, Any]] = []
+        for run_id in {row["run_id"] for row in tool_rows} | set(event_run_ids):
+            events = self.load_events(run_id)
+            canonical_calls[run_id] = {
+                str((event.get("payload") or {}).get("call_id") or "")
+                for event in events
+                if event.get("type") == "tool.prepare"
+            }
+            rejections.extend(
+                dict(event.get("payload") or {})
+                for event in events
+                if event.get("type") == "state_transition_rejected"
+            )
+        missing_canonical_tools = [
+            f"{row['run_id']}:{row['call_id']}"
+            for row in tool_rows
+            if row["call_id"] not in canonical_calls.get(row["run_id"], set())
+        ]
         unknown_calls = [
             run_id for run_id in tool_run_ids
             if self.tool_ledger(run_id).unfinished()
@@ -1773,6 +1820,12 @@ class SQLiteStore:
             issues.append(f"{len(unknown_calls)} runs have in-flight tool calls")
         if seq_mismatch:
             issues.append(f"{len(seq_mismatch)} runs have stale checkpoint seq markers")
+        if stale_state_cache:
+            issues.append(f"{len(stale_state_cache)} runs have stale state_json caches")
+        if missing_canonical_runs:
+            issues.append(f"{len(missing_canonical_runs)} runs have no canonical run.create event")
+        if missing_canonical_tools:
+            issues.append(f"{len(missing_canonical_tools)} tool calls have no canonical tool.prepare event")
         return {
             "database": str(self.path),
             "schema_version": version,
@@ -1780,6 +1833,10 @@ class SQLiteStore:
             "finished_runs_missing_final_record": missing_final,
             "runs_with_in_flight_tool_calls": unknown_calls,
             "runs_with_stale_seq": seq_mismatch,
+            "runs_with_stale_state_cache": stale_state_cache,
+            "runs_without_run_create": missing_canonical_runs,
+            "tool_calls_without_tool_prepare": missing_canonical_tools,
+            "state_transition_rejections": rejections,
             "issues": issues,
             "ok": not issues,
         }

@@ -58,13 +58,12 @@ class AgentLoop:
         run_row = store.get_run(ctx.run_id)
 
         snapshot = store.get_state(ctx.run_id) if ctx.resume else {}
+        events = store.load_events(ctx.run_id)
         state = AgentState.from_snapshot(snapshot, scenario, ctx.run_id, spec.approve, log=journal.event)
-        run = RunRuntime.from_snapshot(ctx.run_id, snapshot.get("run"), log=journal.event)
-        if not run.events:
-            run = RunRuntime.from_run(ctx.run_id, run_row, log=journal.event)
-        tool_ledger = ToolLedger.from_events(ctx.run_id, store.load_events(ctx.run_id), log=journal.event)
-        tool_ledger.merge_snapshot(snapshot.get("tools"))
-        tool_ledger.merge_rows(store.load_tool_calls(ctx.run_id))
+        run = RunRuntime.from_events(ctx.run_id, events, log=journal.event)
+        if ctx.resume and not run.events:
+            raise RuntimeError(f"resume requires canonical run events: {ctx.run_id}")
+        tool_ledger = ToolLedger.from_events(ctx.run_id, events, log=journal.event)
         if not ctx.resume:
             run.create()
             run.lease(run_row.get("lease_owner") or "harness", run_row.get("lease_expires_at"))

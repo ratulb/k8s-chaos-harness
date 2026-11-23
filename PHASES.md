@@ -290,7 +290,7 @@ or destructive validation.
       terminal outcome
 - [x] `ToolState` owns tool status and outcome; prefix strings are evidence for
       humans, not authority
-- [ ] Append-only SQLite event log is authoritative; `state_json` and snapshots
+- [x] Append-only SQLite event log is authoritative; `state_json` and snapshots
       are rebuildable projections/caches
 - [ ] One canonical scorer reads folded state and `GatePath`
 - [ ] Reaper, `--abandon`, and doctor checks covered by focused and full suites

@@ -157,6 +157,24 @@ def transition(
     return resolved
 
 
+def rejection_event(
+    machine: Machine[S, I, E, C],
+    state: S,
+    event: E | MachineEvent[E],
+    error: str,
+) -> dict[str, Any]:
+    machine_event = _as_event(event)
+    return {
+        "type": "state_transition_rejected",
+        "payload": {
+            "machine": machine.kind.value,
+            "event": machine_event.type.value,
+            "state_before": machine.state_id(state),
+            "error": error,
+        },
+    }
+
+
 def fold(
     machine: Machine[S, I, E, C],
     events: Iterable[E | MachineEvent[E]],

@@ -21,6 +21,7 @@ from tools import safety as safety_tools
 from tools.scenario_schema import load_scenario_object
 from harness.agent import Agent
 from harness.reporter import UiReporter
+from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
 from harness.tool_runtime import ToolLedger
 from harness.ui import LiveView
@@ -75,6 +76,39 @@ def _run(
 
 def _artifact(store: SQLiteStore, run_id: str, kind: str, output: str) -> None:
     store.add_artifact(run_id, kind, {"output": output})
+
+
+def _fold_run(store: SQLiteStore, run_id: str) -> RunRuntime:
+    return RunRuntime.from_events(
+        run_id,
+        store.load_events(run_id),
+        log=lambda event: store.add_event(run_id, event["type"], event),
+    )
+
+
+def _record_setup_failure(
+    store: SQLiteStore,
+    run_id: str,
+    owner: str,
+    *event_names: str,
+    reason: str,
+) -> None:
+    run = _fold_run(store, run_id)
+    run.create()
+    run.lease(owner)
+    run.begin_reset()
+    if "reset_failed" in event_names:
+        run.reset_failed(reason)
+    else:
+        run.reset_ok()
+        if "baseline_failed" in event_names:
+            run.baseline_failed(reason)
+        else:
+            run.baseline_ok()
+            run.inject_ok()
+            if "fault_not_observed" in event_names:
+                run.fault_not_observed(reason)
+    run.abort(reason)
 
 
 def _record_topology(store: SQLiteStore, run_id: str, topology_data: dict, capability: dict) -> None:
@@ -170,6 +204,7 @@ def _run_fresh(
     if not reset_ok or not baseline_ok:
         reason = "reset_failed" if not reset_ok else "baseline_failed"
         rec = _terminal_record(run_id, scenario, backend, reset_ok, baseline_ok, setup_output, reason)
+        _record_setup_failure(store, run_id, owner, reason, reason=reason)
         store.finish_run(run_id, rec, status="aborted", end_reason=reason)
         if runs_path:
             store.export_all(runs_path, trace_dir)
@@ -185,6 +220,7 @@ def _run_fresh(
     if not inject_ok:
         reason = "injection_failed"
         rec = _terminal_record(run_id, scenario, backend, reset_ok, baseline_ok, setup_output, reason)
+        _record_setup_failure(store, run_id, owner, reason, reason=reason)
         store.finish_run(run_id, rec, status="aborted", end_reason=reason)
         if runs_path:
             store.export_all(runs_path, trace_dir)
@@ -212,6 +248,7 @@ def _run_fresh(
             run_id, scenario, backend, reset_ok, baseline_ok,
             "\n".join(setup_parts), reason, fault_present=False,
         )
+        _record_setup_failure(store, run_id, owner, reason, reason=reason)
         store.finish_run(run_id, rec, status="aborted", end_reason=reason)
         if runs_path:
             store.export_all(runs_path, trace_dir)

@@ -12,7 +12,7 @@ from harness.machines.tools import (
     ToolPhase,
     ToolState,
 )
-from harness.state_machine import IllegalTransition, MachineEvent
+from harness.state_machine import IllegalTransition, MachineEvent, rejection_event
 
 
 @dataclass(frozen=True)
@@ -170,6 +170,8 @@ class ToolRuntime:
             transition = TOOL_MACHINE.transition(self.state, event)
         except IllegalTransition as exc:
             self.rejections.append(str(exc))
+            if self.log is not None:
+                self.log(rejection_event(TOOL_MACHINE, self.state, event, str(exc)))
             return None
         if idempotency_key is not None:
             self._seen_keys.add(idempotency_key)

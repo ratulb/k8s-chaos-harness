@@ -32,10 +32,11 @@ rebuilds current state. The persistence shell appends the event and writes
 projections in one transaction; the reducer itself performs no I/O and reads no
 clock.
 
-An event that does not belong in the current state is a rejection. It is recorded
-and leaves projections unchanged. Rebuild, resume, replay, doctor checks, and the
-UI all consume the same folded states; none of them infers authority from scalar
-defaults.
+An event that does not belong in the current state is appended as
+`state_transition_rejected` and leaves projections unchanged. Rebuild, resume,
+doctor checks, and replay fold `trace_events` directly; `state_json`,
+`state_snapshots`, and scalar rows are projections or caches and cannot override
+the log even when their sequence markers agree.
 
 ## GateRuntime and `GateState`
 

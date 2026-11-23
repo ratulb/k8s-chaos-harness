@@ -50,11 +50,13 @@ class AgentState:
         approve: str,
         log: Callable[[dict[str, Any]], int] | None = None,
     ) -> "AgentState":
+        gate = GateRuntime.from_snapshot(run_id, snapshot.get("gate"))
+        gate.log = log
         return cls(
             scenario=as_scenario(scenario),
             run_id=run_id,
             approve=approve,
-            gate=GateRuntime.from_snapshot(run_id, snapshot.get("gate"), log=log),
+            gate=gate,
             log=log,
         )
 

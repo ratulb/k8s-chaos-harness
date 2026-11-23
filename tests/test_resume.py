@@ -21,6 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import harness.agent as agent
 import run_benchmark
 from harness.gate_runtime import GateRuntime
+from harness.run_runtime import RunRuntime
+from harness.tool_runtime import ToolLedger
 from storage.sqlite_store import SQLiteStore
 from tools import cluster_config
 
@@ -80,6 +82,17 @@ class TestResume(unittest.TestCase):
         )
         self.store.append_message("resume-1", "system", "prompt")
         self.store.append_message("resume-1", "user", "investigate")
+        run = RunRuntime(
+            "resume-1",
+            log=lambda event: self.store.add_event("resume-1", event["type"], event),
+        )
+        run.create()
+        run.lease()
+        run.begin_reset()
+        run.reset_ok()
+        run.baseline_ok()
+        run.inject_ok()
+        run.fault_observed()
         self.store.add_event("resume-1", "assistant", {"message": {"role": "assistant"}})
         logged: list[dict] = []
         gate = GateRuntime("resume-1", log=logged.append)
@@ -157,6 +170,12 @@ class TestResume(unittest.TestCase):
         row = self._seed_agent_run()
         # A started mutating call with no result is precisely the ambiguous
         # boundary that must not be replayed in place.
+        ledger = ToolLedger(
+            "resume-1",
+            log=lambda event: self.store.add_event("resume-1", event["type"], event),
+        )
+        runtime = ledger.for_call("repair-in-flight", "member_remove_readd", True, True)
+        runtime.start()
         self.store.begin_tool_call(
             "resume-1", "repair-in-flight", 3, "member_remove_readd", {"node": "node-b"}, True, True
         )

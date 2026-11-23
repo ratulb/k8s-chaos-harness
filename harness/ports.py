@@ -10,6 +10,8 @@ if TYPE_CHECKING:
 class RunStore(Protocol):
     def add_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int: ...
 
+    def apply_machine_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int: ...
+
     def add_artifact(
         self,
         run_id: str,

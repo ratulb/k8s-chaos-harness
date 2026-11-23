@@ -103,6 +103,7 @@ class DomainObjectTests(unittest.TestCase):
             run.baseline_ok()
             run.inject_ok()
             run.fault_observed()
+            store.add_event("checkpoint-run", "assistant", {"tokens": 3})
             trace_path = root / "traces" / "checkpoint-run.jsonl"
             checkpoint = Checkpoint(
                 run_id="checkpoint-run",
@@ -308,14 +309,14 @@ class DomainObjectTests(unittest.TestCase):
                 name="probe",
                 description="probe",
                 handler=lambda args: "restarted",
-                kind="repair",
+                kind="probe",
                 mutating=True,
             )
             call = Call.from_tool_call({
                 "id": "call-1",
                 "function": {"name": "probe", "arguments": json.dumps({"node": "vm1"})},
             }, 3).for_tool(tool)
-            context = ToolContext(call_id="")
+            context = ToolContext(call_id="", tool_ledger=ToolLedger("call-run", log=journal.event))
             execution = call.invoke(tool, context, journal)
             unresolved = store.has_unknown_mutating_tool_call("call-run")
             tool_message = execution.commit(journal, "fake")
@@ -325,7 +326,7 @@ class DomainObjectTests(unittest.TestCase):
             store.close()
         self.assertIsInstance(execution, CallExecution)
         self.assertIs(execution.result.kind, ResultKind.SUCCESS)
-        self.assertTrue(unresolved)
+        self.assertFalse(unresolved)
         self.assertEqual(context.call_id, call.id)
         self.assertEqual(tool_message.content, "restarted")
         self.assertEqual(stored["status"], "finished")
@@ -346,7 +347,8 @@ class DomainObjectTests(unittest.TestCase):
                 "id": "call-fail-1",
                 "function": {"name": "explode", "arguments": "{}"},
             }, 1).for_tool(tool)
-            execution = call.invoke(tool, ToolContext(call_id=""), journal)
+            context = ToolContext(call_id="", tool_ledger=ToolLedger("call-fail", log=journal.event))
+            execution = call.invoke(tool, context, journal)
             execution.commit(journal, "fake")
             stored = store.load_tool_calls("call-fail")[0]
             store.close()

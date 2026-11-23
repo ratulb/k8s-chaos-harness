@@ -84,6 +84,7 @@ class LLMResponse:
         journal.event({
             "type": "assistant",
             "message": message.to_stored_dict(),
+            "tokens": self.usage.total_tokens,
             "finish_reason": self.finish_reason,
             "stream_fallback": self.stream_fallback,
             "backend": used_backend,
