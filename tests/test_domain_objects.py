@@ -22,6 +22,7 @@ from harness.journal import Journal
 from harness.loop import RunResult
 from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
+from harness.tool_runtime import ToolLedger
 from harness.tooling import AgentState, Diagnosis
 from harness.verification import Verification
 from llm.client import LLMClient
@@ -108,6 +109,7 @@ class DomainObjectTests(unittest.TestCase):
                 store=store,
                 state=state,
                 run=run,
+                tools=ToolLedger("checkpoint-run"),
                 scenario=scenario,
                 budget=budget,
                 trace_path=trace_path,
@@ -185,6 +187,7 @@ class DomainObjectTests(unittest.TestCase):
                 completed.return_value.stderr = ""
                 agent = replace(build_agent(), client_factory=lambda _backend: _Client())
                 result: RunResult = agent.run(spec, ctx)
+            events = store.load_events("typed-run")
             store.close()
             self.assertIs(result.result.kind, ResultKind.SUCCESS)
             self.assertEqual(result.record["scenario"], scenario.id)
@@ -194,6 +197,13 @@ class DomainObjectTests(unittest.TestCase):
             trace = (root / "traces" / "typed-run.jsonl").read_text(encoding="utf-8")
             self.assertIn("gate.diagnosis_submitted", trace)
             self.assertNotIn("approved:typed-run", trace)
+            self.assertTrue({"tool.prepare", "tool.start", "tool.success"} <= {
+                event["type"] for event in events
+            })
+            self.assertTrue(any(
+                item["state"]["phase"] == "succeeded"
+                for item in result.state["tools"].values()
+            ))
 
     def test_agent_loop_obeys_terminal_run_state_before_agent(self) -> None:
         scenario = Scenario.from_dict({

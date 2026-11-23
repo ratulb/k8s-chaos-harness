@@ -36,6 +36,11 @@ from tools import cluster_config, k8s, node_etcd, repairs
 class ToolOutcome:
     message: str
     status: str = "finished"
+    result_code: str | None = None
+    denied: bool = False
+    timed_out: bool = False
+    unknown_effect: bool = False
+    violation_kind: str | None = None
     approved_by: str | None = None
     call_error: str | None = None
     diagnosis_submitted: bool = False
@@ -58,6 +63,7 @@ class ToolContext:
     diagnosis: Any | None = None
     repair: Any | None = None
     call: Any | None = None
+    tool_ledger: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -105,22 +111,25 @@ class Tool:
                 if context is None or context.diagnosis is None:
                     result = "diagnosis requires runtime context"
                 else:
-                    result = context.diagnosis.execute(self, args, context.call_id)
+                    result = context.diagnosis.execute(
+                        self, args, context.call_id, runtime=getattr(context.tool_ledger, "get", lambda _id: None)(context.call_id)
+                    )
             elif self.kind == "repair":
                 if context is None or context.repair is None:
                     result = self.invoke_handler(args)
                 else:
-                    result = context.repair.execute(self, args, context.call_id)
+                    result = context.repair.execute(
+                        self, args, context.call_id, runtime=getattr(context.tool_ledger, "get", lambda _id: None)(context.call_id)
+                    )
             else:
                 result = self.invoke_handler(args)
         except Exception as e:
-            result = f"ERROR: {e}"
+            return ToolOutcome(message=f"ERROR: {e}", status="failed", call_error=str(e), result_code="failed")
         if isinstance(result, ToolOutcome):
             return result
         message = str(result)
-        status = "failed" if message.startswith("ERROR:") else "finished"
-        repair = self.name if self.kind == "repair" and status == "finished" else None
-        return ToolOutcome(message=message, status=status, repair=repair)
+        repair = self.name if self.kind == "repair" else None
+        return ToolOutcome(message=message, result_code="success", repair=repair)
 
 
 @dataclass

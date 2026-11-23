@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable
 
 from common.results import Approval, Refusal, Result, ResultKind
 from common.vocab import ROOT_CAUSE_LABELS
-from harness.gate_runtime import GateRuntime, classify_repair_result
+from harness.gate_runtime import GateRuntime
 from harness.machines.gate import MAX_DIAGNOSIS_ATTEMPTS, GatePhase
 from harness.prompt import SystemPrompt
 from tools.naming import normalize_repair_name
@@ -224,15 +224,18 @@ class Diagnosis:
             first_attempt_correct=first_attempt_correct,
         ))
 
-    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
+    def execute(self, tool: Tool, args: dict[str, Any], call_id: str, runtime: Any = None) -> ToolOutcome:
         decision = self.decide(tool, args)
         raw = args.get("root_cause")
-        if self.store is not None:
-            self.store.update_tool_call_status(self.state.run_id, call_id, "started")
         if decision.kind is not ResultKind.APPROVAL:
             refusal = decision.unwrap()
-            return ToolOutcome(
+            outcome = ToolOutcome(
                 message=refusal.message,
+                status="denied",
+                result_code="denied",
+                denied=True,
+                call_error=refusal.message,
+                violation_kind="diagnosis",
                 diagnosis_submitted=True,
                 diagnosis=refusal.diagnosis,
                 diagnosis_raw=raw,
@@ -240,17 +243,27 @@ class Diagnosis:
                 diagnosis_attempts=refusal.attempt or self.state.diagnosis_attempts + 1,
                 diagnosis_first_attempt_correct=refusal.first_attempt_correct,
             )
-        approval = decision.unwrap()
-        return ToolOutcome(
-            message=approval.message,
-            approved_by=approval.source,
-            diagnosis_submitted=True,
-            diagnosis=approval.diagnosis,
-            diagnosis_raw=raw,
-            diagnosis_correct=approval.diagnosis_correct,
-            diagnosis_attempts=approval.attempt,
-            diagnosis_first_attempt_correct=approval.first_attempt_correct,
-        )
+        else:
+            approval = decision.unwrap()
+            if runtime is not None:
+                runtime.start()
+            elif self.store is not None:
+                self.store.update_tool_call_status(self.state.run_id, call_id, "started")
+            outcome = ToolOutcome(
+                message=approval.message,
+                result_code="success",
+                approved_by=approval.source,
+                diagnosis_submitted=True,
+                diagnosis=approval.diagnosis,
+                diagnosis_raw=raw,
+                diagnosis_correct=approval.diagnosis_correct,
+                diagnosis_attempts=approval.attempt,
+                diagnosis_first_attempt_correct=approval.first_attempt_correct,
+            )
+        if runtime is not None:
+            runtime.apply_outcome(outcome)
+            outcome = replace(outcome, status=runtime.status, result_code=runtime.result_code)
+        return outcome
 
 
 class Repair:
@@ -307,42 +320,72 @@ class Repair:
             message="",
         ))
 
-    def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
+    def execute(self, tool: Tool, args: dict[str, Any], call_id: str, runtime: Any = None) -> ToolOutcome:
         assert self.state.gate is not None
         canonical = normalize_repair_name(tool.name)
         decision = self.authorize(tool, args)
         if decision.kind is not ResultKind.APPROVAL:
             refusal = decision.unwrap()
-            return ToolOutcome(
+            outcome = ToolOutcome(
                 message=refusal.message,
                 status="denied",
+                result_code="denied",
+                denied=True,
                 call_error=refusal.reason,
                 policy_violation=f"{canonical}: {refusal.reason}",
+                violation_kind="forbidden" if "forbidden" in refusal.reason else "policy",
                 forbidden_reason=refusal.reason if "forbidden" in refusal.reason else None,
             )
+            if runtime is not None:
+                runtime.apply_outcome(outcome)
+                outcome = replace(outcome, status=runtime.status, result_code=runtime.result_code)
+            return outcome
         approval = decision.unwrap()
-        if self.store is not None:
+        if runtime is not None:
+            runtime.start()
+        elif self.store is not None:
             self.store.update_tool_call_status(self.state.run_id, call_id, "started")
         if self.checkpoint is not None:
             self.checkpoint()
         try:
-            result = tool.invoke_handler(args)
-            if isinstance(result, ToolOutcome):
-                result = result.message
-            if result.startswith("timeout waiting for"):
+            raw = tool.invoke_handler(args)
+            if isinstance(raw, ToolOutcome):
+                result = raw.message
+                timed_out = raw.timed_out or result.startswith("timeout waiting for")
+                unknown_effect = raw.unknown_effect
+                error = raw.call_error
+            else:
+                result = str(raw)
+                timed_out = result.startswith("timeout waiting for")
+                unknown_effect = False
+                error = None
+            if timed_out:
                 result += SystemPrompt.REPAIR_TIMEOUT_FOLLOWUP
         except Exception as e:
             result = f"ERROR: {e}"
-        status = "finished" if not result.startswith("ERROR:") else "failed"
-        facts = classify_repair_result(status, result)
-        self.state.gate.finish_repair(
-            status=facts.status,
-            result=result,
-            idempotency_key=f"repair-result:{call_id}",
-        )
+            timed_out = False
+            unknown_effect = False
+            error = str(e)
+        code = "timeout" if timed_out else "failed" if error else "unknown_effect" if unknown_effect else "success"
+        if runtime is not None:
+            if unknown_effect:
+                runtime.cancel()
+            else:
+                runtime.failure(code, error) if code in {"timeout", "failed"} else runtime.success()
+            status = runtime.status
+            result_code = runtime.result_code
+            self.state.gate.finish_repair(tool_state=runtime.state, idempotency_key=f"repair-result:{call_id}")
+        else:
+            status = "failed" if error else "finished"
+            result_code = code
+            self.state.gate.finish_repair(status=status, result=result, idempotency_key=f"repair-result:{call_id}")
         return ToolOutcome(
             message=result,
             status=status,
+            result_code=result_code,
+            timed_out=timed_out,
+            unknown_effect=unknown_effect,
+            call_error=error,
             approved_by=approval.source,
             repair=canonical if status == "finished" else None,
             repair_args=dict(args) if status == "finished" else None,

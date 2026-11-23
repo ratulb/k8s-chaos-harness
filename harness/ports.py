@@ -61,9 +61,21 @@ class RunStore(Protocol):
         args: dict[str, Any],
         mutating: bool = False,
         destructive: bool = False,
+        phase: str = "intended",
+        status: str = "proposed",
+        result_code: str | None = None,
+        reason: str | None = None,
+        violation_kind: str | None = None,
     ) -> int: ...
 
-    def update_tool_call_status(self, run_id: str, call_id: str, status: str) -> None: ...
+    def update_tool_call_status(
+        self,
+        run_id: str,
+        call_id: str,
+        status: str,
+        phase: str | None = None,
+        result_code: str | None = None,
+    ) -> None: ...
 
     def finish_tool_call(
         self,
@@ -75,6 +87,10 @@ class RunStore(Protocol):
         truncated: bool,
         approved_by: str | None = None,
         error: str | None = None,
+        phase: str | None = None,
+        result_code: str | None = None,
+        reason: str | None = None,
+        violation_kind: str | None = None,
     ) -> None: ...
 
     def add_diagnosis_attempt(self, run_id: str, raw: Any, diagnosis: str | None, correct: bool) -> int: ...

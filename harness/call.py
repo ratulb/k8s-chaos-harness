@@ -46,6 +46,10 @@ class Call:
         )
 
     def invoke(self, tool: Tool | None, context: ToolContext, journal: Journal) -> "CallExecution":
+        ledger = context.tool_ledger
+        runtime = None
+        if ledger is not None:
+            runtime = ledger.for_call(self.id, self.name, self.mutating, self.destructive)
         journal.store.begin_tool_call(
             journal.run_id,
             self.id,
@@ -54,18 +58,40 @@ class Call:
             Message.redact_payload(self.args),
             self.mutating,
             self.destructive,
+            phase=runtime.phase.value if runtime else "intended",
+            status=runtime.status if runtime else "proposed",
         )
         if tool is None:
-            return CallExecution.from_outcome(self, self.kind, _unknown_tool(self.name))
-        if tool.kind == "diagnostic":
-            journal.store.update_tool_call_status(journal.run_id, self.id, "started")
+            if runtime is not None:
+                runtime.start()
+                outcome = _unknown_tool(self.name)
+                runtime.apply_outcome(outcome)
+                outcome = replace(outcome, status=runtime.status, result_code=runtime.result_code)
+            else:
+                outcome = _unknown_tool(self.name)
+            return CallExecution.from_outcome(
+                self, self.kind, outcome,
+                failed=runtime.failed if runtime else None,
+                tool_state=runtime.state if runtime else None,
+            )
+        if runtime is not None and tool.kind not in {"diagnosis", "repair"}:
+            runtime.start()
+        elif tool.kind == "diagnostic" and runtime is None:
+            journal.store.update_tool_call_status(journal.run_id, self.id, "started", "started")
         context.call_id = self.id
         context.call = self
         try:
             outcome = tool.run(self.args, context)
         except Exception as exc:
-            outcome = ToolOutcome(message=f"ERROR: {exc}", status="failed", call_error=str(exc))
-        return CallExecution.from_outcome(self, self.kind, outcome)
+            outcome = ToolOutcome(message=f"ERROR: {exc}", status="failed", result_code="failed", call_error=str(exc))
+        if runtime is not None and not runtime.terminal:
+            runtime.apply_outcome(outcome)
+            outcome = replace(outcome, status=runtime.status, result_code=runtime.result_code)
+        return CallExecution.from_outcome(
+            self, self.kind, outcome,
+            failed=runtime.failed if runtime else None,
+            tool_state=runtime.state if runtime else None,
+        )
 
 
 @dataclass(frozen=True)
@@ -74,10 +100,22 @@ class CallExecution:
     tool_kind: str
     outcome: ToolOutcome
     result: Result[ToolOutcome]
+    tool_state: Any | None = None
 
     @classmethod
-    def from_outcome(cls, call: Call, tool_kind: str, outcome: ToolOutcome) -> "CallExecution":
-        failed = outcome.status == "failed" or bool(outcome.call_error)
+    def from_outcome(
+        cls,
+        call: Call,
+        tool_kind: str,
+        outcome: ToolOutcome,
+        failed: bool | None = None,
+        tool_state: Any | None = None,
+    ) -> "CallExecution":
+        failed = (
+            bool(failed)
+            if failed is not None
+            else outcome.status in {"failed", "denied"} or bool(outcome.call_error)
+        )
         if failed and outcome.call_error is None:
             outcome = replace(outcome, call_error=outcome.message)
         result = (
@@ -85,7 +123,7 @@ class CallExecution:
             if failed
             else Result.success(outcome)
         )
-        return cls(call=call, tool_kind=tool_kind, outcome=outcome, result=result)
+        return cls(call=call, tool_kind=tool_kind, outcome=outcome, result=result, tool_state=tool_state)
 
     @property
     def failed(self) -> bool:
@@ -103,15 +141,20 @@ class CallExecution:
                 "args": Message.redact_payload(self.call.args),
                 "result": Message.redact_payload(raw_result),
             })
+        state = self.tool_state
         journal.store.finish_tool_call(
             journal.run_id,
             self.call.id,
-            self.outcome.status,
+            state.persisted_status if state else self.outcome.status,
             Message.redact_payload(raw_result),
             Message.redact_payload(sent_result),
             len(sent_result) < len(raw_result),
             self.outcome.approved_by,
             self.outcome.call_error,
+            phase=state.phase.value if state else None,
+            result_code=state.result_code if state else self.outcome.result_code,
+            reason=state.reason if state else None,
+            violation_kind=state.violation_kind if state else None,
         )
         tool_message.persist(journal, backend=backend, tool_call_id=tool_message.tool_call_id)
         journal.event({
@@ -127,4 +170,4 @@ class CallExecution:
 
 def _unknown_tool(name: str) -> ToolOutcome:
     message = f"unknown tool: {name}"
-    return ToolOutcome(message=message, status="failed", call_error=message)
+    return ToolOutcome(message=message, status="failed", result_code="unknown_tool", call_error=message)

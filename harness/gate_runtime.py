@@ -78,6 +78,22 @@ def classify_repair_result(
     return RepairResultFacts("success", detail=text or None)
 
 
+def repair_facts_from_tool_state(state: Any) -> RepairResultFacts:
+    phase = str(getattr(getattr(state, "phase", None), "value", getattr(state, "phase", "")) or "")
+    code = str(getattr(state, "result_code", None) or "")
+    reason = getattr(state, "reason", None)
+    detail = str(reason) if reason else None
+    if phase == "denied" or code == "denied":
+        return RepairResultFacts("denied", denied=True, detail=detail)
+    if code == "timeout":
+        return RepairResultFacts("timeout", timed_out=True, detail=detail)
+    if code == "unknown_effect" or phase == "unknown_effect":
+        return RepairResultFacts("unknown_effect", unknown_effect=True, detail=detail)
+    if phase == "failed" or code == "failed":
+        return RepairResultFacts("failed", detail=detail)
+    return RepairResultFacts("success", detail=detail)
+
+
 def _gate_state_to_dict(state: GateState) -> dict[str, Any]:
     data = asdict(state)
     data["phase"] = state.phase.value
@@ -282,9 +298,14 @@ class GateRuntime:
         status: Any = None,
         result: Any = None,
         error: Any = None,
+        tool_state: Any = None,
         idempotency_key: str | None = None,
     ) -> MachineEvent[GateEvent] | None:
-        facts = classify_repair_result(status, result, error)
+        facts = (
+            repair_facts_from_tool_state(tool_state)
+            if tool_state is not None
+            else classify_repair_result(status, result, error)
+        )
         if facts.denied:
             return None
         if facts.unknown_effect:

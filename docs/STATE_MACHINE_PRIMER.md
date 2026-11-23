@@ -8,9 +8,10 @@ The harness is driven by three state machines. They own behavior:
 - `RunState` owns the run lifecycle, lease, resume triage, and terminal outcome;
 - `ToolState` owns each tool call's status and outcome.
 
-`GateRuntime` is always on. There are no gate modes or runtime switches. The
-append-only event log is authoritative; `state_json`, `state_snapshots`, UI rows,
-exports, scores, and replay views are projections or caches derived from it.
+`GateRuntime`, `RunRuntime`, and `ToolLedger` are always on. There are no gate
+modes or runtime switches. The append-only event log is authoritative;
+`state_json`, `state_snapshots`, UI rows, exports, scores, and replay views are
+projections or caches derived from it.
 
 ```mermaid
 flowchart LR

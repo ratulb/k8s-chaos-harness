@@ -8,6 +8,7 @@ from typing import Any, Callable
 from harness.budget import Budget
 from harness.ports import RunStore
 from harness.run_runtime import RunRuntime
+from harness.tool_runtime import ToolLedger
 from harness.tooling import AgentState
 from tools.scenario import Scenario
 
@@ -46,6 +47,7 @@ class Checkpoint:
     store: RunStore
     state: AgentState
     run: RunRuntime
+    tools: ToolLedger
     scenario: Scenario
     budget: Budget
     trace_path: Path | str
@@ -62,6 +64,7 @@ class Checkpoint:
             diagnosis_nudged=self.budget.diagnosis_nudged,
         )
         snapshot["run"] = self.run.to_snapshot()
+        snapshot["tools"] = self.tools.to_snapshot()
         self.store.set_state(self.run_id, snapshot)
         if self.run.renew_lease:
             self.store.renew_lease(self.run_id)

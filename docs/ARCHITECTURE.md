@@ -43,7 +43,9 @@ AGENT COMPOSITION
 BEHAVIOR OWNERS
   GateRuntime   diagnosis, nudges, repair proposals, typed outcomes
   GateState     authorization and gate path
-  RunState      lifecycle, lease, verification, terminal outcome
+  RunRuntime    lifecycle, lease, verification, terminal outcome
+  RunState      folded run lifecycle state
+  ToolLedger    folds canonical tool events per call
   ToolState     tool status and outcome per call
             |
             v
@@ -80,8 +82,8 @@ PERSISTENCE AND OUTPUTS
 | Prompt policy | `harness/prompt.py` |
 | Tool catalog and dynamic schemas | `tools/tool.py` |
 | Gate behavior | `GateRuntime` and `GateState` |
-| Run lifecycle, lease, resume, terminal outcome | `RunState` |
-| Tool status and outcome | `ToolState` |
+| Run lifecycle, lease, resume, terminal outcome | `RunRuntime` and `RunState` |
+| Tool status and outcome | `ToolLedger` and `ToolState` |
 | Agent orchestration | `harness/loop.py` |
 | Checkpointing and lease renewal | `harness/checkpoint.py` |
 | Verification | `harness/verification.py` |

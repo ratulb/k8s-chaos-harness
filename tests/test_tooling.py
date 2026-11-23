@@ -8,6 +8,8 @@ from unittest.mock import patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, ETCDCTL_MEMBER_LIST, RESTART_MEMBER
+from harness.machines.tools import ToolPhase
+from harness.tool_runtime import ToolLedger
 from harness.tooling import AgentState, Diagnosis, Repair
 from tools.tool import TOOL_REGISTRY, Tool, ToolContext, ToolOutcome, build_tool_registry
 
@@ -67,6 +69,20 @@ class TestTooling(unittest.TestCase):
         self.assertTrue(result.diagnosis_submitted)
         self.assertTrue(result.diagnosis_correct)
         self.assertEqual(state.receipt, "approved:run-1")
+
+    def test_diagnosis_refusal_produces_typed_denied_state(self) -> None:
+        state = AgentState({"root_cause": "etcd_member_unreachable"}, "run-1", "policy")
+        ledger = ToolLedger("run-1")
+        runtime = ledger.for_call("call-1", DIAGNOSIS_TOOL)
+        outcome = Diagnosis(state).execute(
+            Tool(DIAGNOSIS_TOOL, "", kind="diagnosis"),
+            {"root_cause": "not_a_label"},
+            "call-1",
+            runtime=runtime,
+        )
+        self.assertEqual(outcome.status, "denied")
+        self.assertIs(runtime.phase, ToolPhase.DENIED)
+        self.assertEqual(runtime.result_code, "denied")
 
     def test_repair_execute_blocks_without_diagnosis(self) -> None:
         scenario = {"acceptable_repairs": [RESTART_MEMBER], "forbidden_repairs": []}

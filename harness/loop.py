@@ -15,6 +15,7 @@ from harness.ports import ChatClient, RunStore
 from harness.prompt import SystemPrompt
 from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
+from harness.tool_runtime import ToolLedger
 from harness.tooling import AgentState, Diagnosis, Repair
 from harness.verification import Verification
 from llm.client import LLMClient
@@ -61,6 +62,9 @@ class AgentLoop:
         run = RunRuntime.from_snapshot(ctx.run_id, snapshot.get("run"), log=journal.event)
         if not run.events:
             run = RunRuntime.from_run(ctx.run_id, run_row, log=journal.event)
+        tool_ledger = ToolLedger.from_events(ctx.run_id, store.load_events(ctx.run_id), log=journal.event)
+        tool_ledger.merge_snapshot(snapshot.get("tools"))
+        tool_ledger.merge_rows(store.load_tool_calls(ctx.run_id))
         if not ctx.resume:
             run.create()
             run.lease(run_row.get("lease_owner") or "harness", run_row.get("lease_expires_at"))
@@ -104,6 +108,7 @@ class AgentLoop:
             store=store,
             state=state,
             run=run,
+            tools=tool_ledger,
             scenario=scenario,
             budget=budget,
             trace_path=trace_path,
@@ -182,7 +187,12 @@ class AgentLoop:
                     end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
                     break
 
-                context = ToolContext(call_id="", diagnosis=diagnosis_executor, repair=repair_executor)
+                context = ToolContext(
+                    call_id="",
+                    diagnosis=diagnosis_executor,
+                    repair=repair_executor,
+                    tool_ledger=tool_ledger,
+                )
                 for tool_call in tool_calls:
                     tool = registry.get(str((tool_call.get("function") or {}).get("name") or ""))
                     call = Call.from_tool_call(tool_call, len(messages) - 1).for_tool(tool)

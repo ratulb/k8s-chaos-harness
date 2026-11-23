@@ -26,9 +26,17 @@ from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
 from harness.gate_runtime import GateRuntime
 from harness.message import Message
 from harness.run_runtime import RunRuntime
+from harness.tool_runtime import ToolLedger
 from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend, normalize_repair_name
 
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
+
+TOOL_CALL_COLUMNS = {
+    "phase": "TEXT NOT NULL DEFAULT 'intended'",
+    "result_code": "TEXT",
+    "reason": "TEXT",
+    "violation_kind": "TEXT",
+}
 
 RUN_COLUMNS = {
     "run_id": "TEXT PRIMARY KEY",
@@ -584,6 +592,10 @@ class SQLiteStore:
                     mutating INTEGER NOT NULL DEFAULT 0,
                     destructive INTEGER NOT NULL DEFAULT 0,
                     status TEXT NOT NULL DEFAULT 'proposed',
+                    phase TEXT NOT NULL DEFAULT 'intended',
+                    result_code TEXT,
+                    reason TEXT,
+                    violation_kind TEXT,
                     approved_by TEXT,
                     result_raw TEXT,
                     result_sent TEXT,
@@ -724,6 +736,10 @@ class SQLiteStore:
             for column, definition in SCORE_COLUMNS.items():
                 if column not in score_columns:
                     conn.execute(f"ALTER TABLE scores ADD COLUMN {column} {definition}")
+            tool_columns = {row["name"] for row in conn.execute("PRAGMA table_info(tool_calls)")}
+            for column, definition in TOOL_CALL_COLUMNS.items():
+                if column not in tool_columns:
+                    conn.execute(f"ALTER TABLE tool_calls ADD COLUMN {column} {definition}")
             conn.execute(
                 "UPDATE batches SET backend='ollama' WHERE backend=?",
                 (LEGACY_BACKEND_TOKENS[0],),
@@ -975,13 +991,18 @@ class SQLiteStore:
         args: dict[str, Any],
         mutating: bool = False,
         destructive: bool = False,
+        phase: str = "intended",
+        status: str = "proposed",
+        result_code: str | None = None,
+        reason: str | None = None,
+        violation_kind: str | None = None,
     ) -> None:
         with self._connect() as conn:
             conn.execute(
                 """INSERT OR REPLACE INTO tool_calls(
                        run_id, call_id, msg_seq, name, args_json, mutating, destructive,
-                       status, started_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, 'proposed', ?)""",
+                       status, phase, result_code, reason, violation_kind, started_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     run_id,
                     call_id,
@@ -990,15 +1011,36 @@ class SQLiteStore:
                     self._dumps(args) or "{}",
                     int(bool(mutating)),
                     int(bool(destructive)),
+                    status,
+                    phase,
+                    result_code,
+                    reason,
+                    violation_kind,
                     self._now(),
                 ),
             )
 
-    def update_tool_call_status(self, run_id: str, call_id: str, status: str) -> None:
+    def update_tool_call_status(
+        self,
+        run_id: str,
+        call_id: str,
+        status: str,
+        phase: str | None = None,
+        result_code: str | None = None,
+    ) -> None:
+        assignments = ["status=?"]
+        values: list[Any] = [status]
+        if phase is not None:
+            assignments.append("phase=?")
+            values.append(phase)
+        if result_code is not None:
+            assignments.append("result_code=?")
+            values.append(result_code)
+        values.extend((run_id, call_id))
         with self._connect() as conn:
             conn.execute(
-                "UPDATE tool_calls SET status=? WHERE run_id=? AND call_id=?",
-                (status, run_id, call_id),
+                f"UPDATE tool_calls SET {', '.join(assignments)} WHERE run_id=? AND call_id=?",
+                values,
             )
 
     def finish_tool_call(
@@ -1011,12 +1053,29 @@ class SQLiteStore:
         truncated: bool,
         approved_by: str | None = None,
         error: str | None = None,
+        phase: str | None = None,
+        result_code: str | None = None,
+        reason: str | None = None,
+        violation_kind: str | None = None,
     ) -> None:
+        if phase is None:
+            if result_code == "unknown_effect":
+                phase = "unknown_effect"
+            elif result_code == "superseded_after_resume":
+                phase = "superseded"
+            else:
+                phase = {
+                    "proposed": "intended",
+                    "started": "started",
+                    "finished": "succeeded",
+                    "failed": "failed",
+                    "denied": "denied",
+                }.get(status, status)
         with self._connect() as conn:
             conn.execute(
                 """UPDATE tool_calls
                    SET status=?, result_raw=?, result_sent=?, truncated=?, approved_by=?,
-                       error=?, finished_at=?
+                       error=?, phase=?, result_code=?, reason=?, violation_kind=?, finished_at=?
                    WHERE run_id=? AND call_id=?""",
                 (
                     status,
@@ -1025,6 +1084,10 @@ class SQLiteStore:
                     int(bool(truncated)),
                     approved_by,
                     error,
+                    phase,
+                    result_code,
+                    reason,
+                    violation_kind,
                     self._now(),
                     run_id,
                     call_id,
@@ -1043,26 +1106,20 @@ class SQLiteStore:
             calls.append(call)
         return calls
 
+    def tool_ledger(self, run_id: str) -> ToolLedger:
+        ledger = ToolLedger.from_events(run_id, self.load_events(run_id))
+        ledger.merge_rows(self.load_tool_calls(run_id))
+        return ledger
+
     def unfinished_tool_calls(self, run_id: str) -> list[dict[str, Any]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """SELECT * FROM tool_calls
-                   WHERE run_id=? AND status IN ('proposed', 'started', 'unknown')
-                   ORDER BY started_at, call_id""",
-                (run_id,),
-            ).fetchall()
-        return [dict(row) for row in rows]
+        unfinished = self.tool_ledger(run_id).unfinished()
+        return [
+            row for row in self.load_tool_calls(run_id)
+            if str(row.get("call_id") or "") in unfinished
+        ]
 
     def has_unknown_mutating_tool_call(self, run_id: str) -> bool:
-        with self._connect() as conn:
-            row = conn.execute(
-                """SELECT 1 FROM tool_calls
-                    WHERE run_id=? AND mutating=1 AND status IN ('proposed', 'started', 'unknown')
-
-                   LIMIT 1""",
-                (run_id,),
-            ).fetchone()
-        return row is not None
+        return self.tool_ledger(run_id).has_unknown_mutating()
 
     def add_llm_request(
         self,
@@ -1225,6 +1282,8 @@ class SQLiteStore:
         tokens_in, tokens_out = self.token_totals(run_id)
         gate = GateRuntime.from_events(run_id, events)
         run = RunRuntime.from_events(run_id, events)
+        tools = ToolLedger.from_events(run_id, events)
+        tools.merge_rows(calls)
         if not run.events:
             run = RunRuntime.from_run(run_id, row)
         run_projection = run.projection()
@@ -1233,6 +1292,8 @@ class SQLiteStore:
         state: dict[str, Any] = {
             "gate": gate.to_snapshot(),
             "run": run.to_snapshot(),
+            "tools": tools.to_snapshot(),
+            "tool_states": tools.projections(),
             **run_projection,
             "diagnosis": gs.diagnosis_label,
             "diagnosis_raw": gate.diagnosis_raw,
@@ -1277,7 +1338,7 @@ class SQLiteStore:
                 "diagnosis_correct", "diagnosis_attempts",
                 "diagnosis_first_attempt_correct", "repair", "repair_args",
                 "policy_violations", "forbidden_reason", "diagnosis_nudged",
-                "run", "status", "phase", "fault_present", "verify_ok",
+                "run", "tools", "tool_states", "status", "phase", "fault_present", "verify_ok",
             ):
                 cached[key] = rebuilt.get(key)
             return cached
@@ -1688,11 +1749,9 @@ class SQLiteStore:
                        )"""
                 )
             ]
-            unknown_calls = [
+            tool_run_ids = [
                 row["run_id"]
-                for row in conn.execute(
-                    "SELECT DISTINCT run_id FROM tool_calls WHERE status IN ('proposed', 'started', 'unknown')"
-                )
+                for row in conn.execute("SELECT DISTINCT run_id FROM tool_calls")
             ]
             seq_mismatch = [
                 row["run_id"]
@@ -1701,6 +1760,10 @@ class SQLiteStore:
                        WHERE r.seq != COALESCE((SELECT MAX(seq) FROM trace_events e WHERE e.run_id=r.run_id), 0)"""
                 )
             ]
+        unknown_calls = [
+            run_id for run_id in tool_run_ids
+            if self.tool_ledger(run_id).unfinished()
+        ]
         issues = []
         if version != SCHEMA_VERSION:
             issues.append(f"schema version {version} != {SCHEMA_VERSION}")

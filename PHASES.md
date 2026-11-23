@@ -288,7 +288,7 @@ or destructive validation.
       arguments
 - [x] `RunState` owns run lifecycle, lease, resume triage, verification, and
       terminal outcome
-- [ ] `ToolState` owns tool status and outcome; prefix strings are evidence for
+- [x] `ToolState` owns tool status and outcome; prefix strings are evidence for
       humans, not authority
 - [ ] Append-only SQLite event log is authoritative; `state_json` and snapshots
       are rebuildable projections/caches

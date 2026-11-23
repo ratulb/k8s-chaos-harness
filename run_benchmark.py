@@ -22,6 +22,7 @@ from tools.scenario_schema import load_scenario_object
 from harness.agent import Agent
 from harness.reporter import UiReporter
 from harness.spec import ExperimentSpec, RunContext
+from harness.tool_runtime import ToolLedger
 from harness.ui import LiveView
 from storage.sqlite_store import active_topology_hash, archive_state, discard_state, SQLiteStore
 from tools.scenario import as_scenario
@@ -285,17 +286,34 @@ def _run_resume(
     if not store.start_lease(run_id, owner):
         raise RuntimeError(f"run {run_id} is already leased")
 
-    for call in store.unfinished_tool_calls(run_id):
-        if not call["mutating"]:
-            store.finish_tool_call(
-                run_id,
-                call["call_id"],
-                "finished",
-                "superseded_after_resume",
-                "superseded_after_resume",
-                False,
-                error="read-only call superseded by resume",
-            )
+    def log_tool_event(event: dict) -> int:
+        return store.add_event(run_id, event["type"], event)
+
+    ledger = ToolLedger.from_events(run_id, store.load_events(run_id), log=log_tool_event)
+    ledger.merge_rows(store.load_tool_calls(run_id))
+    for call_id, projection in ledger.unfinished().items():
+        runtime = ledger.get(call_id)
+        if runtime is None:
+            continue
+        if runtime.phase.value == "intended":
+            runtime.start()
+        if projection["mutating"]:
+            runtime.lease_expired()
+        else:
+            runtime.resume_supersede()
+        store.finish_tool_call(
+            run_id,
+            call_id,
+            runtime.status,
+            runtime.state.reason or runtime.result_code or "",
+            runtime.state.reason or runtime.result_code or "",
+            False,
+            error=runtime.state.reason,
+            phase=runtime.phase.value,
+            result_code=runtime.result_code,
+            reason=runtime.state.reason,
+            violation_kind=runtime.state.violation_kind,
+        )
 
     verify_cmd = scenario.verify
     if not os.path.isabs(verify_cmd):
