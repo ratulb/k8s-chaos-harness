@@ -276,10 +276,14 @@ derived views
 ### Detailed handoffs
 
 0. **No-cluster LLM smoke test**
-   - `./chaos ping ...` parser at `chaos_cli.py:257-259`; dispatch at
-     `chaos_cli.py:334`.
-   - `_ping()` at `chaos_cli.py:214-247` calls `build_backend()`, checks
-     `LLMClient.health()`, and then runs one `LLMOutcome.invoke()` completion.
+   - `./chaos ping ...` parser at `chaos_cli.py:269`; dispatch at
+     `chaos_cli.py:345-346`.
+   - `_ping()` at `chaos_cli.py:214-259` calls `build_backend()`, checks
+     `LLMClient.health()`, then runs one bounded `LLMOutcome.invoke()` completion
+     with `max_tokens=256`, `timeout=180`, and `retries=0`.
+   - It prints a waiting message before generation because the first call may
+     load a self-hosted model; health checks alone only prove endpoint reachability.
+   - Empty `content` falls back to truncated `reasoning` for reasoning models.
    - It does not load scenarios or touch the cluster; missing endpoint/key
      returns setup guidance.
 
@@ -554,7 +558,7 @@ HEAD `5df4539`.
 1. **Streaming failures are invisible — partial**
    - Fallback still silently swallows the exception, but `stream_fallback` and
      hard failures are now recorded in events/artifacts and `llm_requests` rows
-     (`llm/client.py:148`, `:170-177`, `llm/response.py:59-75`).
+     (`llm/client.py:109-111`, `:173-179`, `llm/response.py:59-75`).
    - The failed streaming attempt has no dedicated event.
    - Reconstructed responses use `finish_reason="reconstructed"`, not `"stop"`.
 

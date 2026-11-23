@@ -59,6 +59,7 @@ class LLMClient:
         payload: dict[str, Any],
         timeout: int,
         extra_headers: dict[str, str] | None = None,
+        retries: int = 8,
     ) -> Any:
         headers = {
             "User-Agent": "k8s-chaos-harness/1.0",
@@ -73,18 +74,18 @@ class LLMClient:
             headers=headers,
         )
         last = None
-        for attempt in range(9):
+        for attempt in range(retries + 1):
             try:
                 return urllib.request.urlopen(req, timeout=timeout)
             except urllib.error.HTTPError as e:
                 last = e
-                if e.code in (429, 500, 502, 503, 504) and attempt < 8:
+                if e.code in (429, 500, 502, 503, 504) and attempt < retries:
                     time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
                 raise LLMError.from_exception(e) from e
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 last = e
-                if attempt < 8:
+                if attempt < retries:
                     time.sleep(min(60, 5 * (2 ** min(attempt, 4))) + random.uniform(0, 2))
                     continue
                 raise LLMError.from_exception(e) from e
@@ -97,6 +98,7 @@ class LLMClient:
         payload: dict[str, Any],
         timeout: int,
         on_chunk: Callable[[str], None],
+        retries: int = 8,
     ) -> dict[str, Any]:
         stream_payload = dict(payload)
         stream_payload["stream"] = True
@@ -105,7 +107,7 @@ class LLMClient:
         usage: dict[str, Any] | None = None
         tool_calls: dict[int, dict[str, Any]] = {}
         with self._open_completion(
-            stream_payload, timeout, {"Accept": "text/event-stream"}
+            stream_payload, timeout, {"Accept": "text/event-stream"}, retries=retries
         ) as resp:
             if not (200 <= getattr(resp, "status", 200) < 300):
                 raise RuntimeError(f"streaming request failed with status {resp.status}")
@@ -158,6 +160,7 @@ class LLMClient:
         **kwargs: Any,
     ) -> dict[str, Any]:
         timeout = int(kwargs.pop("timeout", 120))
+        retries = int(kwargs.pop("retries", 8))
         kwargs.pop("stream", None)
         payload: dict[str, Any] = {
             "model": self.backend.model,
@@ -169,10 +172,10 @@ class LLMClient:
 
         if on_chunk is not None:
             try:
-                return self._chat_stream(payload, timeout, on_chunk)
+                return self._chat_stream(payload, timeout, on_chunk, retries=retries)
             except Exception:
                 pass
-        with self._open_completion(payload, timeout) as resp:
+        with self._open_completion(payload, timeout, retries=retries) as resp:
             data = json.loads(resp.read().decode("utf-8"))
         data["stream_fallback"] = on_chunk is not None
         choices = data.get("choices") or []

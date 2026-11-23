@@ -21,6 +21,7 @@ import run_benchmark
 import score
 from common.errors import LLMError, classify_llm_error
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
+from llm.client import Backend, LLMClient
 from storage import sqlite_store
 from tools import schemas
 from harness import agent
@@ -331,11 +332,48 @@ class TestHardening(unittest.TestCase):
 
         client = PingClient(object())
         out = io.StringIO()
-        with patch.object(chaos_cli, "LLMClient", lambda backend: client), redirect_stdout(out):
+        err = io.StringIO()
+        with patch.object(chaos_cli, "LLMClient", lambda backend: client), redirect_stdout(out), redirect_stderr(err):
             code = chaos_cli.main(["ping", "hello brain", "--backend", "ollama"])
         self.assertEqual(code, 0)
         self.assertIn("pong", out.getvalue())
+        self.assertIn("first call may load the model", err.getvalue())
         self.assertEqual(client.messages[-1], {"role": "user", "content": "hello brain"})
+
+    def test_ping_uses_bounded_single_attempt_and_shows_reasoning_fallback(self) -> None:
+        class PingClient:
+            def __init__(self, backend: object) -> None:
+                self.kwargs: dict[str, object] = {}
+
+            def health(self) -> bool:
+                return True
+
+            def chat(self, messages: list[dict], **kwargs: object) -> dict:
+                self.kwargs = kwargs
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "", "reasoning": "thought then pong"}}],
+                    "usage": {"total_tokens": 2},
+                }
+
+        client = PingClient(object())
+        out = io.StringIO()
+        with patch.object(chaos_cli, "LLMClient", lambda backend: client), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = chaos_cli.main(["ping", "hello", "--backend", "ollama"])
+        self.assertEqual(code, 0)
+        self.assertEqual(client.kwargs["max_tokens"], 256)
+        self.assertEqual(client.kwargs["timeout"], 180)
+        self.assertEqual(client.kwargs["retries"], 0)
+        self.assertIn("reasoning: thought then pong", out.getvalue())
+
+    def test_chat_can_disable_retries_without_sleeping(self) -> None:
+        client = LLMClient(Backend("test", "http://127.0.0.1:1", "model", "key"))
+        with patch("llm.client.urllib.request.urlopen", side_effect=TimeoutError("boom")) as opener, patch(
+            "llm.client.time.sleep"
+        ) as sleeper:
+            with self.assertRaises(LLMError):
+                client.chat([{"role": "user", "content": "ping"}], retries=0, timeout=1)
+        self.assertEqual(opener.call_count, 1)
+        sleeper.assert_not_called()
 
     def test_ping_reports_missing_endpoint_configuration(self) -> None:
         class DownClient:

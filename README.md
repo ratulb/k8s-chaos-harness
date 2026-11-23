@@ -302,6 +302,9 @@ If the default `ollama` endpoint is not yours, either edit `OLLAMA_BASE_URL` and
 `OLLAMA_MODEL`, or select a hosted backend with
 `./chaos ping "hello" --backend groq|openrouter|cloudflare`. A successful ping
 prints the backend/model and the LLM reply before any cluster tooling is used.
+A first self-hosted call may load the model and take up to three minutes; `ping`
+prints a waiting message and makes one bounded attempt. `llm_ready.py` and
+`LLMClient.health()` only prove endpoint reachability, not generation speed.
 
 Prerequisites for benchmark runs: `kubectl` access, SSH access to control-plane
 nodes, and network access for installs.

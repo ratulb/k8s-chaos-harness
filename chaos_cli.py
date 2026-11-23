@@ -230,18 +230,30 @@ def _ping(backend_name: str, message: str | None) -> int:
         except EOFError:
             message = ""
     message = message or "Reply with exactly: pong"
+    print(
+        f"Waiting for {backend.name} / {backend.model}; the first call may load the model...",
+        file=sys.stderr,
+    )
     outcome = LLMOutcome.invoke(
         client,
         [
             {"role": "system", "content": "You are a concise assistant. Reply directly to the user."},
             {"role": "user", "content": message},
         ],
+        temperature=0,
+        max_tokens=256,
+        timeout=180,
+        retries=0,
     )
     if outcome.failed:
         print(f"LLM ping failed: {outcome.result.error}", file=sys.stderr)
         return 1
     response = outcome.result.unwrap()
-    content = response.primary.content or "(empty response)"
+    content = (response.primary.content or "").strip()
+    if not content:
+        choice = (response.raw.get("choices") or [{}])[0]
+        reasoning = str((choice.get("message") or {}).get("reasoning") or "").strip()
+        content = f"(no content; reasoning: {reasoning[:200]})" if reasoning else "(empty response)"
     print(f"{backend.name} / {backend.model}")
     print(content)
     return 0
