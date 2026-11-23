@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common.scoring import SCORER_VERSION, Score
+from harness.journal import Journal
 from harness.message import Message
 from harness.tooling import AgentState, Diagnosis, Repair
 from llm.client import Backend, LLMClient
@@ -81,6 +82,41 @@ class ReviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted["args"]["approval_token"], "[REDACTED]")
         self.assertEqual(redacted["args"]["node"], "vm1")
         self.assertNotIn("approved:run-1", redacted["content"])
+
+    def test_journal_redacts_stored_events_but_preserves_approval_rebuild(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            store.create_run("journal-redact", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("journal-redact", store)
+            tool_event = {
+                "type": "tool",
+                "name": "restart_member",
+                "status": "finished",
+                "args": {"approval_token": "approved:journal-redact", "node": "vm1"},
+                "result": "restarted approved:journal-redact",
+            }
+            journal.event(tool_event)
+            journal.event({
+                "type": "approval",
+                "granted": True,
+                "diagnosis": "no_fault",
+                "diagnosis_attempts": 1,
+                "diagnosis_correct": True,
+                "diagnosis_first_attempt_correct": True,
+                "approval_token": "approved:journal-redact",
+                "mode": "auto",
+                "raw": "diagnosis",
+            })
+            events = store.load_events("journal-redact")
+            rebuilt = store.rebuild_state("journal-redact")
+            store.close()
+        stored_tool = next(event for event in events if event["type"] == "tool")
+        stored_approval = next(event for event in events if event["type"] == "approval")
+        self.assertEqual(stored_tool["args"]["approval_token"], "[REDACTED]")
+        self.assertNotIn("approved:journal-redact", stored_tool["result"])
+        self.assertEqual(stored_approval["approval_token"], "approved:journal-redact")
+        self.assertEqual(rebuilt["approval_token"], "approved:journal-redact")
+        self.assertIn("approved:journal-redact", tool_event["args"]["approval_token"])
 
     def test_diagnosis_attempt_cap_withholds_receipt(self) -> None:
         state = AgentState(

@@ -8,7 +8,7 @@ from common.results import Result
 from common.scoring import Score
 from harness.budget import Budget
 from harness.call import Call
-from harness.checkpoint import Checkpoint
+from harness.checkpoint import Checkpoint, LeaseRenewer
 from harness.journal import Journal
 from harness.message import Message
 from harness.ports import ChatClient, RunStore
@@ -113,61 +113,62 @@ class AgentLoop:
         checkpointer.capture()
 
         client = self.client_factory(spec.backend)
-        while not budget.exhausted:
-            budget.start_step()
-            outcome = LLMOutcome.invoke(
-                client,
-                [message.to_dict() for message in messages],
-                tools=registry.schemas(),
-                temperature=0.2,
-                max_tokens=2048,
-                on_chunk=(lambda text: journal.emit("assistant_delta", text)) if ctx.reporter is not None else None,
-            )
-            if outcome.failed:
-                llm_error = True
-                end_reason = outcome.end_reason
-                outcome.commit(journal, backend_name)
-                break
-            response = outcome.commit(journal, backend_name)
-            if response is None:
-                llm_error = True
-                end_reason = "error"
-                break
-            msg = response.primary
-            budget.add_tokens(response.usage.total_tokens)
-            messages.append(msg)
-            checkpointer.capture()
+        with LeaseRenewer(lambda: store.renew_lease(ctx.run_id)):
+            while not budget.exhausted:
+                budget.start_step()
+                outcome = LLMOutcome.invoke(
+                    client,
+                    [message.to_dict() for message in messages],
+                    tools=registry.schemas(),
+                    temperature=0.2,
+                    max_tokens=2048,
+                    on_chunk=(lambda text: journal.emit("assistant_delta", text)) if ctx.reporter is not None else None,
+                )
+                if outcome.failed:
+                    llm_error = True
+                    end_reason = outcome.end_reason
+                    outcome.commit(journal, backend_name)
+                    break
+                response = outcome.commit(journal, backend_name)
+                if response is None:
+                    llm_error = True
+                    end_reason = "error"
+                    break
+                msg = response.primary
+                budget.add_tokens(response.usage.total_tokens)
+                messages.append(msg)
+                checkpointer.capture()
 
-            tool_calls = msg.tool_calls
-            if not tool_calls and not state.diagnosis_submitted:
-                if budget.can_continue_without_tool_call():
-                    nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
+                tool_calls = msg.tool_calls
+                if not tool_calls and not state.diagnosis_submitted:
+                    if budget.can_continue_without_tool_call():
+                        nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
+                        messages.append(nudge)
+                        nudge.persist(journal, backend="harness")
+                        checkpointer.capture()
+                        continue
+                    end_reason = "agent_stopped"
+                    break
+                if not tool_calls:
+                    end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
+                    break
+
+                context = ToolContext(call_id="", diagnosis=diagnosis_executor, repair=repair_executor)
+                for tool_call in tool_calls:
+                    tool = registry.get(str((tool_call.get("function") or {}).get("name") or ""))
+                    call = Call.from_tool_call(tool_call, len(messages) - 1).for_tool(tool)
+                    execution = call.invoke(tool, context, journal)
+                    state.apply(execution.outcome)
+                    messages.append(execution.commit(journal, backend_name))
+                    checkpointer.capture()
+
+                if budget.should_nudge_diagnosis(state.diagnosis_submitted):
+                    nudge = Message.user("Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response.")
                     messages.append(nudge)
                     nudge.persist(journal, backend="harness")
+                    budget.diagnosis_nudged = True
+                    journal.event({"type": "nudge", "step": budget.steps})
                     checkpointer.capture()
-                    continue
-                end_reason = "agent_stopped"
-                break
-            if not tool_calls:
-                end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
-                break
-
-            context = ToolContext(call_id="", diagnosis=diagnosis_executor, repair=repair_executor)
-            for tool_call in tool_calls:
-                tool = registry.get(str((tool_call.get("function") or {}).get("name") or ""))
-                call = Call.from_tool_call(tool_call, len(messages) - 1).for_tool(tool)
-                execution = call.invoke(tool, context, journal)
-                state.apply(execution.outcome)
-                messages.append(execution.commit(journal, backend_name))
-                checkpointer.capture()
-
-            if budget.should_nudge_diagnosis(state.diagnosis_submitted):
-                nudge = Message.user("Stop investigating now. Call submit_diagnosis with your best exact root_cause label in the next response.")
-                messages.append(nudge)
-                nudge.persist(journal, backend="harness")
-                budget.diagnosis_nudged = True
-                journal.event({"type": "nudge", "step": budget.steps})
-                checkpointer.capture()
 
         if not llm_error:
             end_reason = budget.exhausted_reason() or end_reason

@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -16,7 +17,7 @@ from common.results import Approval, Refusal, Result, ResultKind
 from harness.budget import Budget
 from harness.agent import Agent, build_agent
 from harness.call import Call, CallExecution
-from harness.checkpoint import Checkpoint
+from harness.checkpoint import Checkpoint, LeaseRenewer
 from harness.journal import Journal
 from harness.loop import RunResult
 from harness.spec import ExperimentSpec, RunContext
@@ -314,6 +315,25 @@ class DomainObjectTests(unittest.TestCase):
         self.assertIs(verification.result.kind, ResultKind.FAILURE)
         self.assertIn("output", artifact["content"])
         self.assertTrue(any(event["type"] == "verify" for event in events))
+
+    def test_lease_renewer_renews_until_exit(self) -> None:
+        renewed = threading.Event()
+        after_exit = threading.Event()
+        stopped = threading.Event()
+        calls = 0
+
+        def renew() -> None:
+            nonlocal calls
+            calls += 1
+            if stopped.is_set():
+                after_exit.set()
+            renewed.set()
+
+        with LeaseRenewer(renew, interval=0.005):
+            self.assertTrue(renewed.wait(1.0))
+            stopped.set()
+        self.assertFalse(after_exit.wait(0.05))
+        self.assertGreater(calls, 0)
 
 
 if __name__ == "__main__":

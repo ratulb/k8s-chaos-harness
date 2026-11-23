@@ -17,10 +17,13 @@ class Journal:
 
     def event(self, event: dict[str, Any]) -> int:
         event["ts"] = time.time()
-        trace_event = Message.redact_payload(event)
         event_type = str(event.get("type", "unknown"))
-        self.emit(event_type, self.describe(event_type, trace_event))
-        return int(self.store.add_event(self.run_id, event_type, event))
+        redacted = Message.redact_payload(event)
+        self.emit(event_type, self.describe(event_type, redacted))
+        stored_event = dict(redacted)
+        if event_type == "approval" and "approval_token" in event:
+            stored_event["approval_token"] = event["approval_token"]
+        return int(self.store.add_event(self.run_id, event_type, stored_event))
 
     def artifact(self, kind: str, payload: Any, content_type: str = "application/json") -> None:
         content = payload if isinstance(payload, str) else json.dumps(payload, sort_keys=True, default=str)

@@ -1,6 +1,7 @@
 # Architecture draft (reverse-engineered)
 
-Status: audited against the implementation at HEAD `5df4539`. This document is a
+Status: maintained against the current implementation. Last full audit anchor:
+`5df4539`; subsequent hardening is reflected inline. This document is a
 reverse-engineered architecture draft plus a hardening-status ledger, not a frozen
 snapshot. The original review baseline was `1952bb2`, retained only as provenance.
 Line references are relative to the repository root and are refreshed where they
@@ -120,14 +121,14 @@ some CLI code, and tool handlers still accept raw dicts for compatibility.
 | Destructive safety | `tools/safety.py` | `require_destructive_guard()` enforces context/cluster/topology allow-lists. |
 | Backend config | `llm/client.py`, `llm/backends.py` | `Backend` is typed; `ExperimentSpec` still carries it as `Any`. |
 | Chat messages | `harness/message.py` | `Message` owns shape, redaction, truncation, and persistence. |
-| Event/artifact channel | `harness/journal.py` | Owns event mutation, redacted UI descriptions, and artifact serialization; raw event payloads remain in SQLite when callers pass them. |
+| Event/artifact channel | `harness/journal.py` | Owns event mutation, redacted stored/UI payloads, and artifact serialization; direct `store.add_event()` callers can still pass raw payloads. |
 | Prompt policy | `harness/prompt.py` | `SystemPrompt` renders topology-aware prompt. |
 | Tool catalog | `tools/tool.py` | Singleton `TOOL_REGISTRY`; dynamic schemas; late-bound repair handlers. |
 | Diagnosis/repair gates | `harness/tooling.py` | `Diagnosis.execute()` and `Repair.authorize()` are the real domain policy seam. |
 | Agent wiring | `harness/agent.py` | `Agent()` has default factories; `build_agent()` and `run_scenario()` are compatibility shims; `Agent.run` delegates to `AgentLoop`. |
 | Response audit | `llm/response.py` | `LLMOutcome` maps success/failure to `Result`; `commit()` records request, artifact, message, and event. |
 | Tool lifecycle | `harness/call.py` | `Call` persists intent; `CallExecution` maps `Result` success/failure and commits the result. |
-| Checkpointing | `harness/checkpoint.py` | Owns state snapshot, lease renewal, and run-row projection. |
+| Checkpointing | `harness/checkpoint.py` | `Checkpoint` owns state snapshot, lease renewal, and run-row projection; `LeaseRenewer` keeps long agent loops alive. |
 | Verification | `harness/verification.py` | Owns verify execution, `Result` variant, evidence artifact, and event. |
 | Orchestration loop | `harness/loop.py` | Coordinates objects and stop conditions; no longer owns per-call persistence details. |
 | Persistence | `storage/sqlite_store.py` | Authoritative, event-log-first; sole writer of derived traces/exports. |
@@ -333,15 +334,15 @@ derived views
 7. **Agent loop**
    - `Agent.run()` at `harness/agent.py:24-31` delegates to `AgentLoop`.
    - `harness/loop.py:57-59` restores or initializes state and messages.
-   - `harness/loop.py:136-170` calls the LLM, persists responses, applies
+   - `harness/loop.py:119-171` calls the LLM, persists responses, applies
      tool outcomes, and emits nudges.
-   - `harness/loop.py:172-185` sets budget end reasons and verification phase.
+   - `harness/loop.py:173-181` sets budget end reasons and verification phase.
    - Legacy `engine.run_scenario()` remains only a compatibility adapter at
      `harness/engine.py:37-108`.
 
 8. **Finish**
    - Final verify at `harness/verification.py:17-44` with `spec.run_env`.
-   - Record and score are created in `harness/loop.py:193-211`.
+   - Record and score are created in `harness/loop.py:183-216`.
    - `SQLiteStore.finish_run()` is at `storage/sqlite_store.py:1251-1310`.
    - `SQLiteStore.export_trace()` and `export_all()` are at
      `storage/sqlite_store.py:1515-1575`; the runner owns the final
@@ -396,7 +397,7 @@ HEAD `5df4539`.
    - `ExperimentSpec` carries frozen `run_env`, populated on both fresh and
      resume paths at `run_benchmark.py:229-239` and `run_benchmark.py:313-323`.
    - Final verify receives `spec.run_env` at `harness/verification.py:20-27`
-     and `harness/loop.py:175-180`.
+     and `harness/loop.py:176-179`.
 
 2. **Fixture fault-check env is child-only — fixed**
    - `wait_for_fault(..., env=run_env)` is called at `run_benchmark.py:512-513`.
@@ -410,23 +411,24 @@ HEAD `5df4539`.
      `storage/sqlite_store.py:1281-1289`.
    - The receipt is a correctness handshake, not a secret; see §8.1.
 
-4. **Lease can expire during legitimate work — partial**
-   - `Checkpoint.capture()` renews the lease at `harness/checkpoint.py:25-36`
-     and is called at loop boundaries in `harness/loop.py:113`, `:139`, `:162`,
-     and `:170`.
-   - There is no background renewal; a long LLM retry burst or a 180s repair
-     wait can still exceed the 300s lease between checkpoints
-     (`llm/client.py:76-90`, `tools/repairs.py:19-35`).
+4. **Lease can expire during legitimate work — fixed**
+   - `Checkpoint.capture()` renews the lease at `harness/checkpoint.py:54-65`
+     and is called at loop boundaries in `harness/loop.py:113`, `:140`, `:148`,
+     `:163`, `:171`, and `:209`.
+   - `LeaseRenewer` wraps the LLM/tool loop and renews every 60s in a daemon
+     thread, stopping on context exit (`harness/checkpoint.py:14-39`,
+     `harness/loop.py:116`). Long LLM retries and repair waits are now covered.
 
-5. **Redaction asymmetry — partial**
+5. **Redaction asymmetry — fixed**
    - `Message.to_stored_dict()` redacts message payloads at write time, and
      derived traces/exports redact via `Message.redact_payload()`
      (`harness/message.py:102-120`, `storage/sqlite_store.py:1520-1526`).
-   - `Journal.event()` still passes the raw event payload to SQLite while using
-     a redacted copy only for UI descriptions (`harness/journal.py:18-23`,
+   - `Journal.event()` now stores the redacted payload in SQLite and uses the
+     same redacted copy for UI descriptions (`harness/journal.py:18-26`,
      `storage/sqlite_store.py:937-947`).
-   - The raw approval receipt in the `approval` event is intentional for rebuild;
-     other raw tool args/results in event payloads are not. See §8.1.
+   - The top-level `approval_token` on `approval` events is the only allowlisted
+     raw value because rebuild needs it; other receipt-like strings in event
+     payloads are redacted. See §8.1.
 
 6. **Shell interpolation risk — partial**
    - `shell=True` remains in runner/verification paths
@@ -482,13 +484,13 @@ HEAD `5df4539`.
      columns all remain.
    - `diagnosis_correct` is computed in state apply, loop record, checkpoint
      projection, and event rebuild (`harness/tooling.py:31-99`,
-     `harness/loop.py:193`, `harness/checkpoint.py:38-53`,
+     `harness/loop.py:194`, `harness/checkpoint.py:67-82`,
      `storage/sqlite_store.py:31-83`).
 
 6. **Trace written twice — fixed**
    - The loop no longer writes trace files.
    - `SQLiteStore.export_trace()` and `export_all()` are the only writers
-     (`harness/loop.py:214-215`, `storage/sqlite_store.py:1515-1575`).
+     (`harness/loop.py:215-216`, `storage/sqlite_store.py:1515-1575`).
 
 7. **Tool dispatch has too many layers — open**
    - Chain is now `Call.invoke()` → `Tool.run()` → `Diagnosis`/`Repair.execute()`
@@ -505,7 +507,7 @@ HEAD `5df4539`.
    - `Score`, `Call`, and `Message` are objects now.
    - Capability dicts, config/fault/record/state dicts, and untyped
      `backend: Any` remain (`tools/topology.py:639-719`,
-     `run_benchmark.py:197-203`, `harness/loop.py:182-206`,
+     `run_benchmark.py:197-203`, `harness/loop.py:183-207`,
      `harness/spec.py:12`).
 
 10. **Destructive policy is scattered — open**
@@ -559,7 +561,7 @@ HEAD `5df4539`.
    - The column and `RECORD_TO_COLUMN` mapping exist at
      `storage/sqlite_store.py:66` and `:112-137`.
    - Verification commits it into the record (`harness/verification.py:43-44`,
-     `harness/loop.py:201`).
+     `harness/loop.py:202`).
 
 3. **Derived files rewritten after every run — open**
    - `export_all()` is still called on terminal/finish paths and rewrites all
@@ -585,8 +587,8 @@ HEAD `5df4539`.
    - Rebuild derives it from `nudge` events
      (`storage/sqlite_store.py:1257-1258`, `:1281-1289`).
    - The early no-tool nudge persists a message but logs no `nudge` event
-     (`harness/loop.py:142-148`); only the later budget nudge logs one
-     (`harness/loop.py:164-170`). Resume can re-nudge.
+     (`harness/loop.py:143-149`); only the later budget nudge logs one
+     (`harness/loop.py:165-171`). Resume can re-nudge.
 
 7. **Env loading is inconsistent — partial**
    - `chaos_cli.py:30`, `:252` now calls `load_env()` alongside
@@ -602,7 +604,7 @@ HEAD `5df4539`.
 9. **Stale or dead abstractions — open**
    - `common/xmlform.py` is still unused by the run flow.
    - `tools/schemas.py` remains a shim while the loop calls `registry.schemas()`
-     directly (`harness/loop.py:121`).
+     directly (`harness/loop.py:122`).
    - `DESIGN.md:236` still attributes schema generation to `tools/schemas.py`.
 
 10. **Docs drift — resolved in docs**
@@ -667,8 +669,8 @@ Landed:
 
 1. Verify env symmetry, fixture fault-check env, fixture opt-in, evidence
    preservation on topology change, target validation, receipt rebuild,
-   diagnosis attempt cap, and checkpoint-time lease renewal. Raw event payload
-   redaction and background lease renewal remain partial (P0.4/P0.5).
+   diagnosis attempt cap, event-payload redaction, checkpoint-time lease renewal,
+   and background lease renewal.
 2. One `Score` object used by loop, `score.py`, and `replay.py`; explicit
    scorer-version precedence; `verify_output` in records.
 3. Streaming fallback visibility and redacted derived traces/exports; failed
@@ -705,10 +707,10 @@ protocol marker proving that diagnosis was accepted before repair. It is not a
 secret and not human approval. Safety comes from canonical forbidden/unacceptable
 repair policy and recorded `policy_violations`. The implementation gates on
 harness-side state, records enough event data for rebuild, and redacts receipt-like
-values from messages, derived traces, and UI output at write time. Raw SQLite event
-payloads remain the rebuild authority: the `approval` event intentionally keeps
-the receipt, while other raw tool args/results in event payloads are still a
-partial gap (P0.5). Prompt mode adds an operator confirmation: it marks the run
+values from messages, all stored event payloads, derived traces, and UI output at
+write time. The top-level `approval_token` on the `approval` event is the only
+allowlisted raw receipt value because rebuild needs it. Prompt mode adds an
+operator confirmation: it marks the run
 `interactive=1`, returns the receipt only when the operator approves, and withholds
 it on decline. Because the harness state is authoritative, a redacted or absent
 wire value is accepted after resume instead of asking the model to guess a

@@ -1,13 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import threading
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from harness.budget import Budget
 from harness.ports import RunStore
 from harness.tooling import AgentState
 from tools.scenario import Scenario
+
+
+@dataclass
+class LeaseRenewer:
+    renew: Callable[[], None]
+    interval: float = 60.0
+    _stop: threading.Event = field(init=False, repr=False)
+    _thread: threading.Thread | None = field(init=False, repr=False, default=None)
+
+    def __post_init__(self) -> None:
+        self._stop = threading.Event()
+
+    def __enter__(self) -> "LeaseRenewer":
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_args: object) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval):
+            try:
+                self.renew()
+            except Exception:
+                pass
 
 
 @dataclass
