@@ -25,6 +25,94 @@ for node in cluster_config.nodes():
         raise SystemExit(f"cleanup failed on {node}: {out} {err}")
 PY
 
+PYTHONPATH="$ROOT" python3 - "${ETCD_MEMBERS[@]}" <<'PY'
+import json
+import subprocess
+import sys
+import time
+
+from tools import cluster_config
+
+nodes = sys.argv[1:]
+probe = cluster_config.default_node()
+if probe in nodes and len(nodes) > 1:
+    probe = next(node for node in nodes if node != probe)
+
+
+def member_payload():
+    proc = subprocess.run(
+        [
+            "kubectl", "--request-timeout=10s", "exec", "-n", "kube-system", f"etcd-{probe}", "--",
+            "etcdctl", "--endpoints=https://127.0.0.1:2379",
+            "--cacert=/etc/kubernetes/pki/etcd/ca.crt",
+            "--cert=/etc/kubernetes/pki/etcd/server.crt",
+            "--key=/etc/kubernetes/pki/etcd/server.key",
+            "--write-out=json", "member", "list",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError((proc.stderr or proc.stdout).strip())
+    return json.loads(proc.stdout)
+
+
+def peer_urls(member):
+    value = member.get("peerURLs") or member.get("peerUrls") or ""
+    if isinstance(value, list):
+        return [str(item) for item in value]
+    return str(value).split(",") if value else []
+
+
+def member_id(member):
+    raw = str(member.get("id") or member.get("ID") or "")
+    try:
+        return format(int(raw), "x")
+    except ValueError:
+        return raw
+
+
+for _ in range(12):
+    try:
+        members = member_payload().get("members", [])
+        pending = []
+        for node in nodes:
+            ip = cluster_config.node_ip(node)
+            desired = f"https://{ip}:2380"
+            for member in members:
+                name = str(member.get("name") or "")
+                urls = peer_urls(member)
+                if name != node and not any(ip in url for url in urls):
+                    continue
+                if urls != [desired]:
+                    pending.append((member_id(member), desired))
+                break
+        if not pending:
+            break
+        for mid, desired in pending:
+            subprocess.run(
+                [
+                    "kubectl", "--request-timeout=10s", "exec", "-n", "kube-system", f"etcd-{probe}", "--",
+                    "etcdctl", "--endpoints=https://127.0.0.1:2379",
+                    "--cacert=/etc/kubernetes/pki/etcd/ca.crt",
+                    "--cert=/etc/kubernetes/pki/etcd/server.crt",
+                    "--key=/etc/kubernetes/pki/etcd/server.key",
+                    "member", "update", mid, f"--peer-urls={desired}",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=True,
+            )
+        time.sleep(2)
+    except Exception:
+        time.sleep(5)
+else:
+    raise SystemExit("failed to normalize etcd peer URLs")
+PY
+
 kubectl delete event scary-warning-noisy -n default --ignore-not-found=true --request-timeout=10s >/dev/null 2>&1 || true
 
 verify_or_repair() {

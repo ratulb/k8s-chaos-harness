@@ -16,6 +16,7 @@ def build_backend(name: str) -> Backend:
             base_url=os.environ.get("OLLAMA_BASE_URL", "http://127.0.0.1:11434"),
             model=os.environ.get("OLLAMA_MODEL", "qwen3.8:27b"),
             api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
+            priority=10,
         )
     if backend_name == "groq":
         return Backend(
@@ -23,6 +24,7 @@ def build_backend(name: str) -> Backend:
             base_url="https://api.groq.com/openai/v1",
             model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
             api_key=os.environ.get("GROQ_API_KEY", ""),
+            priority=20,
         )
     if backend_name == "openrouter":
         return Backend(
@@ -30,6 +32,7 @@ def build_backend(name: str) -> Backend:
             base_url="https://openrouter.ai/api/v1",
             model=os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
             api_key=os.environ.get("OPENROUTER_API_KEY", ""),
+            priority=30,
         )
     if backend_name == "cloudflare":
         account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
@@ -38,6 +41,7 @@ def build_backend(name: str) -> Backend:
             base_url=f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1",
             model=os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
             api_key=os.environ.get("CLOUDFLARE_AUTH_TOKEN", ""),
+            priority=40,
         )
     raise ValueError(f"unknown backend {name!r}; expected one of {', '.join(BACKEND_NAMES)}")
 

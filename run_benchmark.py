@@ -14,8 +14,8 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm.env import load_env
 load_env()
-from llm.backends import BACKEND_NAMES, build_backend
 from llm.client import LLMClient
+from llm.registry import AUTO_BACKEND, backend_choices, resolve_backend
 from tools import fault_checks, topology as topology_tools
 from tools import safety as safety_tools
 from tools.scenario_schema import load_scenario_object
@@ -385,7 +385,7 @@ def _abort_and_retry(
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", required=True)
-    ap.add_argument("--backend", required=True, choices=list(BACKEND_NAMES))
+    ap.add_argument("--backend", required=True, choices=backend_choices())
     ap.add_argument("--mode", choices=["benchmark", "repair"], default="benchmark")
     ap.add_argument("--runs", type=int, default=1)
     ap.add_argument("--seed", type=int, default=0)
@@ -494,7 +494,7 @@ def main() -> None:
     spec_json = json.dumps(scenario_dict, sort_keys=True)
     scenario_version = store.ensure_scenario(scenario.id, spec_hash, spec_json)
 
-    backend = build_backend(args.backend)
+    backend = resolve_backend(args.backend)
 
     inject_cmd = scenario.inject
     if not os.path.isabs(inject_cmd):
@@ -526,6 +526,12 @@ def main() -> None:
         "impact_class": capability["impact_class"],
         "safety_guard": destructive_guard,
     }
+    if args.backend == AUTO_BACKEND or backend.fallbacks:
+        config_hash_input["backend_selector"] = args.backend
+        config_hash_input["fallback_chain"] = [
+            {"name": candidate.name, "model": candidate.model}
+            for candidate in [backend, *backend.fallbacks]
+        ]
     config_hash = store.hash_spec(config_hash_input)
 
     if not capability["eligible"]:
@@ -571,8 +577,11 @@ def main() -> None:
         print(json.dumps(rec), flush=True)
         return
 
+    chain = [candidate.name for candidate in [backend, *backend.fallbacks]]
+    if len(chain) > 1:
+        print(f"LLM fallback chain: {' -> '.join(chain)}", flush=True)
     if not LLMClient(backend).health():
-        print(f"Backend {backend.name} not healthy", file=sys.stderr)
+        print(f"No healthy backend in LLM chain: {' -> '.join(chain)}", file=sys.stderr)
         sys.exit(1)
 
     batch_id = store.create_batch(

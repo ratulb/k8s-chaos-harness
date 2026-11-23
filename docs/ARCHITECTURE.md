@@ -119,7 +119,7 @@ some CLI code, and tool handlers still accept raw dicts for compatibility.
 | Scenario definition + validation | `tools/scenario.py`, `tools/scenario_schema.py` | Typed `Scenario` is authoritative in runner, spec, loop, and gate policy; dicts coerced only at compatibility/serialization edges. |
 | Cluster identity / topology | `tools/topology.py` | `discover_topology()`, `freeze_topology()`, `resolve_targets()`, and `capability_check()` still return raw dicts. |
 | Destructive safety | `tools/safety.py` | `require_destructive_guard()` enforces context/cluster/topology allow-lists. |
-| Backend config | `llm/client.py`, `llm/backends.py` | `Backend` is typed; `ExperimentSpec` still carries it as `Any`. |
+| Backend config | `llm/client.py`, `llm/backends.py`, `llm/registry.py` | `Backend` is typed; registry resolves `auto`/custom endpoints and attaches fallbacks; actual responder is recorded per request. |
 | Chat messages | `harness/message.py` | `Message` owns shape, redaction, truncation, and persistence. |
 | Event/artifact channel | `harness/journal.py` | Owns event mutation, redacted stored/UI payloads, and artifact serialization; direct `store.add_event()` callers can still pass raw payloads. |
 | Prompt policy | `harness/prompt.py` | `SystemPrompt` renders topology-aware prompt. |
@@ -189,7 +189,8 @@ epoch/config/run creation
   active_topology_hash check
   stale state: archive + exit by default; --discard-stale deletes
   stale resume: refuse
-  build_backend()
+  resolve_backend()
+  LLM fallback chain + health sort
   build run_env
   compute config_hash
   create_batch()
@@ -278,9 +279,9 @@ derived views
 0. **No-cluster LLM smoke test**
    - `./chaos ping ...` parser at `chaos_cli.py:269`; dispatch at
      `chaos_cli.py:345-346`.
-   - `_ping()` at `chaos_cli.py:214-259` calls `build_backend()`, checks
-     `LLMClient.health()`, then runs one bounded `LLMOutcome.invoke()` completion
-     with `max_tokens=256`, `timeout=180`, and `retries=0`.
+   - `_ping()` calls `resolve_backend()`, checks `LLMClient.health()` across the
+     chain, then runs one bounded `LLMOutcome.invoke()` completion with
+     `max_tokens=256`, `timeout=180`, and `retries=0`.
    - It prints a waiting message before generation because the first call may
      load a self-hosted model; health checks alone only prove endpoint reachability.
    - Empty `content` falls back to truncated `reasoning` for reasoning models.
@@ -556,9 +557,9 @@ HEAD `5df4539`.
 ### P2 — observability, delivery, and coherence
 
 1. **Streaming failures are invisible — partial**
-   - Fallback still silently swallows the exception, but `stream_fallback` and
-     hard failures are now recorded in events/artifacts and `llm_requests` rows
-     (`llm/client.py:109-111`, `:173-179`, `llm/response.py:59-75`).
+   - The stream-to-non-stream downgrade still swallows its exception, but
+     `stream_fallback`, backend fallback metadata, and hard failures are recorded
+     in events/artifacts and `llm_requests` rows (`llm/client.py`, `llm/response.py`).
    - The failed streaming attempt has no dedicated event.
    - Reconstructed responses use `finish_reason="reconstructed"`, not `"stop"`.
 

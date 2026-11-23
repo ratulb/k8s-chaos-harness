@@ -196,23 +196,33 @@ requested and logs the limitation.
 
 ## 5. Backends
 
-One backend is selected per run. There is no automatic fallback chain.
+A run pins a primary backend and carries an ordered fallback chain. `--backend
+auto` starts with the highest-priority configured endpoint; an explicit name
+remains the primary. All other configured endpoints become fallbacks unless
+`CHAOS_LLM_FALLBACK=0`.
 
 ```bash
-./chaos run --scenario etcd-member-down --backend ollama --runs 1
+./chaos run --scenario etcd-member-down --backend auto --runs 1
 ```
 
 Backends:
 
+- `auto`: priority-ordered fallback chain over every configured endpoint.
 - `ollama`: self-hosted Ollama-compatible endpoint. It may be local Ollama,
   a tunneled endpoint, or another compatible server.
 - `groq`, `openrouter`, `cloudflare`: hosted OpenAI-compatible baselines.
+- custom names: arbitrary endpoints from `CHAOS_LLM_ENDPOINTS`.
+
+Healthy endpoints are tried before known-dead ones when
+`CHAOS_LLM_HEALTH_SORT=1`. The backend/model/attempt that actually answered is
+recorded in `llm_requests`, messages, and artifacts; `config_hash` records the
+selector and name/model chain for fallback runs.
 
 External temporary endpoints are historical infrastructure and are not a backend identity.
 
 `scripts/llm_ready.py` reports configured backend health and counts ready
 backends. Hosted 429/5xx/network retries remain in `llm/client.py` with
-exponential backoff.
+exponential backoff when a single backend is pinned.
 
 ## 6. Tool surfaces
 

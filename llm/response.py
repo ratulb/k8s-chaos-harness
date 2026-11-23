@@ -25,6 +25,12 @@ class LLMResponse:
     usage: Usage = field(default_factory=Usage)
     finish_reason: str | None = None
     stream_fallback: bool = False
+    backend: str | None = None
+    model: str | None = None
+    attempt: int = 1
+    requested_backend: str | None = None
+    fallback_from: tuple[str, ...] = ()
+    skipped_backends: tuple[str, ...] = ()
     raw: dict[str, Any] = field(default_factory=dict, repr=False, compare=False)
 
     @classmethod
@@ -46,6 +52,12 @@ class LLMResponse:
             ),
             finish_reason=choice.get("finish_reason"),
             stream_fallback=bool(value.get("stream_fallback")),
+            backend=value.get("backend"),
+            model=value.get("model"),
+            attempt=int(value.get("attempt") or 1),
+            requested_backend=value.get("requested_backend"),
+            fallback_from=tuple(value.get("fallback_from") or ()),
+            skipped_backends=tuple(value.get("skipped_backends") or ()),
             raw=value,
         )
 
@@ -57,21 +69,28 @@ class LLMResponse:
         return self.messages[0] if self.messages else Message.assistant("")
 
     def commit(self, journal: Journal, backend: str, latency_ms: int) -> Message:
+        used_backend = self.backend or backend
         journal.store.add_llm_request(
             journal.run_id,
-            backend,
+            used_backend,
             latency_ms,
             self.usage.prompt_tokens,
             self.usage.completion_tokens,
+            attempt=self.attempt,
         )
         journal.artifact("llm_response_full", Message.redact_payload(self.to_dict()))
         message = self.primary
-        message.persist(journal, backend=backend, tokens=self.usage.total_tokens)
+        message.persist(journal, backend=used_backend, tokens=self.usage.total_tokens)
         journal.event({
             "type": "assistant",
             "message": message.to_stored_dict(),
             "finish_reason": self.finish_reason,
             "stream_fallback": self.stream_fallback,
+            "backend": used_backend,
+            "attempt": self.attempt,
+            "requested_backend": self.requested_backend,
+            "fallback_from": list(self.fallback_from),
+            "skipped_backends": list(self.skipped_backends),
         })
         return message
 

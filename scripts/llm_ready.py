@@ -9,21 +9,22 @@ from llm.env import load_env
 
 load_env()
 
-from llm.backends import configured_backends
 from llm.client import LLMClient
-from llm.fallback import ready_backends
+from llm.registry import all_backends
 
-backends = configured_backends()
+backends = all_backends()
 
 if not backends:
-    print("No backends configured. Set OLLAMA_BASE_URL or hosted API keys.")
+    print("No backends configured. Set OLLAMA_BASE_URL, a hosted API key, or CHAOS_LLM_ENDPOINTS.")
     raise SystemExit(1)
 
+ready = []
 for backend in backends:
-    status = "READY" if LLMClient(backend).health() else "DOWN"
-    print(f"{backend.name}: {status} ({backend.base_url})")
+    status = LLMClient(backend).health()
+    if status:
+        ready.append(backend)
+    print(f"{backend.name}: {'READY' if status else 'DOWN'} ({backend.base_url})")
 
-ready = ready_backends(backends)
 print(f"\nReady backends: {len(ready)}/{len(backends)}")
 if not ready:
     raise SystemExit(1)

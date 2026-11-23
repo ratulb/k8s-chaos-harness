@@ -52,9 +52,11 @@ That question drives the design:
 - **Real substrate.** Faults happen in Kubernetes and etcd, not a mocked API.
 - **Harness-owned faults.** The injector is never visible to the model.
 - **Separate diagnosis and repair.** A correct guess is not a safe repair.
-- **Comparable backends.** The same scenarios run against `ollama`, `groq`,
-  `openrouter`, and `cloudflare`; there is no fallback chain, and each is a
-  comparable baseline rather than a reference/default path.
+- **Comparable backends with explicit provenance.** The same scenarios can run
+  against `ollama`, `groq`, `openrouter`, `cloudflare`, or arbitrary configured
+  OpenAI-compatible endpoints. `auto` and configured fallback chains keep runs
+  alive when one endpoint fails; each response records the backend that actually
+  answered.
 - **Auditability.** Messages, tools, approvals, repairs, and verification are
   stored in SQLite and can be replayed.
 - **Safety.** The model sees named tools, not a shell, and repairs are gated.
@@ -246,15 +248,20 @@ minimum member count, menu label, and summary.
 
 ## 7. Backends and configuration
 
-One backend is selected per run. There is no fallback chain; backends are
-comparable baselines.
+A run has a primary backend and an ordered fallback chain. `--backend auto`
+starts with the highest-priority configured endpoint; an explicit name stays the
+primary. All other configured endpoints are fallbacks unless
+`CHAOS_LLM_FALLBACK=0`. Failed candidates are skipped; the backend that answers
+is recorded in `llm_requests`, messages, and the `llm_response_full` artifact.
 
 | Backend | Meaning |
 | --- | --- |
+| `auto` | Highest-priority configured endpoint first, then the rest |
 | `ollama` | Self-hosted Ollama-compatible endpoint: local, tunneled, or compatible server |
 | `groq` | Hosted Groq API |
 | `openrouter` | Hosted OpenRouter API |
 | `cloudflare` | Hosted Cloudflare Workers AI API |
+| custom name | Any endpoint defined in `CHAOS_LLM_ENDPOINTS` |
 
 ```bash
 cp .env.example .env
@@ -274,6 +281,9 @@ commands can wait.
 | `GROQ_API_KEY`, `GROQ_MODEL` | Groq |
 | `OPENROUTER_API_KEY`, `OPENROUTER_MODEL` | OpenRouter |
 | `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_AUTH_TOKEN`, `CLOUDFLARE_MODEL` | Cloudflare |
+| `CHAOS_LLM_ENDPOINTS` | JSON list of arbitrary OpenAI-compatible endpoints |
+| `CHAOS_LLM_FALLBACK`, `CHAOS_LLM_MAX_ATTEMPTS` | Chain on/off and attempt cap |
+| `CHAOS_LLM_FALLBACK_RETRIES`, `CHAOS_LLM_HEALTH_SORT` | Per-endpoint retries and health-aware ordering |
 | `K8S_EASY_INSTALL` | Optional lab installer location |
 | `K8S_NODES`, `K8S_NODE_IPS` | Fallback host/IP hints |
 | `SSH_USER`, `SSH_KEY`, `PROBE_NODE` | Cluster access and probe override |
@@ -283,6 +293,19 @@ commands can wait.
 Temperature is fixed at `0.2`; `--seed` is recorded metadata, not model
 sampling control. Run from the repository root because `.env` and some default
 paths are working-directory sensitive; `./chaos run` uses the root for children.
+
+Extra endpoints are configured as a JSON list. Use `api_key_env` rather than
+putting keys in `.env` text:
+
+```bash
+export CHAOS_LLM_ENDPOINTS='[{"name":"gpu","base_url":"http://127.0.0.1:11435","model":"qwen3.8:27b","priority":1},{"name":"backup","base_url":"https://api.example.com/v1","model":"small","api_key_env":"BACKUP_API_KEY","priority":2}]'
+./chaos ping "hello" --backend auto
+./chaos run --scenario etcd-member-down --backend gpu --runs 1
+```
+
+`config_hash` records the selector and name/model chain for fallback runs, so
+resume cannot silently switch to a different policy. Health checks skip known
+dead endpoints before generation when `CHAOS_LLM_HEALTH_SORT=1`.
 
 ## 8. Quickstart
 
@@ -298,10 +321,11 @@ source .venv/bin/activate
 python3 scripts/llm_ready.py
 ```
 
-If the default `ollama` endpoint is not yours, either edit `OLLAMA_BASE_URL` and
-`OLLAMA_MODEL`, or select a hosted backend with
-`./chaos ping "hello" --backend groq|openrouter|cloudflare`. A successful ping
-prints the backend/model and the LLM reply before any cluster tooling is used.
+`./chaos ping` defaults to `auto`. To pin a primary, edit `OLLAMA_BASE_URL` and
+`OLLAMA_MODEL` and use `--backend ollama`, or select another backend with
+`--backend groq|openrouter|cloudflare|<custom-name>`. A successful ping prints
+the backend/model that answered, any fallback path, and the LLM reply before any
+cluster tooling is used.
 A first self-hosted call may load the model and take up to three minutes; `ping`
 prints a waiting message and makes one bounded attempt. `llm_ready.py` and
 `LLMClient.health()` only prove endpoint reachability, not generation speed.

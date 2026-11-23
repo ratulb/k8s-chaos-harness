@@ -17,9 +17,9 @@ from typing import Any
 ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from llm.backends import BACKEND_NAMES, build_backend
 from llm.client import LLMClient
 from llm.env import load_env
+from llm.registry import AUTO_BACKEND, backend_choices, resolve_backend
 from llm.response import LLMOutcome
 from replay import write_replay as write_replay_file
 from storage import sqlite_store as store_tools
@@ -212,7 +212,7 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
 
 
 def _ping(backend_name: str, message: str | None) -> int:
-    backend = build_backend(backend_name)
+    backend = resolve_backend(backend_name)
     client = LLMClient(backend)
     if not client.health():
         hints = {
@@ -221,8 +221,11 @@ def _ping(backend_name: str, message: str | None) -> int:
             "openrouter": "OPENROUTER_API_KEY, OPENROUTER_MODEL",
             "cloudflare": "CLOUDFLARE_ACCOUNT_ID, CLOUDFLARE_AUTH_TOKEN, CLOUDFLARE_MODEL",
         }
+        chain = " -> ".join(candidate.name for candidate in [backend, *backend.fallbacks])
+        print(f"No reachable LLM endpoint in chain: {chain}.", file=sys.stderr)
         print(f"LLM endpoint is not reachable for backend {backend.name} ({backend.base_url}).", file=sys.stderr)
-        print(f"Set {hints[backend.name]} in .env, then run: ./chaos ping --backend {backend.name}", file=sys.stderr)
+        hint = hints.get(backend.name, "CHAOS_LLM_ENDPOINTS")
+        print(f"Set {hint} in .env, then run: ./chaos ping --backend {backend.name}", file=sys.stderr)
         return 1
     if message is None:
         try:
@@ -254,7 +257,13 @@ def _ping(backend_name: str, message: str | None) -> int:
         choice = (response.raw.get("choices") or [{}])[0]
         reasoning = str((choice.get("message") or {}).get("reasoning") or "").strip()
         content = f"(no content; reasoning: {reasoning[:200]})" if reasoning else "(empty response)"
-    print(f"{backend.name} / {backend.model}")
+    used_backend = response.backend or backend.name
+    used_model = response.model or backend.model
+    print(f"{used_backend} / {used_model}")
+    if response.skipped_backends:
+        print(f"skipped unhealthy: {', '.join(response.skipped_backends)}")
+    if response.fallback_from:
+        print(f"fallback from {' -> '.join(response.fallback_from)}")
     print(content)
     return 0
 
@@ -268,7 +277,7 @@ def main(argv: list[str] | None = None) -> int:
 
     ping = sub.add_parser("ping", help="Check the configured LLM brain with a one-shot prompt; no cluster needed")
     ping.add_argument("message", nargs="?", default=None)
-    ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", "ollama"), choices=list(BACKEND_NAMES))
+    ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", AUTO_BACKEND), choices=backend_choices())
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
@@ -302,7 +311,7 @@ def main(argv: list[str] | None = None) -> int:
 
     run = sub.add_parser("run")
     run.add_argument("--scenario", required=True)
-    run.add_argument("--backend", required=True, choices=list(BACKEND_NAMES))
+    run.add_argument("--backend", required=True, choices=backend_choices())
     run.add_argument("--mode", choices=["benchmark", "repair"], default="benchmark")
     run.add_argument("--approve", choices=["policy", "prompt"], default="policy")
     run.add_argument("--runs", type=int, default=1)
