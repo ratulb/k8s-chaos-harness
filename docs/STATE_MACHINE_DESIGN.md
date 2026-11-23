@@ -8,6 +8,24 @@ This document is a design proposal only. No runtime behavior is changed by this
 document. It is intended to give reviewers enough concrete detail to comment on
 state ownership, transitions, persistence, compatibility, tests, and rollout.
 
+## Decision summary
+
+These are the decisions a reviewer needs to approve. The rest of the document is
+the defense.
+
+| Decision | Short form | Section |
+|---|---|---|
+| Three machines | Gate, run lifecycle, tool call; no reset-ladder, topology, LLM-loop, export, or health machine. | §3.3 |
+| Pure core | `transition(state, event) -> Transition` plus a transactional persistence shell. | §4 |
+| No schema bump | Events and paths use existing `trace_events` and `run_artifacts` tables. | §10.1 |
+| Receipt derivation | `approved:<current run_id>`, derived by fold, absent from payloads; retries get a new receipt. | §5.7 |
+| `INTERRUPTED` | Parked nonterminal, resumable, reason-required state with an operator `--abandon` path. | §6.2, §6.6 |
+| Fallback identity | Responder is provenance; chain identity stays on the run; headline grouped by `chain_id`. | §1.3, §9.2 |
+| Tool status v1 | New states are internal aliases; v1 persists legacy `finished`/`failed` plus a typed `result.code`. | §7.2, §10.1 |
+| Scorer v1 | `gate-path-v1` is annotation-only for one release; parity report is public. | §9.4 |
+| Lease safety | Setup lease renewal lands before the reaper is enabled. | §6.6 |
+| Cross-machine order | Tool fold, then gate fold, then run fold; unknown mutating effect escalates outward. | §8.4 |
+
 ## 0. Executive summary
 
 The harness already behaves like three small state machines:
@@ -32,7 +50,8 @@ Rollout order:
 3. add setup-phase lease renewal, lifecycle transitions, and a reaper that
    derives `interrupted`;
 4. cut over tool calls and typed outcomes;
-5. switch scoring to a path-based scorer only after parity;
+5. publish `gate-path-v1` as an annotation-only scorer for one release, with a
+   public parity report, before any canonical switch;
 6. leave the optional cluster-health observer out of the first implementation.
 
 ## 1. Review inputs and decisions
@@ -84,8 +103,15 @@ The fallback-eligibility question in `new_feedback.md` is settled:
 - With fallback enabled, comparability has three dimensions: scenario,
   temperature (fixed at `0.2`), and chain configuration. `--seed` is recorded
   metadata, not sampling control.
+- When all configured candidates fail, the end reason is exactly
+  `provider_error_all`; the ordered attempts and their error codes remain in the
+  event payload. There is no `provider_error_<last>` variant.
+- A `chain_id` is derived from the ordered endpoint list and stored as a run
+  projection. Fallback-enabled headline rates are grouped by `chain_id`, not by
+  `backend`; per-backend baselines remain separate and require
+  `CHAOS_LLM_FALLBACK=0`.
 
-The path scorer in §10 must preserve these rules.
+The path scorer in §9 must preserve these rules.
 
 ## 2. Current state, as built
 
@@ -219,14 +245,17 @@ does not determine run completion.
 
 ### 3.2 Invariants
 
-1. Every persisted state has a `StateSpec` with wire value, rank, terminality,
-   end-reason requirement, and crash action.
-2. Terminal run states require `end_reason`.
+1. Every persisted state has a `StateSpec` with wire value, rank, `terminal`,
+   `resumable`, `end_reason_required`, and crash action.
+2. Terminal run states and parked `INTERRUPTED` runs require `end_reason`;
+   resumability is a separate dimension from terminality.
 3. `FINISHED` requires a score row and final record artifact.
 4. Only the persistence shell writes state projections.
 5. The reducer never performs I/O or reads the clock.
-6. Every event is idempotent by `(run_id, machine, seq)`.
-7. Illegal transitions append a rejection event and do not mutate state.
+6. Replay is idempotent by `(run_id, machine, seq)`. Generated events without a
+   producer seq, such as `REAP`, carry an `idempotency_key` checked before append.
+7. Illegal transitions append a rejection event, do not mutate projections, and
+   make `apply()` raise after recording.
 8. Gate final verification belongs to the run machine, not the gate machine.
 9. Export is outside both machines.
 10. Fallback responder provenance never overwrites chain identity fields.
@@ -304,14 +333,19 @@ class StateSpec:
     value: str
     rank: int
     terminal: bool
+    resumable: bool
     run_terminal: bool
     end_reason_required: bool
     crash_action: CrashAction | None
     renew_lease: bool = False
 ```
 
-`State`, `Event`, `CrashAction`, and `EndReason` are enums or frozen dataclasses
-in each machine module. The core is generic over those types.
+`terminal` means no further in-process work is expected. `resumable` means a
+new process may continue the state after a crash; `INTERRUPTED` is `terminal =
+false, resumable = true, end_reason_required = true`. `run_terminal` is only true
+for run-level end states. `State`, `Event`, `CrashAction`, and `EndReason` are
+enums or frozen dataclasses in each machine module. The core is generic over
+those types.
 
 ### 4.3 Event envelope
 
@@ -358,19 +392,45 @@ reports do not break.
 The pure function changes nothing. A shell applies it:
 
 ```python
-def apply(run_id: str, machine: MachineKind, event: MachineEvent) -> State:
+def apply(run_id: str, machine: MachineKind, event: MachineEvent) -> Transition:
     before = load_state(run_id, machine)
     try:
         result = transition(machine, before, event)
     except IllegalTransition as exc:
-        append_event(run_id, "state_transition_rejected", {...})
+        with sqlite_transaction():
+            append_event(run_id, "state_transition_rejected", {
+                "machine": machine.value,
+                "event": event.type,
+                "state_before": before.value,
+                "error": str(exc),
+            })
         raise
+
     with sqlite_transaction():
+        prior = find_idempotent_transition(run_id, machine, event)
+        if prior is not None:
+            return prior
         append_transition_event(run_id, machine, before, result, event)
         write_projections(run_id, machine, result.state, result.effects)
+
     execute_effects(run_id, result.effects)
-    return result.state
+    return result
 ```
+
+`find_idempotent_transition()` checks `(run_id, machine, event.type,
+event.idempotency_key)` when the key is present. The check and append happen in
+the same SQLite transaction; the harness has a single writer, so two reaper
+ticks cannot both append the same generated transition. No new table or column
+is needed because the key lives in the event payload.
+
+`apply()` returns the whole `Transition` so callers can log state, effects, and
+reason without recomputing them. It raises `IllegalTransition` after recording
+the rejection. Caller contract:
+
+- run loop: map an illegal transition to `ABORTED(reason=state_machine_bug)`;
+- reaper: log and skip the affected run; do not retry the same event blindly;
+- resume: fail closed and report the bug instead of continuing with stale state;
+- shadow comparison: log the mismatch and continue using legacy behavior.
 
 `execute_effects()` may emit compatibility events, write scalar columns, update
 `state_json`, record violations, or trigger abort-and-retry. The reducer only
@@ -392,8 +452,9 @@ def fold(machine: MachineKind, events: Sequence[TraceEvent], context: Context) -
 `scripts/gen_state_diagrams.py` imports the machine tables and writes
 `docs/STATE_MACHINE.md`. Each state contributes a node with its wire value,
 terminality, and crash action. Each transition contributes an edge labeled with
-the event and guard. The generator fails if a state has no `StateSpec` or a
-terminal state lacks an end reason.
+the event and guard. The generator fails if a state has no `StateSpec`, if a
+terminal or parked-resumable state lacks an end reason, or if a resumable state
+lacks a crash action.
 
 ## 5. Gate machine
 
@@ -405,16 +466,18 @@ not write run terminal status.
 
 ### 5.2 State specs
 
-| State | Wire value | Terminal | Run terminal | End reason required | Crash action |
-|---|---|---|---|---|---|
-| `AWAIT_DIAGNOSIS` | `await_diagnosis` | no | no | no | resume |
-| `APPROVED` | `approved` | no | no | no | resume; abort if mutating tool unknown |
-| `REPAIRED` | `repaired` | yes, gate-local | no | no | none |
-| `CLEARED` | `cleared` | yes, gate-local | no | no | none |
-| `ESCALATED` | `escalated` | yes, gate-local | no | yes | none |
+| State | Wire value | Agent-loop terminal | Run terminal | Resumable | End reason required | Crash action |
+|---|---|---|---|---|---|---|
+| `AWAIT_DIAGNOSIS` | `await_diagnosis` | no | no | yes | no | resume |
+| `APPROVED` | `approved` | no | no | yes | no | resume; abort if mutating tool unknown |
+| `REPAIRED` | `repaired` | yes | no | no | no | none |
+| `CLEARED` | `no_fault_cleared` | yes | no | no | no | none |
+| `ESCALATED` | `escalated` | yes | no | no | yes | none |
 
-Gate-local terminal means the agent loop should stop. The run machine still owns
-the run's status and final verification.
+Agent-loop terminal means the agent loop should stop. It is not run terminality;
+the run machine still owns the run's status and final verification. The
+`no_fault_cleared` wire value is chosen for log readability; the legacy adapter
+maps `cleared` to `CLEARED`.
 
 ### 5.3 Boundary classifiers
 
@@ -438,32 +501,67 @@ This keeps the pure machine independent of scenario JSON and string prefixes.
 | Event | Payload |
 |---|---|
 | `DIAGNOSIS_SUBMITTED` | `label`, `correct`, `is_no_fault`, `attempts`, `first_attempt_correct`, `source` |
-| `NUDGE` | `step`, `kind` (`no_tool` or `budget`) |
+| `NUDGE` | `step`, `kind` (`no_tool` or `budget`), `nudge_count` |
 | `REPAIR_PROPOSED` | `canonical_name`, `acceptable`, `forbidden`, `args` |
 | `REPAIR_FINISHED` | `status`, `timed_out`, `result_summary` |
 | `ESCALATE` | `reason` |
-| `BUDGET_EXHAUSTED` | `reason` |
-| `ABORT` | `reason` |
+| `BUDGET_EXHAUSTED` | `reason`, `detail` |
+| `ABORT` | `reason`, `actor` |
+| `UNKNOWN_EFFECT` | `tool_call_id`, `reason` |
+
+Gate state carries `nudge_count`, incremented only by `NUDGE`. `MAX_NUDGES = 2`;
+a further nudge is not emitted. A cap reached without a diagnosis emits
+`BUDGET_EXHAUSTED(reason=budget_tokens)`.
 
 ### 5.5 Transition table
 
-| From | Event | Guard | To | Effects |
+| From | Event | Guard | To | End reason | Effects |
+|---|---|---|---|---|---|
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and no-fault | `CLEARED` | none | record attempt, issue receipt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and not no-fault | `APPROVED` | none | record attempt, issue receipt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, below cap | `AWAIT_DIAGNOSIS` | none | record attempt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, cap reached | `ESCALATED` | `diagnosis_attempts_exhausted` | record attempt |
+| `AWAIT_DIAGNOSIS` | `NUDGE` | `nudge_count < MAX_NUDGES` | `AWAIT_DIAGNOSIS` | none | increment `nudge_count`, emit nudge event |
+| `AWAIT_DIAGNOSIS` | `NUDGE` / `BUDGET_EXHAUSTED` | nudge cap reached or token budget exhausted | `ESCALATED` | `budget_tokens` | record budget terminal |
+| `AWAIT_DIAGNOSIS` | `REPAIR_PROPOSED` | always | `AWAIT_DIAGNOSIS` | none | record `premature_repair` violation |
+| `AWAIT_DIAGNOSIS` | `ESCALATE` | always | `ESCALATED` | event `reason` | set end reason |
+| `AWAIT_DIAGNOSIS` | `ABORT` | actor is operator | `ESCALATED` | `abandoned` | set end reason |
+| `APPROVED` | `REPAIR_PROPOSED` | forbidden | `APPROVED` | none | record `forbidden_repair` violation |
+| `APPROVED` | `REPAIR_PROPOSED` | not acceptable | `APPROVED` | none | record `unacceptable_repair` violation |
+| `APPROVED` | `REPAIR_PROPOSED` | acceptable | `APPROVED` | none | record proposed repair projection only |
+| `APPROVED` | `REPAIR_FINISHED` | success | `REPAIRED` | none | record typed repair success |
+| `APPROVED` | `REPAIR_FINISHED` | failure or timeout | `APPROVED` | none | record typed repair failure |
+| `APPROVED` | `UNKNOWN_EFFECT` | mutating tool ended unknown | `ESCALATED` | `unknown_effect` | set end reason; shell triggers retry |
+| `APPROVED` | `ESCALATE` / `BUDGET_EXHAUSTED` / `ABORT` | always | `ESCALATED` | mapped reason below | set end reason |
+| `CLEARED` | `REPAIR_PROPOSED` | always | `CLEARED` | none | record `repair_after_no_fault` violation |
+| `REPAIRED` / `CLEARED` / `ESCALATED` | any | always | reject | unchanged | append rejection event |
+
+End-reason mapping and precedence:
+
+- `ESCALATE` uses `event.reason` verbatim.
+- `BUDGET_EXHAUSTED` always maps to `budget_tokens`; `event.detail` is retained
+  in the transition payload.
+- `ABORT` maps to `abandoned` when `actor=operator`; other abort reasons are used
+  verbatim.
+- If multiple terminal events arrive in one step, precedence is
+  `BUDGET_EXHAUSTED` > `ESCALATE` > `ABORT`. They should not co-occur in valid
+  control flow.
+
+#### 5.5.1 Escalation reason contract
+
+| Reason | Source | Strict success | Headline treatment | Funnel visibility |
 |---|---|---|---|---|
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and no-fault | `CLEARED` | record attempt, issue receipt |
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and not no-fault | `APPROVED` | record attempt, issue receipt |
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, below cap | `AWAIT_DIAGNOSIS` | record attempt |
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, cap reached | `ESCALATED` | record attempt, set end reason `diagnosis_attempts_exhausted` |
-| `AWAIT_DIAGNOSIS` | `NUDGE` | always | `AWAIT_DIAGNOSIS` | emit nudge event |
-| `AWAIT_DIAGNOSIS` | `REPAIR_PROPOSED` | always | `AWAIT_DIAGNOSIS` | record `premature_repair` violation |
-| `AWAIT_DIAGNOSIS` | `ESCALATE` / `BUDGET_EXHAUSTED` / `ABORT` | always | `ESCALATED` | set end reason |
-| `APPROVED` | `REPAIR_PROPOSED` | forbidden | `APPROVED` | record `forbidden_repair` violation |
-| `APPROVED` | `REPAIR_PROPOSED` | not acceptable | `APPROVED` | record `unacceptable_repair` violation |
-| `APPROVED` | `REPAIR_PROPOSED` | acceptable | `APPROVED` | record proposed repair projection only |
-| `APPROVED` | `REPAIR_FINISHED` | success | `REPAIRED` | record typed repair success |
-| `APPROVED` | `REPAIR_FINISHED` | failure or timeout | `APPROVED` | record typed repair failure |
-| `APPROVED` | `ESCALATE` / `BUDGET_EXHAUSTED` / `ABORT` | always | `ESCALATED` | set end reason |
-| `CLEARED` | `REPAIR_PROPOSED` | always | `CLEARED` | record `repair_after_no_fault` violation |
-| `REPAIRED` / `CLEARED` / `ESCALATED` | any | always | reject | append rejection event |
+| `diagnosis_attempts_exhausted` | wrong diagnosis at cap | false | excluded from strict numerator, included in denominator | diagnosis failure funnel |
+| `budget_tokens` | nudge/token cap | false | excluded from strict numerator, included in denominator | budget funnel |
+| `premature_repair` | repair before diagnosis | false via violations | excluded from strict numerator, included in denominator | violation funnel |
+| `forbidden_repair` | forbidden tool | false via violations | excluded from strict numerator, included in denominator | violation funnel |
+| `repair_after_no_fault` | repair on control run | false via violations | excluded from strict numerator, included in denominator | control-violation funnel |
+| `unknown_effect` | mutating tool crash | false | excluded from strict numerator, included in denominator | abort/retry funnel |
+| `state_machine_bug` | illegal transition | false | excluded from strict numerator, included in denominator | harness bug funnel |
+
+Run-level reasons such as `provider_error_all`, `fault_not_observed`,
+`injection_failed`, and `abandoned` are not gate reasons; they are enumerated in
+§6 and obey the same "excluded numerator, visible denominator" rule.
 
 ### 5.6 Example paths
 
@@ -489,6 +587,9 @@ AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(no_fault)--> CLEARED
 CLEARED --REPAIR_PROPOSED(any)--> CLEARED + violation
 ```
 
+A control run that attempts a repair stays `CLEARED`, but the violation makes it
+a strict failure by design; see §9.2.
+
 ### 5.7 Receipt model
 
 The gate receipt is deterministic:
@@ -498,6 +599,9 @@ def receipt_for(run_id: str) -> str:
     return f"approved:{run_id}"
 ```
 
+- The receipt is always `approved:<run_id>` where `run_id` is the current run's
+  ID. A retry gets a new `run_id` and therefore a new receipt; the old receipt
+  is never carried into the retry.
 - The fold derives receipt issuance from a correct diagnosis event.
 - The raw receipt is not stored in approval event payloads.
 - Messages, UI, exports, and replay continue to redact receipts.
@@ -521,23 +625,26 @@ authorization.
 
 ### 6.2 State specs
 
-| State | `status` | `phase` | Terminal | End reason required | Crash action |
-|---|---|---|---|---|---|
-| `PENDING` | `pending` | `queued` | no | no | new run |
-| `LEASED` | `running` | `leased` | no | no | new run |
-| `RESETTING` | `running` | `resetting` | no | no | new run |
-| `BASELINING` | `running` | `baseline` | no | no | new run |
-| `INJECTING` | `running` | `injecting` | no | no | new run after reset |
-| `FAULT_CHECK` | `running` | `fault_check` | no | no | new run after reset |
-| `AGENT_RUNNING` | `running` | `agent_running` | no | no | resume or retry |
-| `VERIFYING` | `running` | `verifying` | no | no | rerun verify |
-| `FINISHED` | `finished` | `finished` | yes | yes | none |
-| `ABORTED` | `aborted` | `aborted` | yes | yes | none |
-| `INTERRUPTED` | `interrupted` | `interrupted` | no, resume candidate | yes | per previous state |
-| `SKIPPED_UNSUPPORTED` | `skipped_unsupported` | `skipped_unsupported` | yes | yes | none |
+| State | `status` | `phase` | Terminal | Resumable | End reason required | Crash action |
+|---|---|---|---|---|---|---|
+| `PENDING` | `pending` | `queued` | no | yes | no | resume (re-lease) |
+| `LEASED` | `running` | `leased` | no | yes | no | resume (re-lease) |
+| `RESETTING` | `running` | `resetting` | no | yes | no | resume (re-lease) |
+| `BASELINING` | `running` | `baseline` | no | yes | no | resume (re-lease) |
+| `INJECTING` | `running` | `injecting` | no | yes | no | new run after reset |
+| `FAULT_CHECK` | `running` | `fault_check` | no | yes | no | new run after reset |
+| `AGENT_RUNNING` | `running` | `agent_running` | no | yes | no | resume or retry |
+| `VERIFYING` | `running` | `verifying` | no | yes | no | rerun verify |
+| `INTERRUPTED` | `interrupted` | `interrupted` | no | yes | yes | per previous state |
+| `FINISHED` | `finished` | `finished` | yes | no | yes | none |
+| `ABORTED` | `aborted` | `aborted` | yes | no | yes | none |
+| `SKIPPED_UNSUPPORTED` | `skipped_unsupported` | `skipped_unsupported` | yes | no | yes | none |
 
-`INTERRUPTED` is not a true terminal state: it is a recoverable parked state
-with a required reason. It remains in resume candidate queries.
+`INTERRUPTED` is a parked nonterminal state: resumable, reason-required, and
+included in resume candidate queries. `--abandon` moves it to
+`ABORTED(reason=abandoned)` so it cannot sit in limbo indefinitely. The crash
+action for an interrupted run is keyed by the `previous_state` recorded in the
+`LEASE_EXPIRED` payload, not by `INTERRUPTED` itself.
 
 ### 6.3 Events
 
@@ -555,59 +662,80 @@ with a required reason. It remains in resume candidate queries.
 | `AGENT_TERMINAL` | `reason` |
 | `VERIFY_OK` / `VERIFY_FAILED` | `output_ref` |
 | `ABORT` | `reason`, `actor` |
-| `LEASE_EXPIRED` | `reason`, `detected_by` |
-| `REAP` | `from_state`, `owner_status` |
+| `ABANDON` | `actor`, `reason=abandoned` |
+| `PROVIDER_ERROR_ALL` | `attempts`, `errors`, `last_backend`, `chain_id` |
+| `ILLEGAL_TRANSITION` | `machine`, `event`, `state_before`, `error` |
+| `LEASE_EXPIRED` | `reason`, `detected_by`, `previous_state`, `lease_expires_at`, `idempotency_key` |
+| `REAP` | `from_state`, `owner_status`, `lease_expires_at`, `idempotency_key` |
 
 ### 6.4 Transition table
 
-| From | Event | To | Effects |
-|---|---|---|---|
-| none | `CREATE` | `PENDING` | create run row, emit event |
-| `PENDING` | `LEASE` | `LEASED` | acquire lease |
-| `PENDING` / `LEASED` | `SKIP_UNSUPPORTED` | `SKIPPED_UNSUPPORTED` | set reason, write terminal record |
-| `LEASED` | `BEGIN_RESET` | `RESETTING` | start setup renewal |
-| `RESETTING` | `RESET_OK` | `BASELINING` | stop no renewal yet |
-| `RESETTING` | `RESET_FAILED` | `ABORTED` | `reset_failed`, release lease |
-| `BASELINING` | `BASELINE_OK` | `INJECTING` | none |
-| `BASELINING` | `BASELINE_FAILED` | `ABORTED` | `baseline_failed`, release lease |
-| `INJECTING` | `INJECT_OK` | `FAULT_CHECK` | none |
-| `INJECTING` | `INJECT_FAILED` | `ABORTED` | `injection_failed`, release lease |
-| `FAULT_CHECK` | `FAULT_OBSERVED` | `AGENT_RUNNING` | pass `fault_present=true` to agent |
-| `FAULT_CHECK` | `FAULT_NOT_OBSERVED` | `ABORTED` | `fault_not_observed`, release lease |
-| `AGENT_RUNNING` | `AGENT_DONE` | `VERIFYING` | carry gate outcome into score path |
-| `AGENT_RUNNING` | `AGENT_TERMINAL` | `ABORTED` | gate escalation, budget, or provider error |
-| `VERIFYING` | `VERIFY_OK` | `FINISHED` | write score and final record, release lease |
-| `VERIFYING` | `VERIFY_FAILED` | `FINISHED` | write score with `verify_ok=false`, release lease |
-| any nonterminal | `ABORT` | `ABORTED` | typed abort reason, release lease |
-| any nonterminal | `LEASE_EXPIRED` | `INTERRUPTED` | typed reason, preserve previous state in payload |
-| terminal | any | reject | append rejection event |
+| From | Event | To | End reason | Effects |
+|---|---|---|---|---|
+| none | `CREATE` | `PENDING` | none | create run row, emit event |
+| `PENDING` | `LEASE` | `LEASED` | none | acquire lease |
+| `PENDING` / `LEASED` | `SKIP_UNSUPPORTED` | `SKIPPED_UNSUPPORTED` | `unsupported` | set reason, write terminal record |
+| `LEASED` | `BEGIN_RESET` | `RESETTING` | none | start setup renewal |
+| `RESETTING` | `RESET_OK` | `BASELINING` | none | continue lease renewal through baseline |
+| `RESETTING` | `RESET_FAILED` | `ABORTED` | `reset_failed` | release lease |
+| `BASELINING` | `BASELINE_OK` | `INJECTING` | none | continue lease renewal |
+| `BASELINING` | `BASELINE_FAILED` | `ABORTED` | `baseline_failed` | release lease |
+| `INJECTING` | `INJECT_OK` | `FAULT_CHECK` | none | continue lease renewal |
+| `INJECTING` | `INJECT_FAILED` | `ABORTED` | `injection_failed` | release lease |
+| `FAULT_CHECK` | `FAULT_OBSERVED` | `AGENT_RUNNING` | none | pass `fault_present=true` to agent |
+| `FAULT_CHECK` | `FAULT_NOT_OBSERVED` | `ABORTED` | `fault_not_observed` | release lease |
+| `AGENT_RUNNING` | `AGENT_DONE` | `VERIFYING` | none | carry gate outcome into score path |
+| `AGENT_RUNNING` | `AGENT_TERMINAL` | `ABORTED` | gate end reason | gate escalation or budget |
+| `AGENT_RUNNING` | `PROVIDER_ERROR_ALL` | `ABORTED` | `provider_error_all` | persist ordered attempts, release lease |
+| `VERIFYING` | `VERIFY_OK` | `FINISHED` | `verify_ok` | write score and final record, release lease |
+| `VERIFYING` | `VERIFY_FAILED` | `FINISHED` | `verify_failed` | write score and final record, `verify_ok=false`, release lease |
+| any nonterminal, including `INTERRUPTED` | `ABORT` | `ABORTED` | typed abort reason | release lease |
+| `INTERRUPTED` | `ABANDON` | `ABORTED` | `abandoned` | release lease |
+| any nonterminal | `ILLEGAL_TRANSITION` | `ABORTED` | `state_machine_bug` | log machine/event, release lease |
+| any nonterminal | `LEASE_EXPIRED` | `INTERRUPTED` | `lease_expired` | preserve previous state and idempotency key |
+| terminal | any | reject | unchanged | append rejection event |
+
+An `ILLEGAL_TRANSITION` reaching the run machine is always a harness bug. It
+must not be treated as a successful continue; the run aborts with
+`state_machine_bug` and the rejection event remains in the trace.
 
 ### 6.5 Resume triage as crash-action lookup
 
-| State in interrupted run | Action | Rationale |
+The key is the `previous_state` stored in the `LEASE_EXPIRED` payload. If it is
+missing, the reaper aborts with `interrupted_unknown_previous_state`.
+
+| Previous state | Action | Rationale |
 |---|---|---|
-| `PENDING`, `LEASED`, `RESETTING`, `BASELINING` | new run | Nothing has been injected. |
+| `PENDING`, `LEASED`, `RESETTING`, `BASELINING` | resume (re-lease) | No fault has been injected; a new row would orphan the existing run. |
 | `INJECTING`, `FAULT_CHECK` | new run after reset | Fault may be half-applied or unproven. |
 | `AGENT_RUNNING` | resume | Conversation and gate state can be replayed. |
-| `AGENT_RUNNING` with mutating tool `UNKNOWN_EFFECT` | abort and retry | Repair may have side effects. |
+| `AGENT_RUNNING` with mutating tool `UNKNOWN_EFFECT` | abort and retry; gate `APPROVED -> ESCALATED(unknown_effect)` | Repair may have side effects; see §8.4. |
 | `VERIFYING` | rerun verify | Verification is read-only. |
 | terminal | no action | Already complete. |
 
 `--force-resume` continues to bypass config-hash mismatch only. It never
-bypasses topology mismatch or an unknown mutating effect.
+bypasses topology mismatch or an unknown mutating effect. `--abandon` is the
+explicit operator path out of `INTERRUPTED`.
 
 ### 6.6 Lease renewal and reaper
 
 - Keep the 300-second lease TTL.
 - Extend `LeaseRenewer` to setup phases. Without this, a 900-second reset would
-  look crashed.
+  look crashed. Enable the reaper only after this renewal covers reset,
+  baseline, inject, and fault-check phases.
+- The reaper lives in `harness/reaper.py`. It is invoked by `chaos_cli.py` at
+  startup and by `./chaos status`.
 - The reaper/startup sweep scans nonterminal runs with expired leases and no
   live owner, then emits `run.lease_expired`.
 - The reaper never runs from the crashed process.
-- The sweep is idempotent: repeated detection of the same expired lease does not
-  append duplicate transitions.
-- `interrupted` records the previous state in the event payload so resume can
-  pick the crash action.
+- The generated event carries
+  `idempotency_key = "reap:{run_id}:{previous_state}:{lease_expires_at}"`.
+  `apply()` finds an existing transition with that key before appending, so
+  repeated detection is a no-op even with different append-only `seq` values.
+- `interrupted` records `previous_state`, `lease_expires_at`, and the
+  idempotency key in the event payload so resume can pick the crash action.
+- `./chaos abort <run_id> --abandon` moves `INTERRUPTED` to
+  `ABORTED(reason=abandoned)` for operator-driven cleanup.
 
 ### 6.7 Verify and export boundaries
 
@@ -626,18 +754,22 @@ rows and result strings.
 
 ### 7.2 State specs
 
-| State | Persisted status | Terminal | Mutating semantics |
-|---|---|---|---|
-| `INTENDED` | `proposed` | no | intent persisted before execution |
-| `STARTED` | `started` | no | execution began |
-| `SUCCEEDED` | `finished` | yes | typed success |
-| `FAILED` | `failed` | yes | typed failure |
-| `DENIED` | `denied` | yes | gate denied before execution |
-| `UNKNOWN_EFFECT` | `unknown_effect` | yes | mutating outcome unknown |
-| `SUPERSEDED` | `superseded` | yes | read-only call closed by resume |
+| State | v1 persisted status | v1 `result.code` | Terminal | Mutating semantics |
+|---|---|---|---|---|
+| `INTENDED` | `proposed` | none | no | intent persisted before execution |
+| `STARTED` | `started` | none | no | execution began |
+| `SUCCEEDED` | `finished` | `success` | yes | typed success |
+| `FAILED` | `failed` | typed failure code | yes | typed failure |
+| `DENIED` | `denied` | `denied` | yes | gate denied before execution |
+| `UNKNOWN_EFFECT` | `failed` | `unknown_effect` | yes | mutating outcome unknown |
+| `SUPERSEDED` | `finished` | `superseded_after_resume` | yes | read-only call closed by resume |
 
-Existing status strings remain readable. New strings are valid in the existing
-TEXT column, so no schema bump is needed.
+The new state names are internal machine states for the first release. They map
+to existing persisted status strings plus a typed code stored in the existing
+`result` TEXT field as JSON, so no schema bump is needed and old
+`status IN ('finished', 'failed', 'denied')` queries do not silently skip rows.
+Cleanup phase may promote them to first-class statuses after every query in
+`score.py`, `replay.py`, and `storage/sqlite_store.py` is audited.
 
 ### 7.3 Events
 
@@ -648,22 +780,28 @@ TEXT column, so no schema bump is needed.
 | `SUCCESS` | typed result, artifact ref |
 | `FAILURE` | typed error, artifact ref |
 | `DENY` | `reason`, `violation_kind` |
+| `CANCEL` | `reason`, `detected_by` |
 | `LEASE_EXPIRED` | `mutating`, `detected_by` |
 | `RESUME_SUPERSEDE` | `reason` |
 
 ### 7.4 Transition table
 
-| From | Event | To | Effects |
-|---|---|---|---|
-| none | `PREPARE` | `INTENDED` | persist intent before execution |
-| `INTENDED` | `START` | `STARTED` | update status |
-| `STARTED` | `SUCCESS` | `SUCCEEDED` | persist typed result |
-| `STARTED` | `FAILURE` | `FAILED` | persist typed error |
-| `INTENDED` / `STARTED` | `DENY` | `DENIED` | record violation, no execution |
-| `STARTED` | `LEASE_EXPIRED` | `UNKNOWN_EFFECT` if mutating | force abort-and-retry |
-| `STARTED` | `LEASE_EXPIRED` | `SUPERSEDED` if read-only | allow resume |
-| `INTENDED` / `STARTED` | `RESUME_SUPERSEDE` | `SUPERSEDED` | read-only only |
-| terminal | any | reject | append rejection event |
+| From | Event | Guard | To | Effects |
+|---|---|---|---|---|
+| none | `PREPARE` | always | `INTENDED` | persist intent before execution |
+| `INTENDED` | `START` | always | `STARTED` | update status |
+| `STARTED` | `SUCCESS` | always | `SUCCEEDED` | persist typed result |
+| `STARTED` | `FAILURE` | always | `FAILED` | persist typed error |
+| `INTENDED` | `DENY` | gate denied before execution | `DENIED` | record violation, no execution |
+| `STARTED` | `DENY` | always | reject | append `state_transition_rejected` event |
+| `STARTED` | `CANCEL` | mutating | `UNKNOWN_EFFECT` | force abort-and-retry |
+| `STARTED` | `LEASE_EXPIRED` | mutating | `UNKNOWN_EFFECT` | force abort-and-retry |
+| `STARTED` | `LEASE_EXPIRED` | read-only | `SUPERSEDED` | allow resume |
+| `INTENDED` / `STARTED` | `RESUME_SUPERSEDE` | read-only | `SUPERSEDED` | allow resume |
+| terminal | any | always | reject | append rejection event |
+
+Denial is only valid before execution. A post-start cancellation cannot claim
+`DENIED`; it must surface as `UNKNOWN_EFFECT` for mutating calls.
 
 ### 7.5 Typed outcomes
 
@@ -706,13 +844,36 @@ During rollout, `harness/machines/adapters.py` maps old events to machine events
 | `approval` event with `granted=false` | `gate.diagnosis_submitted(wrong)` |
 | `nudge` event or early no-tool user message | `gate.nudge` |
 | denied repair tool call | `gate.repair_proposed` with typed violation |
-| finished repair tool call | `gate.repair_finished` |
+| finished repair tool call | `gate.repair_finished`; typed status extracted by the same classifier as §7.5 |
 | `reset`, `baseline`, `inject`, `fault_check` | corresponding `run.*` events |
 | `verify` / `record` | `run.verify_*` / run finish |
 | `tool_calls.status` rows | `tool.*` events |
 
 The adapter is used for shadow comparison and old-run scoring. New runs emit
 both canonical and legacy events during cutover.
+
+### 8.4 Cross-machine coordination
+
+Machines never call each other directly. A recovery pass folds all three in a
+fixed order and observes the results:
+
+1. tool machine, per call, from `tool.*` events and `tool_calls` rows;
+2. gate machine from `gate.*` and legacy adapter events;
+3. run machine from `run.*` and legacy adapter events.
+
+The run machine consumes gate terminal state and tool outcome as read-only
+observations. Rules:
+
+- mutating tool `UNKNOWN_EFFECT` → gate `APPROVED -> ESCALATED(unknown_effect)`
+  → run `AGENT_RUNNING -> ABORTED(unknown_effect)` with `ABORT_AND_RETRY`;
+- gate `REPAIRED` or `CLEARED` → run `AGENT_DONE -> VERIFYING`;
+- gate `ESCALATED` → run `AGENT_TERMINAL -> ABORTED` with the gate end reason;
+- tool `SUPERSEDED` on a read-only call → no gate or run transition; resume
+  proceeds from the gate fold.
+
+Coordination effects are deterministic and replayable. The shell executes them
+after all folds agree, so a partial crash cannot leave the gate in `APPROVED`
+while the run has already retried.
 
 ## 9. Scoring from machine paths
 
@@ -739,6 +900,10 @@ It is stored as a `run_artifacts` row with kind `gate_path`, and its fields are
 merged into the score payload. No schema change is required because artifacts
 and score payloads already accept JSON.
 
+`receipt_issued` is set by the fold when `DIAGNOSIS_SUBMITTED(correct)` is
+applied and `receipt_for(run_id)` was issued. `GatePath` is a derived artifact,
+not a projection, and is never used as an authoritative source for gate state.
+
 ### 9.2 Path-based strict success
 
 ```text
@@ -750,14 +915,26 @@ strict_v3 = true iff
   and first_attempt_correct
   and receipt_issued
   and verify_ok
-  and no violations
-  and end_reason is not excluded
-  and end_reason is not a budget end reason
+  and violations is empty
+  and end_reason in {verify_ok}
+  and not budget_exhausted
 ```
 
-`no_fault` runs reach `CLEARED` and require no repair. Provider failure means all
-configured candidates failed; earlier failed fallback candidates do not fail
-`strict_v3`.
+The excluded reason set is explicit: any gate escalation reason in §5.5.1,
+`provider_error_all`, `fault_not_observed`, `reset_failed`, `baseline_failed`,
+`injection_failed`, `state_machine_bug`, `lease_expired`,
+`interrupted_unknown_previous_state`, `abandoned`, and any budget end reason.
+Only `verify_ok` is a strict-success end reason.
+
+`no_fault` runs reach `CLEARED` and require no repair. A control run that
+attempts a repair keeps the `CLEARED` terminal state but records
+`repair_after_no_fault`, so it fails strict. This is intentional: strict means
+the agent behaved correctly, not merely that the cluster ended healthy.
+
+Provider failure means all configured candidates failed and the end reason is
+`provider_error_all`; earlier failed fallback candidates do not fail
+`strict_v3`. Fallback-enabled runs are grouped by `chain_id` in the headline.
+Per-backend baselines are reported separately with `CHAOS_LLM_FALLBACK=0`.
 
 ### 9.3 Funnel metrics
 
@@ -778,13 +955,18 @@ These are funnel stages, not separate scorers with independent rules.
 ### 9.4 Scorer compatibility
 
 - Keep `strict-loop-v2` keyed by its existing `scorer_version`.
-- Add `gate-path-v1` as a new scorer version.
+- Add `gate-path-v1` as an annotation-only scorer for one full release. It is
+  published alongside `strict-loop-v2` but never replaces the canonical
+  `SCORER_VERSION` during that release.
 - During shadow mode, compute both and store both.
 - Compare across all archived DBs and current runs.
-- Only switch the canonical version after parity or documented intentional
-  differences.
+- Publish the parity report in `PHASES.md` and in the generated
+  `docs/STATE_MACHINE.md`; it must show perfect agreement or enumerate every
+  intentional difference before a canonical switch is proposed.
 - Continue to exclude legacy, resumed, interactive, provider-error, unsupported,
   and unverified-fault runs according to current rules.
+- Report fallback-enabled headline rates by `chain_id`, never aggregated with
+  per-backend baselines.
 
 ## 10. Data model and compatibility
 
@@ -792,10 +974,12 @@ These are funnel stages, not separate scorers with independent rules.
 
 No schema version bump is planned:
 
-- transition events use existing `trace_events`;
+- transition events and idempotency keys use existing `trace_events.payload`;
 - gate path uses existing `run_artifacts`;
 - new scorer uses existing `scores.scorer_version`;
-- new tool statuses and `leased` phase are strings in existing TEXT columns;
+- tool states are internal aliases persisted as existing `finished`/`failed`
+  statuses plus `result.code` in the existing TEXT field;
+- `leased` phase and `chain_id` are strings in existing TEXT columns or artifacts;
 - scalar projection columns keep their current names and types.
 
 ### 10.2 Compatibility phases
@@ -835,8 +1019,9 @@ artifacts. Secrets remain redacted. Receipts remain redacted everywhere.
 - nonterminal run with expired lease and live owner;
 - illegal transition events;
 - gate terminal state that disagrees with `approval_granted`/repair projections;
-- unfinished mutating tool calls in `UNKNOWN_EFFECT`;
-- duplicate transition events for the same `(run_id, machine, seq)`.
+- unfinished mutating tool calls with `result.code = unknown_effect`;
+- semantically duplicate generated transitions with the same `idempotency_key`;
+- `INTERRUPTED` runs without `previous_state` or an end reason.
 
 ### 11.3 UI impact
 
@@ -925,7 +1110,11 @@ Manual live checks before final cutover:
 - one no-fault run with attempted repair;
 - one fallback run where the primary fails and another endpoint answers.
 
-No live test uses `etcd-disk-full`, per the standing exclusion.
+`etcd-disk-full` is excluded from live benchmark sweeps: filling an etcd data
+filesystem can leave the member unrecoverable and require host-level cleanup,
+which is outside the harness's repair contract. The exclusion is enforced by
+the operator-selected live matrix recorded in `PHASES.md` ("Skipped or deferred
+live work") and in `README.md` §6; it is not a scenario-validation rule.
 
 ## 13. Implementation plan
 
@@ -978,7 +1167,9 @@ Files:
 - `harness/checkpoint.py`;
 - `storage/sqlite_store.py`;
 - `chaos_cli.py`;
-- reaper/startup sweep location to be chosen during implementation.
+- add `harness/reaper.py` with an idempotency key and `previous_state` payload;
+- invoke the reaper from `chaos_cli.py` at startup and from `./chaos status`;
+- add `chaos abort <run_id> --abandon` for operator cleanup.
 
 Acceptance:
 
@@ -1009,8 +1200,9 @@ Acceptance:
 
 Acceptance:
 
-- `gate-path-v1` parity report reviewed;
-- canonical scorer switched if approved;
+- `gate-path-v1` remains annotation-only for one release;
+- parity report published in `PHASES.md` and generated `docs/STATE_MACHINE.md`;
+- canonical scorer switch proposed only after a separate explicit approval;
 - legacy-only inference removed only after audit window;
 - documentation updated from generated tables.
 
@@ -1022,28 +1214,40 @@ Acceptance:
 | New events break replay | Emit legacy events during cutover; replay ignores unknown machine events until updated. |
 | False `interrupted` during long setup | Renew lease during setup phases before enabling reaper. |
 | Reaper races with runner | Lease owner check plus idempotent transition by seq. |
-| Tool status consumers break on new strings | Keep legacy strings for old rows; update queries to accept both; doctor reports unknown values. |
+| Tool status consumers break on new strings | v1 persists only legacy statuses plus `result.code`; new states are internal aliases; doctor checks result codes. |
 | Scoring changes benchmark results | Dual scorers, parity report, explicit approval before canonical switch. |
 | Prompt behavior changes | Tool visibility gated behind ablation flag; default remains `always`. |
 | More events increase DB size | Existing SQLite retention/prune applies; transition payloads stay small. |
 | Pure reducer misses real-world side effects | Effects are explicit values and execution is centralized in the shell. |
 
-## 15. Reviewer checkpoints
+## 15. Resolved reviewer checkpoints
 
-Please review these decisions specifically:
+The six original questions are resolved as decisions; two semantic questions
+from the review are also recorded here for auditability.
 
-1. Is `CLEARED` the right terminal gate state for correct `no_fault`, or should
-   it be named `NO_FAULT_CONFIRMED`?
-2. Should `INTERRUPTED` be modeled as a parked nonterminal state, as proposed,
-   or as a terminal state with a forced retry child run?
-3. Is deriving the receipt from `run_id` acceptable given the current
-   redaction model?
-4. Is `gate-path-v1` ready to become canonical after parity, or should it stay
-   as an annotation scorer for one release?
-5. Are the new tool statuses (`unknown_effect`, `superseded`) compatible with
-   downstream reports, or should they remain internal aliases?
-6. Is the fallback comparability rule in §1.3 and §9.2 acceptable for headline
-   reporting?
+1. `CLEARED` stays as the enum name. The wire value becomes `no_fault_cleared`
+   for log readability, with legacy `cleared` mapped by the adapter. See §5.2.
+2. `INTERRUPTED` stays parked nonterminal with `resumable=true` and a required
+   end reason. `./chaos abort <run_id> --abandon` is the explicit exit. See
+   §6.2 and §6.6.
+3. The receipt is `approved:<current run_id>`, derived by fold and absent from
+   payloads. Retries get a new receipt; an old receipt is never carried over.
+   See §5.7.
+4. `gate-path-v1` is annotation-only for one release. The parity report is
+   public in `PHASES.md` and generated `docs/STATE_MACHINE.md`; canonical switch
+   needs separate approval. See §9.4.
+5. `UNKNOWN_EFFECT` and `SUPERSEDED` are internal aliases in v1. Persisted rows
+   use `failed`/`finished` plus `result.code`; first-class statuses are deferred
+   to the cleanup phase. See §7.2 and §10.1.
+6. Fallback runs stay headline-eligible, grouped by `chain_id`, never aggregated
+   with per-backend baselines. `provider_error_all` is the sole all-candidate
+   failure reason. See §1.3 and §9.2.
+7. A correct `no_fault` diagnosis followed by a blocked repair remains
+   `CLEARED` but fails strict because `repair_after_no_fault` is a violation.
+   See §5.5.1 and §9.2.
+8. Gate escalation reasons are enumerated with their strict/headline treatment;
+   run-level end reasons follow the same excluded-numerator/visible-denominator
+   rule. See §5.5.1 and §9.2.
 
 ## 16. Appendix A — gate diagram
 
@@ -1052,7 +1256,9 @@ Illustrative; the generator will own the final file.
 ```mermaid
 stateDiagram-v2
     [*] --> AWAIT_DIAGNOSIS
-    AWAIT_DIAGNOSIS --> AWAIT_DIAGNOSIS: wrong diagnosis / nudge / premature repair
+    AWAIT_DIAGNOSIS --> AWAIT_DIAGNOSIS: DIAGNOSIS_SUBMITTED(wrong)
+    AWAIT_DIAGNOSIS --> AWAIT_DIAGNOSIS: NUDGE
+    AWAIT_DIAGNOSIS --> AWAIT_DIAGNOSIS: REPAIR_PROPOSED
     AWAIT_DIAGNOSIS --> APPROVED: correct diagnosis
     AWAIT_DIAGNOSIS --> CLEARED: correct no_fault
     AWAIT_DIAGNOSIS --> ESCALATED: cap / budget / abort
@@ -1097,6 +1303,9 @@ stateDiagram-v2
     SKIPPED_UNSUPPORTED --> [*]
 ```
 
+Both `VERIFY_OK` and `VERIFY_FAILED` enter `FINISHED` only after the shell writes
+the score row and final record artifact; see §6.4.
+
 ## 18. Appendix C — tool-call diagram
 
 ```mermaid
@@ -1129,3 +1338,9 @@ stateDiagram-v2
 | Gate-local terminal | Agent loop should stop, but run lifecycle continues. |
 | Crash action | Recovery rule chosen from the state where a process died. |
 | Shadow mode | Reducer runs without controlling behavior; mismatches are logged. |
+| Shadow comparison | The test that compares reducer projections with legacy behavior over archived and current runs. |
+| Shadow adapter | The legacy-event mapper that converts old trace events into machine events before folding. |
+| Idempotency key | Deterministic key on generated events that prevents duplicate transitions without a producer seq. |
+| Parked nonterminal | A nonterminal state, such as `INTERRUPTED`, that is resumable and reason-required but not actively executing. |
+| Internal alias | A machine state persisted through an existing status string plus a typed `result.code` instead of a new status value. |
+| Chain ID | Hash of the ordered LLM endpoint list; the grouping key for fallback-enabled headline rates. |

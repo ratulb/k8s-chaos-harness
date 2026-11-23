@@ -276,3 +276,18 @@ or destructive validation.
   model failures from harness/provider failures
 - Acceptance: every scored run has an observed fault, no provider failure, and
   a strict metric backed by auditable fault-check artifacts
+
+## Phase 12 — Explicit state machines (proposed)
+- Design: `docs/STATE_MACHINE_DESIGN.md`
+- [ ] Phase 0: pure reducer core, adapters, exhaustive tests, generated diagrams
+- [ ] Phase 1: gate machine cutover
+- [ ] Phase 2: run lifecycle cutover, setup lease renewal, reaper, `--abandon`
+- [ ] Phase 3: tool-call cutover with internal status aliases
+- [ ] Phase 4: `gate-path-v1` annotation scorer and public parity report
+- Public parity report must be recorded here and in generated
+  `docs/STATE_MACHINE.md` before any canonical scorer switch is proposed.
+- `etcd-disk-full` remains excluded from live sweeps per the operator decision
+  recorded above and in `README.md` §6.
+- Deliverable: deterministic, replayable state with auditable crash recovery
+- Acceptance: `fold(events) == live_state` on archived and current DBs; no
+  silently skipped tool rows; canonical scorer unchanged until explicit approval

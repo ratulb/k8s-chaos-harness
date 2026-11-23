@@ -220,6 +220,12 @@ rules, budgets, scripts, and menu metadata.
 `control-healthy-noisy` is the false-positive control: repairing a healthy
 cluster is penalized.
 
+`etcd-disk-full` is excluded from live benchmark sweeps: filling an etcd data
+filesystem can leave the member unrecoverable and require host-level cleanup.
+The exclusion is an operator decision recorded in `PHASES.md` ("Skipped or
+deferred live work") and in `docs/STATE_MACHINE_DESIGN.md` §12.7; scenario
+validation still accepts the fault.
+
 | Scenario | Acceptable repairs | Forbidden repairs |
 | --- | --- | --- |
 | `control-healthy-noisy` | none | all repair tools |
