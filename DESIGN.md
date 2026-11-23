@@ -67,9 +67,9 @@ terminal view that shows what the agent and cluster are doing.
    the recommended way to create a clean cluster, but it is optional.
 6. **SQLite is operational truth for the current epoch only.** It records
    events, artifacts, resume state, and scores. It is not an archive.
-7. **Topology changes discard stale state.** On any new benchmark or repair run,
-   a discovered `topology_hash` mismatch triggers a loud state discard and
-   fresh start.
+7. **Topology changes archive stale state by default.** On a new benchmark or
+   repair run, a discovered `topology_hash` mismatch archives the epoch under
+   `archive/<timestamp>/` and exits; `--discard-stale` is required for deletion.
 8. **Repair mode is best effort and honest.** Record what was attempted, what
    succeeded, what failed, and what could not be verified. Never claim recovery
    without verification.
@@ -218,6 +218,16 @@ Healthy endpoints are tried before known-dead ones when
 recorded in `llm_requests`, messages, and artifacts; `config_hash` records the
 selector and name/model chain for fallback runs.
 
+A run that answers on a fallback is headline-eligible; earlier candidate
+failures are not a run-level provider error when a later candidate answers.
+`runs.backend` and `runs.model` remain the selected chain identity, not the
+responder. Current score tables group by `runs.backend`, so fallback-enabled
+runs are comparable as configured chains rather than clean per-backend
+baselines; a per-backend baseline pins one endpoint with `--backend <name>` and
+`CHAOS_LLM_FALLBACK=0`. Temperature is fixed at `0.2` and `--seed` is metadata;
+with fallback enabled, the chain configuration is the third comparability
+dimension alongside scenario and seed.
+
 External temporary endpoints are historical infrastructure and are not a backend identity.
 
 `scripts/llm_ready.py` reports configured backend health and counts ready
@@ -357,8 +367,9 @@ For each scenario and seed:
 1. Discover live topology.
 2. Run state lifecycle preflight:
    - compare `topology_hash` to active SQLite;
-   - on mismatch, discard stale state loudly unless this is explicit resume;
-   - initialize fresh DB if discarded.
+   - on mismatch, archive stale state and exit unless `--discard-stale` is
+     passed and this is not explicit resume;
+   - initialize fresh DB only after intentional discard.
 3. Load scenario and pin `scenario_version` by `spec_hash`.
 4. Check capability against frozen topology.
 5. Create a `pending` run row before destructive action.
@@ -493,16 +504,18 @@ The recommended entry point is a repo-local `./chaos` command. Existing scripts
 remain as lower-level tools.
 
 ```text
+./chaos ping ["message"] [--backend auto|<name>]
 ./chaos doctor
 ./chaos target show
 ./chaos scenario list
 ./chaos scenario show <id>
 ./chaos scenario validate
 ./chaos scenario menu --output menu.sh
-./chaos run --scenario <id> --backend <ollama|groq|openrouter|cloudflare>
+./chaos run --scenario <id> --backend <auto|ollama|groq|openrouter|cloudflare|<custom-name>>
            [--mode benchmark|repair] [--runs N] [--seed N]
            [--ui none|live|plain] [--logs-dir PATH]
            [--approve policy|prompt] [--detach] [--resume-of <run_id>]
+           [--force-resume] [--no-jsonl] [--discard-stale]
 ./chaos attach <run_id> [--follow] [--after-seq N] [--interval S]
 ./chaos abort <run_id|all> [--no-kill] [--yes]
 ./chaos status
@@ -516,10 +529,11 @@ remain as lower-level tools.
 
 Rules:
 
-- `ollama` is the self-hosted backend name. Legacy aliases are not user-facing.
-- `./chaos run` is a new benchmark or repair attempt. It may auto-discard on
-  topology mismatch.
-- `./chaos run --resume-of` is explicit resume. It never auto-discards.
+- `ollama` is the self-hosted backend name. Legacy aliases are not user-facing;
+  `auto` and configured `CHAOS_LLM_ENDPOINTS` names are also valid selectors.
+- `./chaos run` is a new benchmark or repair attempt. It archives stale state
+  and exits on topology mismatch unless `--discard-stale` is passed.
+- `./chaos run --resume-of` is explicit resume. It never discards stale state.
 - `./chaos attach` is read-only, warns on stale topology, and `--follow` tails
   the same SQLite event/UI rows used by the live view.
 - `./chaos run --detach` records `launch_id` and `pid` on the run and returns a
@@ -678,7 +692,8 @@ The redesign is complete when:
 - Live UI streams intermediate model/tool/cluster events without corrupting
   final JSON.
 - Detached run, attach, abort, and prompt approval work.
-- Topology mismatch on a new run discards stale state loudly.
+- Topology mismatch on a new run archives stale state and exits; intentional
+  deletion requires `--discard-stale`.
 - Explicit resume refuses on topology mismatch.
 - `chaos cluster nuke` rebuilds via `setup.conf`, accepts live topology, and
   discards stale state only after success.
@@ -695,8 +710,9 @@ The redesign is complete when:
 - Unknown repair side effects are never replayed in place.
 - Live topology can be partially observed during incidents; confidence labels
   prevent guesses from looking like facts.
-- Auto-discard is intentional data loss for stale epochs; it must be loud,
-  predictable, and never applied to explicit resume or read-only commands.
+- Topology-mismatch archiving preserves stale epochs by default; explicit
+  `--discard-stale` is intentional data loss and must be loud, predictable, and
+  never applied to explicit resume or read-only commands.
 - SQLite DB can grow; `db_cli.py prune` may be used for report snapshots, but
   full-epoch cleanup is `chaos state discard`.
 - This document is the reconciled source of truth.

@@ -4,8 +4,9 @@ Status: maintained against the current implementation. Last full audit anchor:
 `5df4539`; subsequent hardening is reflected inline. This document is a
 reverse-engineered architecture draft plus a hardening-status ledger, not a frozen
 snapshot. The original review baseline was `1952bb2`, retained only as provenance.
-Line references are relative to the repository root and are refreshed where they
-matter; current code wins.
+README §17 uses that same `1952bb2` review baseline; this architecture audit uses
+`5df4539`. Both may lag current code. Line references are relative to the
+repository root and are refreshed where they matter; current code wins.
 
 This document captures:
 

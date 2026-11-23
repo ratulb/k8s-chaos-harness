@@ -89,7 +89,9 @@ whether a conversation was educational or useful. The only current strict data
 point is the five-run pilot: `strict_loop_success = 0.20` (§14). The archived
 13-run sweep scored `0.462` on the legacy `loop_success` metric; it predates
 fault-present gates and strict scoring, is not comparable to the headline
-metric, and is retained only as historical context.
+metric, and is retained only as historical context. The headline is per
+configured chain when fallback is enabled: a run that answers on a fallback is
+eligible, but must be read with its recorded provenance (§7, §14).
 
 ## 2. Scope
 
@@ -99,7 +101,7 @@ dynamically, stores history in SQLite, and gates repairs on diagnosis and
 approval. It is not a generic Kubernetes autopilot, an MCP-first system, a
 raw-shell interface, a fixed three-node tool, or a JSONL-first store. It works
 with an existing cluster; `k8s-easy-install` is optional lab infrastructure.
-Only the public backend names in §7 are selectable.
+The public backend names and any custom endpoint names defined in §7 are selectable.
 
 ## 3. System at a glance
 
@@ -309,6 +311,20 @@ export CHAOS_LLM_ENDPOINTS='[{"name":"gpu","base_url":"http://127.0.0.1:11435","
 resume cannot silently switch to a different policy. Health checks skip known
 dead endpoints before generation when `CHAOS_LLM_HEALTH_SORT=1`.
 
+**Fallback and comparability rule.** A run that eventually answers on a fallback
+is headline-eligible; earlier candidate failures are not a run-level
+`provider_error_*` when a later candidate answers. The responding backend is
+provenance, not a score gate. `runs.backend` and `runs.model` keep the selected
+primary/chain identity, while the answering backend, requested backend, fallback
+path, and skipped candidates are recorded in `llm_requests.backend`, messages,
+`llm_response_full`, and `assistant` events. Current score tables group by
+`runs.backend`, so fallback-enabled runs are comparable as configured chains,
+not as clean per-backend baselines. For a per-backend baseline, pin one endpoint
+with `--backend <name>` and `CHAOS_LLM_FALLBACK=0`, then inspect provenance for
+any fallback path. Temperature is fixed at `0.2` and `--seed` is metadata; when
+fallback is enabled, the chain configuration is the third comparability
+dimension alongside scenario and seed.
+
 ## 8. Quickstart
 
 Prerequisites for the first step: Linux with Python 3 and one working LLM
@@ -362,11 +378,11 @@ python3 score.py --db results.sqlite3 --format md
 Implemented `./chaos` commands:
 
 ```text
-./chaos ping ["message"] [--backend ollama|groq|openrouter|cloudflare]
+./chaos ping ["message"] [--backend auto|ollama|groq|openrouter|cloudflare|<custom-name>]
 ./chaos status [--limit N] [--json]
 ./chaos target show [--json] [--mode benchmark|repair]
 ./chaos scenario list|show|validate|menu ...
-./chaos run --scenario <id> --backend <name> [options]
+./chaos run --scenario <id> --backend <name|auto> [--discard-stale] [options]
 ./chaos attach <run_id> [--after-seq N] [--follow] [--interval S] [--json]
 ./chaos abort <run_id|all> [--yes] [--no-kill]
 ./chaos state discard [--yes]
@@ -378,11 +394,12 @@ Implemented `./chaos` commands:
 
 | Option | Meaning |
 | --- | --- |
-| `--scenario`, `--backend` | Required scenario ID and backend |
+| `--scenario`, `--backend` | Required scenario ID; backend accepts `auto`, public names, or `CHAOS_LLM_ENDPOINTS` custom names |
 | `--mode`, `--approve` | `benchmark` (default) or `repair` (best-effort incident context; see caveat below) |
 | `--runs`, `--seed` | Batch size and recorded seed |
 | `--ui`, `--detach`, `--logs-dir` | Rendering and detached launch/logging |
 | `--resume-of`, `--force-resume`, `--no-jsonl` | Resume and export controls |
+| `--discard-stale` | Intentional deletion of a stale topology epoch; default is archive and exit |
 
 The `repair` mode changes capability and reporting context, but the current
 runner still resets, verifies baseline, and injects. It is best-effort, not a
@@ -412,6 +429,25 @@ Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 `score.py --reference-only`. Use the lower-level commands above.
 
 ### CLI operation reference
+
+<details>
+<summary><b><code>./chaos ping ["message"] [--backend auto|&lt;name&gt;]</code></b></summary>
+
+**What it means.** A one-shot LLM smoke test; it needs an endpoint/key but no
+cluster.
+
+**Expects.** One configured backend or `CHAOS_LLM_ENDPOINTS` chain. `auto` is the
+default for `ping`.
+
+**Does.** Resolves the backend chain, checks health, sends the prompt, and
+prints the reply.
+
+**Evidence produced / scoring effect.** Prints the backend/model that answered
+and any fallback path. It creates no run and affects no score.
+
+**Failure modes and recovery.** If no endpoint is healthy or every candidate
+fails, fix `.env`/`CHAOS_LLM_ENDPOINTS` and retry; see §7 for chain semantics.
+</details>
 
 <details>
 <summary><b><code>./chaos status [--limit N] [--json]</code></b></summary>
@@ -468,7 +504,7 @@ truth.
 </details>
 
 <details>
-<summary><b><code>./chaos run --scenario &lt;id&gt; --backend &lt;name&gt; [options]</code></b></summary>
+<summary><b><code>./chaos run --scenario &lt;id&gt; --backend &lt;name|auto&gt; [--discard-stale] [options]</code></b></summary>
 
 **What it means.** The destructive benchmark entry point: reset, inject,
 converse, repair attempt, verify, and record.
@@ -886,14 +922,25 @@ escape hatch rather than a normal model repair.
 SQLite is the authoritative active epoch. Event tables are truth;
 `runs.state_json` is a rebuildable cache.
 
-| Artifact | Authority | Role |
+Files:
+
+| File | Authority | Role |
 | --- | --- | --- |
 | `results.sqlite3` | authoritative | Events, control rows, state, scores |
-| `state_snapshots`, `ui_stream` | authoritative DB tables | Durable state snapshots and redacted UI chunks |
 | `runs.jsonl` | derived | Legacy export; never edit as source of truth |
 | `traces/*.jsonl` | derived | Run traces, including `<run_id>.snapshots.jsonl` and `<run_id>.ui.jsonl` v3 artifacts |
 | `logs/<run_id>.log`, `logs/<launch_id>.log` | local logs | Runner command log and detached launcher output |
 | `replay.html` | derived | Static redacted HTML from SQLite |
+
+Authoritative DB tables:
+
+| Tables | Role |
+| --- | --- |
+| `messages`, `trace_events`, `llm_requests`, `tool_calls`, `run_artifacts` | Append-only evidence |
+| `runs`, `batches`, `scenarios` | Control and projection rows |
+| `state_snapshots`, `ui_stream` | Durable snapshots and redacted UI chunks |
+| `diagnosis_attempts`, `policy_violations` | Gate history |
+| `scores`, `score_reports` | Derived score projections stored in the authoritative DB |
 
 Tables group into configuration (`scenarios`, `batches`), run lifecycle
 (`runs`), conversation (`messages`), tooling (`tool_calls`), LLM calls
@@ -911,14 +958,19 @@ Mutating tool calls are recorded as intents before execution and updated after.
 An unfinished mutating call marks an unknown-effect crash boundary. State is
 rebuilt when `cached.seq`, `runs.state_seq`, and `runs.seq` disagree.
 
-Legacy backend aliases normalize to `ollama` on DB init and export. Export writes derived files; `import-legacy` is explicit migration and
-does not import `.snapshots.jsonl` or `.ui.jsonl`.
+Legacy backend aliases normalize to `ollama` on DB init and export. `auto` and
+custom `CHAOS_LLM_ENDPOINTS` names are preserved; `runs.backend`/`runs.model`
+keep the selected chain identity and are not rewritten to the responder after a
+fallback. The answering backend is preserved in `llm_requests.backend`, messages,
+`llm_response_full`, and `assistant` events (§7). Export writes derived files;
+`import-legacy` is explicit migration and does not import `.snapshots.jsonl` or
+`.ui.jsonl`.
 
 ## 13. State lifecycle
 
 | Action | If topology changed | Result |
 | --- | --- | --- |
-| normal `./chaos run` | yes | Loudly discards stale state, then exits |
+| normal `./chaos run` | yes | Archives stale state under `archive/<timestamp>/`, then exits unless `--discard-stale` is passed |
 | `./chaos run --resume-of <id>` | yes | Refuses; never discards |
 | `./chaos status`, `attach` | yes | Read-only warning |
 | `./chaos state discard --yes` | n/a | Deletes active epoch, DB/WAL/SHM, and all `traces/*.jsonl`; truncates `runs.jsonl`; `logs/` survives; no archive |
@@ -967,9 +1019,14 @@ usage payloads, and live token accounting was verified in the five-run pilot.
 
 A run is headline-eligible iff `status='finished'`, `resume_count=0`,
 `interactive=0`, `end_reason` is not `legacy_exploratory` or a provider-error or
-unsupported end reason, `truth` is present, and `fault_present=true`.
-`--include-resumed`, `--include-interactive`, `--include-provider-errors`, and
-`--include-unverified-faults` opt into excluded groups for historical analysis.
+unsupported end reason, `truth` is present, and `fault_present=true`. Fallback
+runs are included; a provider error means every configured candidate failed, not
+that an earlier candidate failed before a later one answered. Because current
+score tables group by `runs.backend`, fallback-enabled runs are comparable as
+configured chains, not as clean per-backend baselines; see §7 for the provenance
+rule. `--include-resumed`, `--include-interactive`, `--include-provider-errors`,
+and `--include-unverified-faults` opt into excluded groups for historical
+analysis.
 
 `strict_loop_success=1` additionally requires `diagnosis_correct=true` on the
 first attempt, `approval_granted=true`, `verify_ok=true`, an acceptable repair
@@ -1122,9 +1179,10 @@ budget/policy reasons.
 
 **What it means.** Why the run loop ended.
 
-**Expects.** Values such as `submitted`, `budget_tokens`, `agent_stopped`,
-`fault_not_observed`, `reset_failed`, `baseline_failed`, `operator_abort`, or
-`provider_error_*`.
+**Expects.** Values such as `submitted`, `budget_steps`, `budget_tokens`,
+`agent_stopped`, `injection_failed`, `fault_not_observed`, `reset_failed`,
+`baseline_failed`, `operator_abort`, `provider_error_*`,
+`skipped_unsupported`, or imported `legacy_exploratory`.
 
 **Does.** Distinguishes ordinary completion from budget exhaustion, setup
 failure, and provider failure.
@@ -1139,8 +1197,10 @@ from headline rates. Budget cutoffs remain visible and fail strict success.
 **What it means.** A deliberately narrow clean end-to-end repair signal.
 
 **Expects.** Observed fault, first-attempt correct diagnosis, approval, acceptable
-repair, no forbidden repair, no policy violation, no provider failure, no budget
-cutoff, and passing verification.
+repair, no forbidden repair, no policy violation, no run-level provider failure,
+no budget cutoff, and passing verification. Earlier fallback candidates that
+failed before another candidate answered do not fail this criterion; the
+answering backend is recorded as provenance (§7).
 
 **Does.** Answers “did the model do the whole loop cleanly?”, not “was the
 conversation educational or useful?”.
@@ -1255,8 +1315,9 @@ unreadable DB.
 
 ## 17. Current status and limitations
 
-Live status as of 2026-11-21. Documentation was reviewed at commit `1952bb2`;
-later commits may change behavior, and current code wins.
+Live status as of 2026-11-21. The README review baseline was `1952bb2`;
+`docs/ARCHITECTURE.md` was last fully audited at `5df4539`. Both may lag current
+code, and current code wins.
 
 - live topology discovery and `chaos cluster nuke` acceptance passed
 - the three lab control planes returned Ready after rebuild
@@ -1276,15 +1337,18 @@ later commits may change behavior, and current code wins.
 - UI/replay redact secrets; gate receipts are redacted from messages, traces,
   artifacts, and state snapshots, while the approval event keeps the value needed
   for rebuild
-- runner auto-discard does not clear the node IP cache; CLI discard/nuke do
+- topology-mismatch archive does not clear the node IP cache; CLI discard/nuke do
 - `--no-jsonl` disables export, but topology-mismatch discard still truncates the
   default `runs.jsonl`
 
 These are user-visible limitations only. Open work is tracked in `PHASES.md`
 (status/roadmap) and `docs/ARCHITECTURE.md` §5/§7 (known engineering gaps and
-refactor order). The P0 verify-env, fixture-env, lease, shell-validation, and
-gate-receipt gaps have been addressed; the remaining highest-priority work is the
-incremental `Scenario`/`ExperimentSpec` and `RunStore` refactor.
+refactor order). P0 status follows `docs/ARCHITECTURE.md` §5: P0.1 final-verify
+env, P0.2 fixture fault-check env, P0.3 gate-receipt rebuild, P0.4 lease renewal,
+P0.5 event/artifact redaction, and P0.7 prompt-mode receipt are fixed; P0.6 shell
+interpolation and P0.8 unknown mutating tool calls are partial. The remaining
+highest-priority work is the incremental `Scenario`/`ExperimentSpec` and
+`RunStore` refactor.
 
 ## 18. Documentation map
 
@@ -1297,5 +1361,8 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `PHASES.md` | Status, acceptance history, remaining work |
 | `docs/ARCHITECTURE.md` | Reverse-engineered current architecture, workflow trace, P0/P1/P2 gap inventory, candidate target design and code layout (§6, commit-pinned) |
 | `scripts/README.md` | Helper-script details |
+| `docs/STATE_MACHINE_DESIGN.md` | Proposed state-machine design; not yet implemented |
 
-When documents conflict, current code plus `DESIGN.md` and `PHASES.md` win.
+Historical reviewer documents under `docs/archive/` were retired at commit
+`5df4539` after their useful details were salvaged. When documents conflict,
+current code plus `DESIGN.md` and `PHASES.md` win.

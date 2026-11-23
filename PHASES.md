@@ -264,6 +264,10 @@ or destructive validation.
 - [x] Run destructive fault calibration after explicit approval
 - [x] Run model pilots after explicit approval
 - [ ] Run full public sweep and publish refreshed replay/score artifacts
+- The sweep must use comparable units: pinned single-backend runs with
+  `CHAOS_LLM_FALLBACK=0` for per-backend comparison, or configured chains as the
+  unit when fallback is enabled; fallback runs stay headline-eligible with
+  provenance recorded (§7/§14 of README)
 - Live calibration passed for all five injected scenarios; observed delays were
   under 16 seconds, well inside the 15-second disk and 60-second disruptive limits
 - Pilot results: 5 runs, 100% diagnosis, 80% verify, 20% strict loop success;
