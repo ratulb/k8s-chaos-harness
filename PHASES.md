@@ -279,9 +279,12 @@ or destructive validation.
 
 ## Phase 12 — Explicit state machines (proposed)
 - Design: `docs/STATE_MACHINE_DESIGN.md`
+- Execution plan: `docs/STATE_MACHINE_DESIGN.md` §13; execute the phase gates in
+  order and record evidence here before each cutover
 - [ ] Phase 0: pure reducer core, adapters, exhaustive tests, generated diagrams
 - [ ] Phase 1: gate machine cutover
-- [ ] Phase 2: run lifecycle cutover, setup lease renewal, reaper, `--abandon`
+- [ ] Phase 2: run lifecycle cutover in two slices — shell/lease foundation,
+  then reaper/`--abandon`
 - [ ] Phase 3: tool-call cutover with internal status aliases
 - [ ] Phase 4: `gate-path-v1` annotation scorer and public parity report
 - Public parity report must be recorded here and in generated

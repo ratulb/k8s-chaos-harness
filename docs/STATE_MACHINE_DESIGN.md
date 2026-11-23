@@ -1161,25 +1161,122 @@ live work") and in `README.md` §6; it is not a scenario-validation rule.
 
 ## 13. Implementation plan
 
-### Phase 0 — core, adapters, and shadow mode
+### 13.0 Why this plan exists
+
+The design is settled; the risk is now sequencing. A single large cutover would
+mix reducer correctness, event adapter fidelity, crash recovery, tool outcome
+semantics, and scorer changes. That would make failures hard to localize and
+would put headline results at risk. This plan makes each phase independently
+reviewable, revertible, and provable.
+
+The execution order is deliberately:
+
+1. pure machines and tests, with no runtime behavior change;
+2. gate machine, because it owns the most volatile policy and receipt rules;
+3. run lifecycle, after gate terminals are trustworthy;
+4. tool calls, after the run machine can consume `UNKNOWN_EFFECT`;
+5. scorer annotation and parity, after all state paths exist;
+6. cleanup and any canonical scorer switch, only after an audit window and a
+   separate explicit approval.
+
+Do not change canonical scoring before Phase 4 approval. Do not enable the
+reaper before lease renewal covers setup, baseline, inject, and fault-check.
+Do not implement a schema bump, a reset-ladder rewrite, an LLM-loop machine, a
+cluster-health observer, or a canonical scorer switch as a side effect of these
+phases.
+
+### 13.1 Progression rules
+
+- One phase per review unit. A phase may contain several commits, but its exit
+  gate must be green before the next phase begins.
+- Build in this order inside every phase: pure reducer/table test → adapter →
+  shadow comparison → flag-gated enforce → focused tests → full suite → doc
+  update.
+- Keep legacy events and legacy scalar projections during cutover. Replay and
+  old DBs must remain readable throughout.
+- Use `CHAOS_SM_GATE`, `CHAOS_SM_RUN`, and `CHAOS_SM_TOOL` with
+  `off|shadow|enforce`. Start each machine in `shadow`; move to `enforce` only
+  after that phase's exit gate. `off` is the rollback switch.
+- Each phase ends with a written evidence note in `PHASES.md`: commands run,
+  test counts, shadow mismatches, intentional differences, and the flag value
+  used. This becomes the audit trail for the next phase.
+- Archived DBs are read-only inputs. Shadow tests may use generated temp DBs or
+  operator-supplied archives, but must never mutate them.
+- Live or destructive validation requires explicit operator confirmation. The
+  manual live matrix in §12.7 runs only after Phase 3 is green. `etcd-disk-full`
+  remains excluded by operator decision.
+- When a phase changes a locked decision in `DESIGN.md`, stop and update that
+  doc first. `PHASES.md` records status; `docs/STATE_MACHINE_DESIGN.md` records
+  the state-machine decision; current code wins on drift.
+
+### 13.2 Phase 0 — core, adapters, and shadow mode
+
+Goal: prove the reducers and replay model without changing runtime behavior.
+
+Entry gate: design review complete; no live work; current full suite green.
+
+Work order:
+
+1. Define `StateSpec`, `Event`, `Transition`, `Machine`, and the pure
+   `transition(state, event) -> Transition` contract in `harness/state_machine.py`.
+2. Add gate, run, and tool transition tables in
+   `harness/machines/{gate,run,tools}.py`; keep adapters in
+   `harness/machines/adapters.py`.
+3. Add the exhaustive `(state, event)` matrix test. Missing cells fail the test;
+   reject cells must be explicit. Assert terminal invariants, resumability,
+   crash actions, rank monotonicity, and reachability.
+4. Add fold/replay tests: deterministic `seq` order, idempotent replay,
+   rejection events preserve state, no I/O or clock reads in reducers.
+5. Add legacy adapters from `trace_events`, tool rows, and scalar columns.
+   Cover redacted receipts, missing early nudges, later denial clearing a
+   receipt, fallback responder provenance, and legacy tool statuses.
+6. Add `scripts/gen_state_diagrams.py`; it imports tables and writes
+   `docs/STATE_MACHINE.md`. The generator fails on malformed tables.
+7. Run shadow comparison over archived/current DBs. Log mismatches; do not
+   guess or repair history.
 
 Files:
 
 - add `harness/state_machine.py`;
-- add `harness/machines/{gate,run,tools,adapters}.py` if split;
+- add `harness/machines/{gate,run,tools,adapters}.py`;
 - add `scripts/gen_state_diagrams.py`;
 - add `docs/STATE_MACHINE.md`;
 - add `tests/test_state_machine.py`;
-- add `tests/test_state_machine_shadow.py`.
+- add `tests/test_state_machine_shadow.py`;
+- update `PHASES.md` with the shadow report.
 
-Acceptance:
+Exit gate:
 
-- all table and fold tests pass;
-- no behavior change;
-- shadow comparison runs over archived DBs;
-- generated diagrams match the tables.
+- all table, fold, generated-diagram, and shadow tests pass;
+- no runtime behavior change; `CHAOS_SM_*` flags are absent or `off`;
+- every shadow mismatch is explained or fixed;
+- `docs/STATE_MACHINE.md` is generated, not hand-maintained.
 
-### Phase 1 — gate cutover
+Stop/rollback: delete the new files or leave them inert. There are no runtime
+projection writes yet, so rollback has no data consequence.
+
+### 13.3 Phase 1 — gate machine cutover
+
+Goal: make gate state, receipts, nudges, and repair outcomes one derived state.
+
+Entry gate: Phase 0 exit gate green; shadow comparison shows no unexplained
+gate mismatch.
+
+Work order:
+
+1. Introduce `GateState` as the single source for diagnosis, nudge count,
+   approval, escalation, and repair outcome. Keep legacy booleans as read-only
+   compatibility during the slice.
+2. Derive the receipt as `approved:<current run_id>` from the fold. Stop
+   persisting the receipt in payloads; accept absent or `[REDACTED]` after
+   resume.
+3. Convert nudges to events. Increment `nudge_count` only below the cap;
+   convert the over-cap intention to
+   `BUDGET_EXHAUSTED(reason=budget_tokens, detail=nudge_cap)` before transition.
+4. Replace `BLOCKED:`/`ERROR:`/timeout prefix interpretation with typed
+   `ToolOutcome` while leaving human-readable strings in artifacts.
+5. Compute `GatePath` as an annotation only. Do not change `strict-loop-v2`.
+6. Move `CHAOS_SM_GATE` from `shadow` to `enforce` after focused and full tests.
 
 Files:
 
@@ -1189,19 +1286,64 @@ Files:
 - `harness/journal.py`;
 - `harness/message.py`;
 - `storage/sqlite_store.py`;
-- `common/scoring.py`;
-- optional `harness/spec.py` and prompt files for tool visibility.
+- `common/scoring.py` for annotation plumbing only;
+- optional `harness/spec.py` and prompt files for tool visibility;
+- extend `tests/test_gate.py`, `tests/test_tooling.py`,
+  `tests/test_review_hardening.py`, `tests/test_domain_objects.py`, and
+  `tests/test_resume.py`.
 
-Acceptance:
+Exit gate:
 
 - one `GateState` replaces independent booleans;
 - receipt derived from `run_id` and absent from event payloads;
-- nudge is an event;
+- nudge is an event and cap conversion is in the nudge rule;
 - typed repair outcomes replace prefixes;
+- distinct strict outcomes for forbidden, unacceptable, premature, budget,
+  no-fault-with-repair, and successful repair paths;
 - `gate-path-v1` computed in shadow;
-- existing suite remains green.
+- existing suite remains green; `score.py` and replay output unchanged.
 
-### Phase 2 — run lifecycle cutover
+Stop/rollback: set `CHAOS_SM_GATE=off` or `shadow`, keep legacy events, and
+retain `GatePath` as annotation only. Do not rewrite history.
+
+### 13.4 Phase 2 — run lifecycle cutover
+
+Goal: one run state drives phase projection, crash triage, resume, lease expiry,
+verification, and abort semantics.
+
+This phase executes in two slices. They report as one roadmap item, but slice A
+must be green before slice B is enabled.
+
+#### 13.4.1 Slice A — shell and lease foundation
+
+1. Add `RunState` and the transition shell so `apply()` owns `runs.status`,
+   `runs.phase`, `runs.end_reason`, and `state_json`.
+2. Remove direct lifecycle writes from `run_benchmark.py`. Verify by search that
+   it no longer writes `status`, `phase`, or `end_reason` directly.
+3. Extend lease renewal through reset, baseline, inject, and fault-check before
+   any reaper work.
+4. Encode crash action as a lookup keyed by `previous_state`; require a reason
+   for `INTERRUPTED` and fail closed on unknown previous state.
+5. Move verification into the run machine; keep export outside it so export
+   failure cannot make a finished run look unfinished.
+6. Add resume triage as a table lookup, preserving `--force-resume` limits.
+
+#### 13.4.2 Slice B — reaper and operator exit
+
+1. Add `harness/reaper.py`. It must read the lease owner, use the idempotency
+   key `reap:{run_id}:{previous_state}:{lease_expires_at}`, and never run from a
+   crashed process.
+2. Invoke the reaper from `chaos_cli.py` startup and `./chaos status` only after
+   slice A is green.
+3. Add `chaos abort <run_id> --abandon` as a separate dispatch path. It applies
+   `run.ABANDON` through the shell and refuses non-`INTERRUPTED` runs. Do not
+   reuse `abort_runs()`; that path terminates live PIDs and writes terminal
+   `aborted`.
+4. Preserve existing `abort` and `cluster nuke` semantics during cutover; route
+   their final projection through the shell later if approved.
+5. Add replay and doctor coverage for terminal-without-reason, `FINISHED`
+   without score/final record, expired live lease, and duplicate generated
+   transitions.
 
 Files:
 
@@ -1210,48 +1352,183 @@ Files:
 - `harness/checkpoint.py`;
 - `storage/sqlite_store.py`;
 - `chaos_cli.py`;
-- add `harness/reaper.py` with an idempotency key and `previous_state` payload;
-- invoke the reaper from `chaos_cli.py` at startup and from `./chaos status`;
-- add `chaos abort <run_id> --abandon` for operator cleanup.
+- add `harness/reaper.py`;
+- add `tests/test_reaper.py`;
+- extend `tests/test_run_benchmark_topology.py`, `tests/test_chaos_cli.py`,
+  `tests/test_resume.py`, and `tests/test_sqlite_store.py`.
 
-Acceptance:
+Exit gate:
 
-- phase writes only in transition shell; `run_benchmark.py` no longer writes
-  `status`, `phase`, or `end_reason` directly, and all writes go through
-  `apply()`;
-- setup lease renewal active;
-- reaper writes `interrupted`;
+- phase writes only in the transition shell;
+- `run_benchmark.py` no longer writes `status`, `phase`, or `end_reason`
+  directly, and all writes go through `apply()`;
+- setup lease renewal active before reaper enabled;
+- reaper writes `interrupted` exactly once and `INTERRUPTED + LEASE_EXPIRED`
+  remains idempotent;
 - resume triage is a table lookup;
 - verification transitions to `FINISHED`;
-- export stays outside the machine.
+- `./chaos abort <run_id> --abandon` is the explicit exit from `INTERRUPTED`;
+- export stays outside the machine;
+- focused tests covering resume, topology mismatch, abort, lease, and reaper
+  are green.
 
-### Phase 3 — tool-call cutover
+Stop/rollback: disable the reaper first, then set `CHAOS_SM_RUN=off|shadow`.
+Keep emitted events; rebuild projections from the shell or legacy adapter. A
+false `interrupted` is a release blocker, not an acceptable mismatch.
+
+### 13.5 Phase 3 — tool-call cutover
+
+Goal: make tool execution observable before mutation and typed after execution,
+without breaking legacy status consumers.
+
+Entry gate: Phase 2 exit gate green; unknown mutating effect can escalate to
+gate and run.
+
+Work order:
+
+1. Persist the tool intent before execution in `harness/call.py`.
+2. Introduce `ToolState` events and outcomes in `harness/tooling.py` and
+   `tools/tool.py`. `SUCCEEDED` and `FAILED` are internal aliases; `UNKNOWN_EFFECT`
+   covers mutating crash or post-start cancel; `SUPERSEDED` is read-only only.
+   A repair call reaching `RESUME_SUPERSEDE` is rejected as a bug.
+3. Persist legacy `status` strings plus JSON `result.code` in the existing TEXT
+   field. New writes always use the envelope. Plain-text values from old rows
+   remain `result.text`; they are not silently reinterpreted.
+4. Keep denial valid only before execution. After `STARTED`, a mutating cancel
+   becomes `UNKNOWN_EFFECT`, not a clean denial.
+5. Extend doctor to detect unfinished mutating calls, duplicate generated
+   transitions, and illegal transition events.
+6. Verify replay redaction and legacy scoring remain unchanged.
 
 Files:
 
 - `harness/call.py`;
 - `harness/tooling.py`;
 - `tools/tool.py`;
-- `storage/sqlite_store.py`.
+- `storage/sqlite_store.py`;
+- extend `tests/test_tooling.py`, `tests/test_domain_objects.py`,
+  `tests/test_resume.py`, `tests/test_sqlite_store.py`, and
+  `tests/test_db_cli.py`.
 
-Acceptance:
+Exit gate:
 
 - intents before execution;
 - named `UNKNOWN_EFFECT` and `SUPERSEDED`;
 - result status typed;
 - new writes always use the JSON envelope in `result`, with `result.code`;
-- existing plain-text result values are read as `result.code` only when they are
-  JSON; otherwise they are preserved as legacy `result.text`.
+- existing plain-text result values are read as `result.code` only when JSON;
+  otherwise preserved as legacy `result.text`;
+- `doctor --strict` understands both legacy and machine-aware rows;
+- no old tool status query starts skipping rows.
 
-### Phase 4 — scorer and cleanup
+Stop/rollback: set `CHAOS_SM_TOOL=off|shadow`, keep legacy status writes, and
+leave typed codes in `result` as annotation only. Do not delete envelope data.
 
-Acceptance:
+### 13.6 Phase 4 — scorer annotation, parity, and cleanup
+
+Goal: prove state-derived scoring agrees with the canonical metric before any
+headline change.
+
+Entry gate: Phases 0–3 green; all live manual checks in §12.7 completed with
+operator confirmation.
+
+Work order:
+
+1. Add `gate-path-v1` as an annotation scorer in `common/scoring.py`. Keep
+   `strict-loop-v2` canonical.
+2. Run parity across every archived and current DB. Compare no-fault strict
+   success, budget cutoffs, second attempts, forbidden repairs, policy
+   violations, provider errors, fallback runs grouped by `chain_id`, and
+   default exclusions for resumed/interactive/unsupported runs.
+3. Publish the parity report in `PHASES.md` and generated
+   `docs/STATE_MACHINE.md`. Require perfect agreement or an enumerated list of
+   intentional differences before a canonical switch is even proposed.
+4. Keep the annotation-only release for one audit window. During that window,
+   fix adapters and tests, not headline definitions.
+5. Legacy-only inference is removed only after the audit window. A canonical
+   scorer switch requires a separate explicit approval and a new decision entry.
+
+Files:
+
+- `common/scoring.py`;
+- `score.py` for display of both versions only;
+- `replay.py` for annotation display only;
+- `PHASES.md`;
+- generated `docs/STATE_MACHINE.md`;
+- extend `tests/test_score_db.py`, `tests/test_review_hardening.py`,
+  `tests/test_hardening.py`, `tests/test_legacy_import.py`,
+  `tests/test_replay.py`, and `tests/test_db_cli.py`.
+
+Exit gate:
 
 - `gate-path-v1` remains annotation-only for one release;
 - parity report published in `PHASES.md` and generated `docs/STATE_MACHINE.md`;
-- canonical scorer switch proposed only after a separate explicit approval;
+- canonical scorer switch proposed only after separate explicit approval;
 - legacy-only inference removed only after audit window;
-- documentation updated from generated tables.
+- documentation updated from generated tables;
+- `score.py summarize()` and `replay._matrix_rows()` outputs for existing rows
+  remain unchanged.
+
+Stop/rollback: stop publishing `gate-path-v1`; leave canonical scorer untouched.
+Any unexplained parity difference blocks the cleanup phase.
+
+### 13.7 Verification ladder
+
+Run after every phase slice, before marking the phase exit gate:
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m compileall -q .
+bash -n run_benchmark.sh
+git diff --check
+python3 db_cli.py init
+python3 db_cli.py migrate
+python3 db_cli.py doctor --strict
+python3 score.py --db results.sqlite3 --format json
+python3 replay.py --db results.sqlite3 --output /tmp/opencode/replay.html
+```
+
+Focused suites by phase:
+
+- Phase 0: `tests.test_state_machine`, `tests.test_state_machine_shadow`.
+- Phase 1: `tests.test_gate`, `tests.test_tooling`,
+  `tests.test_review_hardening`, `tests.test_domain_objects`,
+  `tests.test_resume`.
+- Phase 2: `tests.test_run_benchmark_topology`, `tests.test_chaos_cli`,
+  `tests.test_resume`, `tests.test_sqlite_store`, `tests.test_reaper`.
+- Phase 3: `tests.test_tooling`, `tests.test_domain_objects`,
+  `tests.test_resume`, `tests.test_sqlite_store`, `tests.test_db_cli`.
+- Phase 4: `tests.test_score_db`, `tests.test_review_hardening`,
+  `tests.test_hardening`, `tests.test_legacy_import`, `tests.test_replay`,
+  `tests.test_db_cli`.
+
+The canonical full suite command from `README.md` remains:
+
+```bash
+python3 -m unittest discover -s tests -v
+OLLAMA_MODEL=qwen3:8b python3 -m unittest discover -s tests -v
+CHAOS_LIVE_BACKEND_TESTS=1 python3 -m unittest tests.test_backends -v
+```
+
+The live backend test is opt-in and is not a phase exit gate unless the operator
+explicitly includes it.
+
+### 13.8 Phase gate summary
+
+| Phase | Proof required | Default at start | Rollback | Next phase blocked by |
+|---|---|---|---|---|
+| 0 | table/fold/shadow/diagram tests pass | inert | delete or leave inert | unexplained shadow mismatch |
+| 1 | one `GateState`, receipt derived, typed outcomes | `CHAOS_SM_GATE=shadow` | `off`/`shadow` | gate parity mismatch or score change |
+| 2A | shell owns writes, setup lease renewal active | `CHAOS_SM_RUN=shadow` | `off`/`shadow` | direct writes remain or false resume |
+| 2B | reaper idempotent, `--abandon` works | reaper disabled | disable reaper first | false `interrupted` |
+| 3 | intents and typed results, legacy statuses valid | `CHAOS_SM_TOOL=shadow` | `off`/`shadow` | skipped legacy tool rows |
+| 4A | parity report public | annotation only | stop annotation | unexplained parity difference |
+| 4B | audit window complete | no canonical switch | none needed | explicit approval missing |
+
+Documentation update points during execution: `PHASES.md` for status and parity
+evidence, this section for plan changes, `docs/ARCHITECTURE.md` for gap-ledger
+status, `README.md` only for user-visible behavior changes, and `DESIGN.md` only
+if a locked decision changes.
 
 ## 14. Risks and mitigations
 
