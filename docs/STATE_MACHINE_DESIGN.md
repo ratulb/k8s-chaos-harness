@@ -476,8 +476,9 @@ def fold(machine: MachineKind, events: Sequence[TraceEvent], context: Context) -
 `docs/STATE_MACHINE.md`. Each state contributes a node with its wire value,
 terminality, and crash action. Each transition contributes an edge labeled with
 the event and guard. The generator fails if a state has no `StateSpec`, if a
-terminal or parked-resumable state lacks an end reason, or if a resumable state
-lacks a crash action.
+run-terminal or parked-resumable state lacks an end reason, or if a resumable
+state lacks a crash action. Gate-loop terminal states do not require a run end
+reason because the run machine owns run terminality.
 
 ## 5. Gate machine
 
@@ -512,10 +513,17 @@ classify_repair(canonical_name, args, scenario) -> RepairFacts
 classify_repair_result(result) -> RepairResultFacts
 ```
 
-`DiagnosisFacts` carries `label`, `correct`, `is_no_fault`, `attempts`, and
-`first_attempt_correct`. `RepairFacts` carries `canonical_name`, `acceptable`,
-`forbidden`, and safe args. `RepairResultFacts` carries a typed status such as
-`success`, `failed`, `timeout`, or `denied`.
+`DiagnosisFacts` carries `label`, `correct`, `approved`, `is_no_fault`,
+`attempts`, and `first_attempt_correct`. `RepairFacts` carries `canonical_name`,
+`acceptable`, `forbidden`, and safe args. `RepairResultFacts` carries a typed
+status such as `success`, `failed`, `timeout`, or `denied`.
+
+`approved` distinguishes a correct diagnosis that earned a receipt from a
+correct diagnosis in prompt mode where the operator declined. The former may
+repair; the latter records the correct label but stays in `AWAIT_DIAGNOSIS`
+without a receipt. A later denial from `APPROVED` also withholds the receipt and
+clears any repair projection; a later wrong submission from `APPROVED` clears
+the receipt and may escalate at the diagnosis-attempt cap.
 
 This keeps the pure machine independent of scenario JSON and string prefixes.
 
@@ -523,7 +531,7 @@ This keeps the pure machine independent of scenario JSON and string prefixes.
 
 | Event | Payload |
 |---|---|
-| `DIAGNOSIS_SUBMITTED` | `label`, `correct`, `is_no_fault`, `attempts`, `first_attempt_correct`, `source` |
+| `DIAGNOSIS_SUBMITTED` | `label`, `correct`, `approved` (default true), `is_no_fault`, `attempts`, `first_attempt_correct`, `source` |
 | `NUDGE` | `step`, `kind` (`no_tool` or `budget`), `nudge_count` |
 | `REPAIR_PROPOSED` | `canonical_name`, `acceptable`, `forbidden`, `args` |
 | `REPAIR_FINISHED` | `status`, `timed_out`, `result_summary` |
@@ -542,8 +550,9 @@ also arrive directly from the token-budget guard with `detail=token_budget`.
 
 | From | Event | Guard | To | End reason | Effects |
 |---|---|---|---|---|---|
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and no-fault | `CLEARED` | none | record attempt, issue receipt |
-| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct and not no-fault | `APPROVED` | none | record attempt, issue receipt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct, approved, no-fault | `CLEARED` | none | record attempt, issue receipt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct, approved, not no-fault | `APPROVED` | none | record attempt, issue receipt |
+| `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | correct but not approved | `AWAIT_DIAGNOSIS` | none | record attempt, withhold receipt |
 | `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, below cap | `AWAIT_DIAGNOSIS` | none | record attempt |
 | `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, cap reached | `ESCALATED` | `diagnosis_attempts_exhausted` | record attempt |
 | `AWAIT_DIAGNOSIS` | `NUDGE` | `nudge_count < MAX_NUDGES` | `AWAIT_DIAGNOSIS` | none | increment `nudge_count`, emit nudge event |
@@ -556,10 +565,20 @@ also arrive directly from the token-budget guard with `detail=token_budget`.
 | `APPROVED` | `REPAIR_PROPOSED` | acceptable | `APPROVED` | none | record proposed repair projection only |
 | `APPROVED` | `REPAIR_FINISHED` | success | `REPAIRED` | none | record typed repair success |
 | `APPROVED` | `REPAIR_FINISHED` | failure or timeout | `APPROVED` | none | record typed repair failure |
+| `APPROVED` | `DIAGNOSIS_SUBMITTED` | correct and approved | `APPROVED` | none | record attempt, keep receipt |
+| `APPROVED` | `DIAGNOSIS_SUBMITTED` | correct but not approved | `AWAIT_DIAGNOSIS` | none | record attempt, clear receipt and repair projection |
+| `APPROVED` | `DIAGNOSIS_SUBMITTED` | wrong, below cap | `AWAIT_DIAGNOSIS` | none | record attempt, clear receipt |
+| `APPROVED` | `DIAGNOSIS_SUBMITTED` | wrong, cap reached | `ESCALATED` | `diagnosis_attempts_exhausted` | record attempt, clear receipt |
 | `APPROVED` | `UNKNOWN_EFFECT` | mutating tool ended unknown | `ESCALATED` | `unknown_effect` | set end reason; shell triggers retry |
 | `APPROVED` | `ESCALATE` / `BUDGET_EXHAUSTED` / `ABORT` | always | `ESCALATED` | mapped reason below | set end reason |
 | `CLEARED` | `REPAIR_PROPOSED` | always | `CLEARED` | none | record `repair_after_no_fault` violation |
 | `REPAIRED` / `CLEARED` / `ESCALATED` | any | always | reject | unchanged | append rejection event |
+
+Diagnosis submissions remain accepted in `APPROVED` so a later operator denial
+or wrong re-submission can revoke the repair receipt before verification. Any
+transition out of `APPROVED` back to `AWAIT_DIAGNOSIS` clears the stored repair
+name and repair status; wrong submissions at the cap escalate with
+`diagnosis_attempts_exhausted`.
 
 End-reason mapping and precedence:
 
@@ -593,7 +612,7 @@ Run-level reasons such as `provider_error_all`, `fault_not_observed`,
 Correct repair:
 
 ```text
-AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(correct)--> APPROVED
+AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(correct, approved)--> APPROVED
 APPROVED --REPAIR_PROPOSED(acceptable)--> APPROVED
 APPROVED --REPAIR_FINISHED(success)--> REPAIRED
 ```
@@ -603,6 +622,19 @@ Wrong twice:
 ```text
 AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(wrong, 1)--> AWAIT_DIAGNOSIS
 AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(wrong, 2)--> ESCALATED
+```
+
+Prompt-mode decline:
+
+```text
+AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(correct, approved=false)--> AWAIT_DIAGNOSIS
+```
+
+Later denial after approval:
+
+```text
+AWAIT_DIAGNOSIS --DIAGNOSIS_SUBMITTED(correct, approved)--> APPROVED
+APPROVED --DIAGNOSIS_SUBMITTED(correct, approved=false)--> AWAIT_DIAGNOSIS
 ```
 
 Control/no-fault:
@@ -627,7 +659,8 @@ def receipt_for(run_id: str) -> str:
 - The receipt is always `approved:<run_id>` where `run_id` is the current run's
   ID. A retry gets a new `run_id` and therefore a new receipt; the old receipt
   is never carried into the retry.
-- The fold derives receipt issuance from a correct diagnosis event.
+- The fold derives receipt issuance from a correct, approved diagnosis event; a
+  later denial or wrong re-submission clears it.
 - The raw receipt is not stored in approval event payloads.
 - Messages, UI, exports, and replay continue to redact receipts.
 - The repair gate accepts absent or `[REDACTED]` wire receipts after resume,
@@ -1228,8 +1261,9 @@ Work order:
 4. Add fold/replay tests: deterministic `seq` order, idempotent replay,
    rejection events preserve state, no I/O or clock reads in reducers.
 5. Add legacy adapters from `trace_events`, tool rows, and scalar columns.
-   Cover redacted receipts, missing early nudges, later denial clearing a
-   receipt, fallback responder provenance, and legacy tool statuses.
+   Cover redacted receipts, missing early nudges, prompt-mode declines, later
+   denial clearing a receipt, fallback responder provenance, legacy tool
+   statuses, and scalar defaults with no supporting trace evidence.
 6. Add `scripts/gen_state_diagrams.py`; it imports tables and writes
    `docs/STATE_MACHINE.md`. The generator fails on malformed tables.
 7. Run shadow comparison over archived/current DBs. Log mismatches; do not

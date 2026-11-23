@@ -281,12 +281,39 @@ or destructive validation.
 - Design: `docs/STATE_MACHINE_DESIGN.md`
 - Execution plan: `docs/STATE_MACHINE_DESIGN.md` §13; execute the phase gates in
   order and record evidence here before each cutover
-- [ ] Phase 0: pure reducer core, adapters, exhaustive tests, generated diagrams
+- [x] Phase 0: pure reducer core, adapters, exhaustive tests, generated diagrams
 - [ ] Phase 1: gate machine cutover
 - [ ] Phase 2: run lifecycle cutover in two slices — shell/lease foundation,
   then reaper/`--abandon`
 - [ ] Phase 3: tool-call cutover with internal status aliases
 - [ ] Phase 4: `gate-path-v1` annotation scorer and public parity report
+
+### Phase 0 shadow report — 2026-11-23
+
+- Read-only replay sources:
+  - `/tmp/opencode/e2e-final.sqlite3` and its archived copy
+    `/tmp/opencode/archive/20261123T140037Z-c89211/e2e-final.sqlite3`: 7 runs,
+    93 tool calls, 7 mismatches, 0 rejections; identical results.
+  - `/tmp/opencode/e2e-quorum.sqlite3`: 1 run, 22 tool calls, 3 mismatches,
+    0 rejections.
+  - `/tmp/opencode/e2e-fallback.sqlite3`: 5 runs, 56 tool calls, 12 mismatches,
+    0 rejections.
+- Excluding the duplicate archived copy: 13 runs, 171 tool calls, 22 mismatches,
+  0 rejections. There are no gate-field mismatches; all machine tool states
+  replay without rejection.
+- All remaining mismatches are legacy semantic drift, not engine bugs:
+  - 6 `end_reason` fields use legacy `submitted`/`budget_tokens` where the
+    machine derives `verify_ok`/`verify_failed`/`diagnosis_attempts_exhausted`.
+  - 10 status/phase fields are legacy `finished` where the machine reaches
+    `ABORTED` after terminal or abort evidence.
+  - 5 `verify_ok` fields remain populated on those legacy-finished rows; the
+    machine leaves verification undefined on aborted paths.
+  - 1 tool status is `finished` while its result text starts with
+    `timeout waiting for`; the adapter classifies the typed result as
+    `failed`/`timeout`.
+- Scalar defaults without trace evidence are ignored. No DB was mutated and no
+  history was rewritten.
+
 - Public parity report must be recorded here and in generated
   `docs/STATE_MACHINE.md` before any canonical scorer switch is proposed.
 - `etcd-disk-full` remains excluded from live sweeps per the operator decision
