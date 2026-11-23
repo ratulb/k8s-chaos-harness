@@ -1,142 +1,100 @@
-This is a strong design document — the most rigorous thing you've produced in this repo. It makes the right structural calls (three machines, pure reducer + shell, hand-rolled tables, no library, no schema bump), and it explicitly closes several of the gaps I flagged in earlier reviews. The review below is organized as: (A) what's genuinely good, (B) design-level issues worth resolving before Phase 0, (C) specific table/contract inconsistencies, and (D) answers to your six reviewer checkpoints.
+This revision resolves every publication-blocking item from my previous review and adds the decision-summary page I suggested. The design is now coherent enough to start Phase 0. Below is a focused review: what's resolved, what remains, and the handful of items I'd still tighten before code exists.
 
-A. What's genuinely good
-The reducer/shell split is correct. The pure transition(state, event) -> (state, effects) with a transactional shell is the right shape, and the Effect enum makes side effects auditable. This is the thing that makes "deterministic replay" a claim you can actually test.
+What's resolved
+All ten of my prior recommendations are addressed in the document, and several are improved beyond what I asked for:
 
-fold(events) == live
-_state
- as a testable invariant is the single most valuable idea in the document. It converts "SQLite is authoritative" from an aspiration into a property with a test.
+B1 (INTERRUPTED contradiction). §4.2 now has explicit terminal, resumable, end_re
+ason_required
+ dimensions, and
+StateSpec
+ carries all three. §6.2 and §6.5 key the crash action off previous_state, not off INTERRUPTED. §6.6 adds --abandon. This is clean.
 
-The compatibility phasing (shadow → dual-write → enforce → cleanup) per machine, gated by CHAOS_SM_* env flags, is the right incremental-rollout pattern. No big-bang.
+B2 (escalation-reason enum). §5.5.1 is exactly the table I asked for, with strict/headline/funnel columns per reason. The "excluded numerator, visible denominator" rule for run-level reasons is the right generalization.
 
-The crash-action table (§6.5) is the best part of the document. It converts the scattered resume heuristics into a lookup, and it directly fixes the "crashed runs stay running" problem. Keep this.
+B3 (cross-machine coordination). §8.4 names the fold order (tool → gate → run), names the three inter-machine rules (unknown mutating effect escalates outward; gate terminal feeds run; superseded read-only is a no-op), and states the shell executes coordination after all folds agree. This closes the gap.
 
-The typed boundary classifiers (§5.3) — classify_diagnosis, classify_repair, classify_rep
-air_result
- — correctly keep the pure machine independent of scenario JSON and string prefixes. This is what allows §5.5 to be a real table instead of pseudo-code.
+B4 (reaper idempotency). §3.2 invariant 6 now distinguishes producer-seq idempotency from generated-event idempotency, and §6.6 specifies idempotency_key = "reap:{run_id}:{previous_state}:{lease_expires_at}" with a same-transaction check. §11.2's doctor check is now "semantically duplicate generated transitions with the same idempotency_key," which is the right wording.
 
-The receipt model (§5.7) is now correct: deterministic approved:<run_id>, derived by fold, absent from payloads, redacted everywhere, wire value irrelevant after resume. This closes P0.3 cleanly.
+B5 (illegal transition contract). §4.4's caller contract — run loop aborts with state_machine_bug, reaper logs and skips, resume fails closed, shadow logs and continues on legacy — is exactly the discipline needed. §6.4's "An ILLEGAL_TRANSITION reaching the run machine is always a harness bug" makes this explicit.
 
-§1.3 settles the fallback-comparability question I flagged in the previous review, and does it the right way: responder is provenance, not a score gate; chain identity preserved; per-backend baselines require explicit --backend <name> + CHAOS_LLM_FALLBACK=0. Good.
+B6 (tool status compatibility). §7.2's v1-persisted-status + result.code scheme is the right lowest-risk answer, and §14's mitigation row matches it. This avoids silently skipping rows in old score.py/replay.py queries.
 
-The non-goals list (§3.3) is disciplined and correct: no reset ladder, no topology epoch, no LLM loop, no export state, no health observer. This is the right scope.
+B7 (all-candidate failure). §1.3 pins provider_error_all as the sole reason, no provider_error_<last> variant, and the ordered attempts stay in the payload. §6.3's PROVIDER_ERROR_ALL event matches.
 
-§9.4's "shadow, compare across archived DBs, switch canonical only after parity" is exactly the right discipline for a scorer change.
+B8 (no-fault-with-violation strictness). §5.6 and §9.2 now state explicitly that a control run that attempts a repair stays CLEARED but fails strict via repair_after_no_fault. §15 item 7 records this as a decision. This is the right call and it's now visible.
 
-B. Design-level issues to resolve before Phase 0
-These are places where the design is internally consistent but I think the choice should be reconsidered or made more explicit before code exists.
+B9 (nudge cap). §5.4 has MAX_NUDGES = 2 and nudge_count in gate state; §5.5 has the BUDGET_EXHAUSTED transition when the cap is reached. Resolved.
 
-B1. INTERRUPTED as "nonterminal, resume candidate, end reason required" is self-contradictory.
-§6.2 lists INTERRUPTED with Terminal = no, resume candidate and End reason required = yes. §3.2 invariant 2 says "Terminal run states require end_reason." If INTERRUPTED is nonterminal, requiring an end reason violates the invariant's own framing; if it's terminal-for-now, then "resume candidate" needs a separate concept (a resumable flag, not terminality). This matters because §6.5's crash-action lookup keys off "state in interrupted run" and §6.4's ABORT transition from INTERRUPTED is unspecified (the table says "any nonterminal | ABORT | ABORTED", so it's covered, but the reader can't tell whether INTERRUPTED is in that set). Recommendation: add a third dimension to StateSpec — terminal: bool (true for FINISHED/ABORTED/SKIPPED_UNSUPPORTED), resumable: bool (true for INTERRUPTED and nonterminal states), and end_reason_required: bool (true for all terminal states and INTERRUPTED, because you need to know why it was interrupted to pick the crash action). That resolves the contradiction without changing the semantics.
-
-B2. The END_REASON_REQUIRED on ESCALATED (gate) needs a companion rule for the run machine.
-§5.2 says ESCALATED requires an end reason; §6.4 says AGENT_TERMINAL (gate escalation) transitions AGENT_RUNNING → ABORTED with a typed reason. So the gate's end reason becomes the run's end reason. But §9.2's strict_v3 only excludes "end_reason is not excluded" — it doesn't say which gate escalation reasons exclude from headline. diagnosis_attempts_exhausted should be visible but excluded from strict (it's a model failure, not an infra failure); budget_tokens likewise; premature_repair/forbidden_repair are policy violations, already excluded by the 
-no violations
- clause. Recommendation: enumerate the gate escalation reasons in §5.5 and §9.2, and state for each whether it excludes from headline, strict, both, or neither. Right now the reader has to infer the mapping.
-
-B3. The tool machine's UNKNOWN_EFFECT vs. the gate's receipt interaction is under-specified.
-§7.4 says a mutating STARTED call that hits LEASE_EXPIRED becomes UNKNOWN_EFFECT, which "forces abort-and-retry." But §5.5 says APPROVED + a mutating repair can be in flight when the lease expires — and the gate machine's crash action for APPROVED is "resume; abort if mutating tool unknown." So the gate's crash action depends on the tool machine's state. That's fine, but the document doesn't say how the shell coordinates the two: does it fold the tool machine first, then the gate machine, then the run machine? If the tool machine says UNKNOWN_EFFECT, the gate machine should transition APPROVED → ESCALATED(reason=unknown_effect) rather than resume. §6.5 covers the run-machine side ("AGENT_RUNNING with mutating tool UNKNOWN_EFFECT → abort and retry"), but the gate-machine side is missing. Recommendation: add a "cross-machine coordination" subsection (probably in §8) that states the fold order and what each machine does when it observes another machine's state. The current document implies the coordination exists but never names it.
-
-B4. The reaper's idempotency claim (§6.6) needs a concrete mechanism.
-"Repeated detection of the same expired lease does not append duplicate transitions" is the right invariant, but §3.2 invariant 6 says "Every event is idempotent by (run_id, machine, seq)" — which is fine for events that carry a seq, but the reaper's REAP event is generated by the reaper, not by a seq-carrying producer. If the reaper runs twice before the shell processes the first REAP, you get two events with different seqs and the transition fires twice. The idempotency-by-seq rule protects against replaying the same event, not against producing the event twice. Recommendation: add an idempotency key to the REAP event (e.g., (run_id, from_state, lease_expires_at)), and have the shell check it before appending. State this explicitly in §6.6 and §4.4. Without it, the reaper is the one component that can violate invariant 6.
-
-B5. state_transition_rejected vs. invariant 7 ("Illegal transitions append a rejection event and do not mutate state") is right, but §4.4's pseudo-code raises IllegalTransition after appending the rejection. That's fine, but it means the caller must catch it — and if the caller is the run loop, an illegal transition during a resume could abort a run that should have continued. Recommendation: state the contract: apply() raises on illegal transition after recording the rejection, and every caller (run loop, reaper, resume, shadow comparison) must handle it. For the run loop, an illegal transition should become ABORTED with reason state_machine_bug, not a silent continue. Add this to §4.4 and §6.4.
-
-B6. The "no schema bump" claim (§10.1) is mostly true, but the new tool statuses are a real compatibility surface.
-You note in §14 that "tool status consumers break on new strings." The mitigation is "update queries to accept both; doctor reports unknown values." But §7.2 lists UNKNOWN_EFFECT and SUPERSEDED as new persisted statuses, and §11.2 says doctor should check "unfinished mutating tool calls in UNKNOWN_EFFECT." If an old score.py or replay.py queries tool_calls.status IN ('finished', 'failed', 'denied'), it will silently miss the new states. Recommendation: either (a) keep the new states as internal aliases and persist failed with a result_code='unknown_effect', or (b) make the new statuses additive and audit every query in score.py, replay.py, sqlite_store.py that filters on tool status. I'd recommend (a) for the first release — it's the lowest-risk path and matches your §14 mitigation — and move to (b) in the cleanup phase.
-
-B7. §1.3's fallback rule needs one more sentence about the provider_error_* end reason.
-"Failures of earlier candidates are not a run-level provider_error_* when a later candidate answers" — good. But what is the end reason when all candidates fail? It's presumably provider_error_<last> or a generic provider_error_all, and the reader needs to know which, because §9.2's strict_v3 excludes provider-error runs. State the exact end-reason value in §1.3 and §6.3 (event payload). If it's a generic provider_error, say so; if it embeds the last candidate's error code, say that.
-
-B8. The gate's CLEARED terminal state for no_fault is the right call, but §5.5's CLEARED + REPAIR_PROPOSED → CLEARED + violation means the gate never transitions to ESCALATED for a no-fault run that attempts repair. Is that intentional? A model that diagnoses no_fault, then attempts restart_member, should end up with a violation and the run should still be "clean" (the cluster was never broken). I think the design is right, but it means CLEARED can have violations, and §9.2's strict_v3 requires no violations — so a no-fault run with a blocked repair attempt fails strict, even though it correctly diagnosed. Is that intended? If so, say so; if not, §9.2 needs an exception for CLEARED runs where violations are all repair_after_no_fault. This is a real semantic question.
-
-B9. The gate NUDGE event (§5.4) has no cap. §5.5 says AWAIT_DIAGNOSIS + NUDGE → AWAIT_DIAGNOSIS + emit nudge event. If the model gets nudged repeatedly without submitting a diagnosis, the loop emits unbounded nudge events. The current code has an early-nudge bug (P2.6) and a no-tool nudge, but the design should state a cap. Recommendation: add a n
-udge_count
- to the gate state (or to DiagnosisFacts), and define a BUDGET_EXHAUSTED transition from AWAIT_DIAGNOSIS when nudge_count >= MAX_NUDGES. This is a small fix but it prevents an unbounded-event bug.
-
-B10. §4.4's apply() returns State, not Transition. The reducer returns (state, effects), but the shell's 
+B10 (
 apply()
- returns only State. That means callers can't inspect the effects (which they might need for logging, or for the cross-machine coordination in B3). Recommendation: apply() should return the Transition (state + effects + reason) so callers can log it, and the shell executes the effects internally. This is a small API change but it makes the shell's boundary honest.
+ return type). §4.4 now returns Transition, and the shell executes effects internally. Good.
 
-C. Specific table and contract inconsistencies
-C1. §5.2 vs. §5.5 on REPAIRED vs. CLEARED transition to ESCALATED. §5.2 marks both as terminal; §5.5's last row says "REPAIRED / CLEARED / ESCALATED | any | reject." So a budget exhaustion after a successful repair cannot transition to ESCALATED — it's rejected. That's fine (the repair is done, the run can move to verify), but it means the run machine must handle "gate is REPAIRED but the agent loop is still running." §6.4's AGENT_DONE transition expects gate_terminal in the payload, so this works, but the reader needs to know that REPAIRED/CLEARED are agent-loop-stop states, not run terminal states. §5.2 says "Gate-local terminal means the agent loop should stop" — good — but §5.5's rejection rule doesn't distinguish "rejected because terminal" from "rejected because the agent loop should stop." Consider renaming the column to agent_loop_terminal to disambiguate from run terminality.
+The specific table inconsistencies I raised are also fixed:
 
-C2. §5.5's AWAIT_DIAGNOSIS + ESCALATE/BUDGET_EXHAUSTED/ABORT → ESCALATED vs. §5.2's ESCALATED requiring an end reason. The transition table shows three events all going to ESCALATED, but only ESCALATE carries a reason in §5.4. BUDGET_EXHAUSTED carries a reason too, but ABORT also carries one. So all three have reasons — good — but the table doesn't show which reason becomes the end reason. If ESCALATE fires with reason=premature_repair, that becomes the end reason; if BUDGET_EXHAUSTED fires, budget_tokens becomes the end reason. Recommendation: add a reason column to the transition table for the → ESCALATED rows, and state the precedence rule (e.g., BUDGET_EXHAUSTED wins over ESCALATE if both fire, which they shouldn't). This is small but it's the kind of thing that produces a bug in Phase 1.
+C1 — §5.2 uses "Agent-loop terminal" as a column, disambiguated from run terminality, with a clarifying sentence. Resolved.
 
-C3. §6.4's RESET_OK transition says "stop no renewal yet" — that's a typo or a note-to-self, not a table entry. The Effects column for RESETTING + RESET_OK → BASELINING reads "stop no renewal yet." I think you mean "stop the reset-phase renewal; baseline doesn't renew yet." Since §6.6 says setup renewal is being added, the effect for RESET_OK should be "renew lease through baseline" (or "continue renewal"), and the note about "no renewal yet" belongs in a design note, not the table.
+C2 — §5.5 has an
+End reason
+ column, and the precedence rule BUDGET_EXHAUSTED > ESCALATE > ABORT is stated. Resolved.
 
-C4. §6.2's PENDING crash action is "new run," but §6.4's none
-+ CREATE → PENDING
- means a PENDING run has just been created and no work has started. A crash between CREATE and LEASE should arguably be a resume (nothing was done, but the run row exists and a batch may be in flight). The current table says "new run," which would create a second run row and orphan the first. Recommendation: change PENDING's crash action to "resume (re-lease)" — or, if you want to keep "new run," have the reaper mark the orphaned PENDING as ABORTED(reason=orphaned) before creating the replacement. Otherwise a crash-and-retry in PENDING produces duplicate rows.
+C3 — §6.4's RESET_OK effect is now "continue lease renewal through baseline," and the "no renewal yet" note is gone. Resolved.
 
-C5. §7.4's INTENDED/STARTED + DENY
-→ DENIED
- is ambiguous for a STARTED call. If execution has begun and then DENY arrives, you're denying a call that may already have side effects. The tool machine's DENY should only be valid from INTENDED (the gate denies before execution); STARTED + DENY should be rejected, not transition to DENIED. If you really want to support post-start denial, it should be STARTED + CANCEL → UNKNOWN_EFFECT (because you don't know whether the side effect landed). Recommendation: split the row: INTENDED + DENY → DENIED (clean), STARTED + DENY → reject (with a state_transition_rejected event). This matters because the whole point of the tool machine is to make unknown effects explicit.
+C4 — §6.2's PENDING crash action is now "resume (re-lease)," with §6.5's rationale ("a new row would orphan the existing run"). Resolved.
 
-C6. §8.3's legacy adapter maps "finished repair tool call" to gate.repair_finished, but doesn't say how it extracts the typed status. The adapter must map the legacy ERROR:/BLOCKED:/timeout waiting for strings to RepairResultFacts{status: success|failed|timeout|
-denied}
- — that's §7.5's job, but §8.3 doesn't reference it. Recommendation: add a cross-reference from §8.3's row to §7.5, and state that the adapter uses the same classifier as the live path (so shadow comparison is apples-to-apples).
+C5 — §7.4 splits INTENDED + DENY (clean) from STARTED + DENY (reject), and adds STARTED + CANCEL → UNKNOWN_EFFECT for mutating calls. Resolved.
 
-C7. §9.2's strict_v3 requires receipt_issued, but §5.7 says "the raw receipt is not stored in approval event payloads." So receipt_issued must be derived by fold from a correct diagnosis event, not read from a column. That's fine, but the GatePath dataclass (§9.1) carries receipt_issued: bool, so the question is: does the fold set it, or does the shell? Recommendation: state that 
-receipt_issued
- is set by the fold when a DIAGNOSIS_SUBMITTED(correct) event is applied and a receipt_for(run_id) was issued; the 
-GatePath
- is a derived artifact, not a projection. This is already implied by §9.1's "stored as a run_artifacts row," but the document should say it explicitly.
+C6 — §8.3's "finished repair tool call" row now says "typed status extracted by the same classifier as §7.5." Resolved.
 
-C8. §11.2's doctor checks mention "duplicate transition events for the same (run_id, machine, seq)" — but invariant 6 says every event is idempotent by that key. If duplicates are possible, the invariant is violated; if they're impossible, the doctor check is unnecessary. Recommendation: clarify whether "duplicate" means "two events with the same seq" (impossible, since seq is append-only) or "two events with the same semantic content" (possible, e.g., a reaper re-emitting 
-REAP
-). If the latter, the doctor check should be for "semantically duplicate transitions" and the mitigation is B4's idempotency key. Either way, §3.2 invariant 6 and §11.2 need to agree.
+C7 — §9.1 states receipt_issued is fold-set and GatePath is a derived artifact, not a projection. Resolved.
 
-D. Answers to your six reviewer checkpoints
-1. Is CLEARED the right terminal gate state for correct no_fault, or should it be NO_FAULT
-_CONFIRMED
-?
-CLEARED
- is better, but for a different reason than naming: CLEARED describes the cluster state (clear of fault), while NO_FAULT_CONFIRMED describes the diagnosis. The gate's terminal states (REPAIRED, ESCALATED) are about outcome, and CLEARED fits that pattern. Keep CLEARED. However, the wire value cleared is ambiguous in logs ("cleared what?"). Consider no_fault_cleared as the wire value, with CLEARED as the enum name. That gives you both readability and consistency.
+C8 — §3.2 invariant 6 and §11.2 now agree on the two kinds of idempotency (producer seq vs. generated idempotency_key). Resolved.
 
-2. Should INTERRUPTED be parked nonterminal or terminal-with-forced-retry?
-Parked nonterminal, as proposed, but fix the end_reason_required contradiction (B1). The reason to keep it nonterminal: a 
-VERIFYING
- run that's interrupted can resume verify (read-only), which is strictly better than forcing a retry. A terminal-with-forced-retry model would lose that. The cost is that INTERRUPTED sits in queries for a while, which is fine — the reaper's job is to move it to a real terminal state once a human or the next run decides to abandon it. Add a --abandon operator path (or ./chaos abort --abandon) that moves INTERRUPTED → ABORTED(reason=abandoned) explicitly, so INTERRUPTED isn't a permanent limbo.
+The decision summary table at the top is a good addition — it's the one-page artifact a reviewer can approve or reject, and each row points to the section that defends it. The glossary additions (shadow comparison vs. shadow adapter vs. idempotency key vs. internal alias vs. chain ID) fix the §19 gaps I flagged.
 
-3. Is deriving the receipt from run_id acceptable given the current redaction model?
-Yes, and it's the right call. The receipt is approved:<run_id>, which is already derivable from data the harness has, so storing it adds nothing. Redacting it from payloads is fine; deriving it from the fold is fine; accepting [REDACTED] after resume is fine. The one thing to double-check: if a run is resumed into a different process with a different run_id (retry), the receipt changes — which is correct (a retry is a new run). Make sure §5.7 says "the receipt is approved:<run_id> where run_id is the current run's ID," and that retries get a new receipt. If the current code passes the old receipt to the retry, that's a bug worth catching in Phase 1.
+What I'd still tighten before Phase 0
+T1. §6.2's INTERRUPTED crash action is "per previous state," but §6.5's lookup table keys off previous_state — and §6.4's LEASE_EXPIRED transition from "any nonterminal" includes INTERRUPTED itself. A LEASE_EXPIRED event arriving on a run already in INTERRUPTED (say, the reaper runs twice, or a second process crashes) should be a no-op or a rejection, not a re-entry into INTERRUPTED. The table currently permits it. Fix: exclude INTERRUPTED from the "any nonterminal → LEASE_EXPIRED → INTERRUPTED" row, or add an explicit INTERRUPTED + LEASE_EXPIRED → INTERRUPTED (idempotent, no new event) row with the idempotency key as the guard. This is the one place where the reaper's own idempotency and the run machine's transition table aren't in agreement.
 
-4. Is gate-path-v1 ready to become canonical after parity, or should it stay as an annotation scorer for one release?
-Annotation for one release. The reason is not that gate-path-v1 is wrong — it's that the headline number is the thing readers compare across releases, and changing the scorer changes the headline even when behavior is identical. Run both for one release, publish both, and let readers see that strict_v3 and strict-loop-v2 agree on the archived set before switching. Your §9.4 already says this; I'm just endorsing it. The one addition: make the parity report public (in PHASES.md or 
-docs/STATE_MACHINE.md
-) so the switch is auditable.
+T2. §5.5's AWAIT_DIAGNOSIS + NUDGE | BUDGET_EXHAUSTED | nudge cap reached → ESCALATED conflates two different events with two different causes. The NUDGE event that increments nudge_count is in the previous row; the cap-reached case is a guard on the same event, not a separate event. Splitting them as NUDGE (below cap) and NUDGE / BUDGET_EXHAUSTED (cap reached) means the reader has to infer that NUDGE at cap maps to BUDGET_EXHAUSTED(reason=budget_tokens). Fix: either (a) make the second row NUDGE with guard "cap reached" and effect "emit BUDGET_EXHAUSTED then transition," or (b) rename the second row's event to BUDGET_EXHAUSTED only and move the cap-reached→BUDGET_EXHAUSTED conversion into the nudge-cap rule in §5.4. Right now the table and the rule are saying the same thing in two places, which is a drift risk.
 
-5. Are the new tool statuses (unknown_
-effect
-, 
-superseded
-) compatible with downstream reports, or should they remain internal aliases?
-Internal aliases for the first release (B6). Persist failed with a result_code column, and map to 
-unknown_effect
-/
-superseded
- in the machine layer. Then migrate to first-class statuses in the cleanup phase once every query in score.py, replay.py, and sqlite
-_store.py
- has been audited. This is the lowest-risk path and it matches your §14 mitigation ("keep legacy strings for old rows; update queries to accept both"). The downside is that the DB doesn't show the new states, which is a real cost — but the cost of a silently-skipped tool call in a report is worse.
+T3. §8.4's coordination rule "tool SUPERSEDED on a read-only call → no gate or run transition" is correct, but it doesn't say what happens if the superseded call was a REPAIR_PROPOSED that never finished. A read-only tool call being superseded is fine; a repair tool call being superseded (if that's even possible — repairs are mutating, so they should be UNKNOWN_EFFECT not SUPERSEDED) is a different matter. Fix: add a sentence: "Repairs are mutating; a repair call that hits RESUME_SUPERSEDE is a bug — the tool machine rejects it, and the shell records a state_transition_rejected event." This closes the last ambiguity in the cross-machine rules.
 
-6. Is the fallback comparability rule in §1.3 and §9.2 acceptable for headline reporting?
-Yes, with one addition: the headline should be reported per chain configuration, not as a single number. §1.3 says "fallback-enabled runs are comparable as configured chains, not as clean per-backend baselines." Good. But §9.2's strict_v3 is a single boolean per run, and the score tables group by runs.backend (which now holds the chain identity, not the responder). So a reader sees "backend=auto, strict=0.20" and can't tell whether that's one chain or several. Recommendation: add a chain_id projection (a hash of the ordered endpoint list) and group the headline by (chain_id) rather than (backend). Then "auto" is a family of chains, each with its own headline. If you don't want that complexity, state explicitly in §9.2 that fallback-enabled runs are reported separately from per-backend baselines and are never aggregated with them.
+T4. §9.2's strict_v3 requires end_reason in {verify_ok}, which is a strong claim: every strict-success run must end with the literal verify_ok end reason. That's consistent with §6.4 (VERIFY_OK → FINISHED with verify_ok), but it means VERIFY_FAILED → FINISHED(verify_failed) can never be strict, which is right, and it means any future end reason that's also a "success" (e.g., no_fault_verified if you ever separate control runs) would fail strict by default. Fix: either keep the set literal (and document that adding new strict-eligible end reasons requires updating §9.2), or express it as end_reason not in EXCLUDED_REASONS where EXCLUDED_REASONS is the §5.5.1 + §9.2 union. The second is safer against future drift; the first is more auditable. Pick one and say why.
 
-E. Minor issues
-§13 Phase 2 lists chaos_cli.py as a file to change, but the reaper's location is "to be chosen during implementation." A design document should name the location (e.g., harness/reaper.py, invoked by chaos_cli.py at startup and by ./chaos status). Pick one.
+T5. §12.1's exhaustive-table-test requirement ("every (state, event) pair yields either a defined transition or a defined rejection") is the right test, but the transition tables don't currently enumerate rejections explicitly — they say "terminal | any | reject" and rely on the test to catch missing rows. The design would be stronger if the generator (or a test helper) emitted the full state × event matrix from the tables and failed if any cell was neither an explicit transition nor an explicit reject. Fix: add one sentence to §12.1: "The test loads the transition tables and asserts every (state, event) cell is either an explicit row or an explicit reject; a missing cell is a test failure, not a runtime IllegalTransition." This makes "illegal transitions are visible" (a goal in §3.1) testable rather than aspirational.
 
-§12.7 says "No live test uses etcd-disk-full, per the standing exclusion." Good — but the standing exclusion isn't documented anywhere in this design or (as far as I can see) in the README. Add a one-line rationale (destructive to the point of unrecoverable?) and a pointer to where it's enforced.
+T6. §13 Phase 2's file list includes harness/reaper.py and chaos abort --abandon, but run_benchmark.py is listed without saying what changes there. Phase 2's acceptance criteria ("phase writes only in transition shell," "setup lease renewal active") imply run_benchmark.py is being rewritten to call the shell instead of writing runs.status/runs.phase directly. Fix: add a sentence to Phase 2's acceptance: "run_benchmark.py no longer writes status, phase, or end_reason directly; all writes go through apply()." That's the verifiable condition.
 
-§16's Mermaid diagram shows AWAIT_DIAGNOSIS --> AWAIT_DIAGNOSIS: wrong diagnosis / nudge / premature repair, which conflates three different events with different payloads and different effects. The generator (§4.6) will produce per-event edges, so the hand-drawn diagram will be replaced — good — but the hand-drawn one is currently misleading. Consider making it illustrative-only with a note, or generating it from the start.
+T7. §13 Phase 3 doesn't mention the result.code migration. §7.2 says new states are persisted as finished/failed + result.code in the existing result TEXT column as JSON. But existing rows may have plain-text result values (like "superseded_after_resume" from run_benchmark.py:288-298, per §2.3). Fix: add a sentence to Phase 3's acceptance: "Existing plain-text result values are read as
+result.code
+ only when they're JSON; otherwise they're treated as a legacy result.text and preserved. New writes always use the JSON envelope." This is the compatibility contract that makes "old rows remain readable" true.
 
-§17's diagram shows VERIFYING --> INTERRUPTED: LEASE_EXPIRED, which is correct per §6.4, but it also shows VERIFYING --> FINISHED: VERIFY_OK / VERIFY_FAILED without noting that both require a score row and final record. The diagram is illustrative, but the transition table (§6.4) should say "write score and final record" for both.
+T8. §15's resolved-checkpoints list has eight items, but the six original reviewer questions plus B8 (no-fault strictness) and B2 (escalation-reason enum) — that's eight, matching — but the document doesn't say which of the six original questions are now decisions vs. open. The header says "resolved as decisions; two semantic questions from the review are also recorded here for auditability." That's clear enough, but a reader scanning for "what's still open" won't find it. Fix: add a one-line note at the end of §15: "No reviewer checkpoint remains open; any future disagreement is a new proposal, not a reopened question." That's the closure statement that makes the decision summary at the top authoritative.
 
-§19's glossary defines "Shadow mode" as "Reducer runs without controlling behavior; mismatches are logged." Good. But the document uses "shadow comparison" in §12.2 and "shadow adapter" in §8.3 without defining whether those are the same thing. They're not: shadow comparison is the test, shadow adapter is the legacy-event mapper. Add both to the glossary.
+One small addition I'd recommend
+Add a "§0.1 — What this design does not fix" section. The non-goals (§3.3) cover the scope exclusions (no reset ladder, no LLM-loop machine, etc.), but they don't cover the known gaps this design leaves in place. Specifically, the design resolves P0.3, P1.5, P1.7, P1.12, P2.6, run crash state, resume ambiguity, and tool unknown effect (per §2.5), but it does not address:
 
-F. One structural suggestion
-The document is 19 sections and ~700 lines. That's appropriate for a design proposal, but it means reviewers will skim. Consider adding a one-page "decision summary" at the top (above §0 or replacing most of §1) with the 8–10 decisions a reviewer must approve: three machines, pure reducer + shell, no schema bump, receipt from run_id, INTERRUPTED parked-nonterminal, fallback responder-is-provenance, tool statuses as internal aliases in v1, gate-path-v1 annotation-only for one release, setup lease renewal before reaper, no reset-ladder/topology/health machines. Each decision gets one line and a pointer to the section that justifies it. That's the artifact that gets you a decision, and the rest of the document is the defense.
+P1.4 (three definitions of success — common/scoring.py, score.py, replay.py still compute independently; gate-path-v1 is one of them, but the unification is Phase 4/cleanup).
+
+P1.6 (trace written twice — engine appends and export_all() rewrites; the state machine doesn't change this).
+
+P1.8 (tools/ mixes domain and infrastructure).
+
+P1.9 (primitive-obsession leftovers — some are resolved by typed events, but
+config_hash
+, Backend, call_id remain).
+
+P1.10 (destructive policy scattered — the gate machine owns gate policy, but
+safety.py
+, topology.py:capability, and prompt.py still each hold a piece).
+
+P1.14 (whole-flow testability — run_benchmark.main() and chaos_cli.main() still mix argv/exit/subprocess; Phase 2 changes what they call but not their shape).
+
+P2.1 (streaming fallback invisibility — unrelated to machines).
+
+P2.5 (score-version precedence — gate-path-v1 is a new version, but the read-side ORDER BY ambiguity is not addressed).
+
+A short section listing these — "Known gaps not addressed by this design; tracked in ARCHITECTURE.md §5" — prevents a reviewer from concluding the state-machine work is the whole refactor. It isn't, and the document should say so plainly. This is the one structural omission I'd flag as worth adding before Phase 0.
 
 Bottom line
-This is a publishable design document, and the Phase 0 → 4 sequence is the right order. Before Phase 0, resolve B1 (INTERRUPTED terminality contradiction), B3 (cross-machine coordination order), B4 (reaper idempotency key), B6 (tool status compatibility), and C4 (PENDING crash action) — those are the ones that will produce real bugs in Phase 1–2 if left implicit. B8 (no-fault-with-violation strictness) and B2 (escalation-reason enum) are semantic decisions you should make now, because they affect strict_v3 and therefore the headline number. Everything else is polish or documentation, and the reviewer checkpoints are well-chosen: your six questions are exactly the six I'd ask, and the answers are mostly already implied by the document — they just need to be stated as decisions rather than left for the reader to infer.
+The design is ready for Phase 0. T1 (the INTERRUPTED + LEASE_EXPIRED table row) is the only item I'd call a correctness fix rather than a clarity fix; the rest (T2–T8) are precision improvements that will make Phase 1–2 code easier to write and review, but none blocks starting. The decision summary, the resolved-checkpoints section, and the expanded glossary make the document approvable as-is; the "what this design does not fix" section is the one addition I'd argue for strongly, because it's the difference between "this is the refactor" and "this is one refactor among several," and the document currently reads like the former.
 

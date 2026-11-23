@@ -54,6 +54,29 @@ Rollout order:
    public parity report, before any canonical switch;
 6. leave the optional cluster-health observer out of the first implementation.
 
+### 0.1 What this design does not fix
+
+This is one refactor among several, not the whole hardening program. The state
+machines resolve P0.3, P1.5, P1.7, P1.12, P2.6, the run-crash state gap, resume
+ambiguity, and tool unknown effect. They do **not** resolve the following known
+gaps, which remain tracked in `docs/ARCHITECTURE.md` §5:
+
+- P1.4: success is still computed independently in `common/scoring.py`,
+  `score.py`, and `replay.py`; `gate-path-v1` adds another version rather than
+  unifying the read side.
+- P1.6: the trace is still written by the engine and rewritten by
+  `export_all()`.
+- P1.8: `tools/` still mixes domain tools with infrastructure.
+- P1.9: primitive-obsession leftovers such as `config_hash`, `Backend`, and
+  `call_id` remain; typed events reduce but do not eliminate them.
+- P1.10: destructive policy is still split across the gate machine,
+  `safety.py`, `topology.py:capability`, and `prompt.py`.
+- P1.14: `run_benchmark.main()` and `chaos_cli.main()` still mix argv, exit, and
+  subprocess concerns; Phase 2 changes what they call, not their shape.
+- P2.1: streaming fallback invisibility is unrelated to machines.
+- P2.5: score-version precedence on the read side, including the `ORDER BY`
+  ambiguity, is unchanged.
+
 ## 1. Review inputs and decisions
 
 ### 1.1 Where the reviewers agree
@@ -509,9 +532,11 @@ This keeps the pure machine independent of scenario JSON and string prefixes.
 | `ABORT` | `reason`, `actor` |
 | `UNKNOWN_EFFECT` | `tool_call_id`, `reason` |
 
-Gate state carries `nudge_count`, incremented only by `NUDGE`. `MAX_NUDGES = 2`;
-a further nudge is not emitted. A cap reached without a diagnosis emits
-`BUDGET_EXHAUSTED(reason=budget_tokens)`.
+Gate state carries `nudge_count`, incremented only by `NUDGE`. `MAX_NUDGES = 2`.
+When the next nudge would exceed the cap, the nudge layer converts that
+intention to `BUDGET_EXHAUSTED(reason=budget_tokens, detail=nudge_cap)` before
+the gate transition; no further `NUDGE` event is emitted. `BUDGET_EXHAUSTED` may
+also arrive directly from the token-budget guard with `detail=token_budget`.
 
 ### 5.5 Transition table
 
@@ -522,7 +547,7 @@ a further nudge is not emitted. A cap reached without a diagnosis emits
 | `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, below cap | `AWAIT_DIAGNOSIS` | none | record attempt |
 | `AWAIT_DIAGNOSIS` | `DIAGNOSIS_SUBMITTED` | wrong, cap reached | `ESCALATED` | `diagnosis_attempts_exhausted` | record attempt |
 | `AWAIT_DIAGNOSIS` | `NUDGE` | `nudge_count < MAX_NUDGES` | `AWAIT_DIAGNOSIS` | none | increment `nudge_count`, emit nudge event |
-| `AWAIT_DIAGNOSIS` | `NUDGE` / `BUDGET_EXHAUSTED` | nudge cap reached or token budget exhausted | `ESCALATED` | `budget_tokens` | record budget terminal |
+| `AWAIT_DIAGNOSIS` | `BUDGET_EXHAUSTED` | nudge cap converted or token budget exhausted | `ESCALATED` | `budget_tokens` | record budget terminal |
 | `AWAIT_DIAGNOSIS` | `REPAIR_PROPOSED` | always | `AWAIT_DIAGNOSIS` | none | record `premature_repair` violation |
 | `AWAIT_DIAGNOSIS` | `ESCALATE` | always | `ESCALATED` | event `reason` | set end reason |
 | `AWAIT_DIAGNOSIS` | `ABORT` | actor is operator | `ESCALATED` | `abandoned` | set end reason |
@@ -692,12 +717,18 @@ action for an interrupted run is keyed by the `previous_state` recorded in the
 | any nonterminal, including `INTERRUPTED` | `ABORT` | `ABORTED` | typed abort reason | release lease |
 | `INTERRUPTED` | `ABANDON` | `ABORTED` | `abandoned` | release lease |
 | any nonterminal | `ILLEGAL_TRANSITION` | `ABORTED` | `state_machine_bug` | log machine/event, release lease |
-| any nonterminal | `LEASE_EXPIRED` | `INTERRUPTED` | `lease_expired` | preserve previous state and idempotency key |
+| any nonterminal except `INTERRUPTED` | `LEASE_EXPIRED` | `INTERRUPTED` | `lease_expired` | preserve previous state and idempotency key |
+| `INTERRUPTED` | `LEASE_EXPIRED` | `INTERRUPTED` | unchanged | idempotent no-op when `idempotency_key` matches; otherwise reject |
 | terminal | any | reject | unchanged | append rejection event |
 
 An `ILLEGAL_TRANSITION` reaching the run machine is always a harness bug. It
 must not be treated as a successful continue; the run aborts with
 `state_machine_bug` and the rejection event remains in the trace.
+
+A second lease-expiry observation on an already `INTERRUPTED` run is not a
+re-entry. With the same `idempotency_key`, `apply()` returns the stored
+`Transition` without appending an event. With a different key, the transition is
+rejected and the original `previous_state` is preserved.
 
 ### 6.5 Resume triage as crash-action lookup
 
@@ -871,7 +902,13 @@ observations. Rules:
 - tool `SUPERSEDED` on a read-only call → no gate or run transition; resume
   proceeds from the gate fold.
 
-Coordination effects are deterministic and replayable. The shell executes them
+Repairs are mutating. A repair call that reaches `RESUME_SUPERSEDE` is a bug:
+the tool machine rejects the transition, the shell records a
+`state_transition_rejected` event, and the run follows the unknown-effect path
+rather than treating the repair as cleanly superseded.
+
+Coordination effects are deterministic and replayable.
+ The shell executes them
 after all folds agree, so a partial crash cannot leave the gate in `APPROVED`
 while the run has already retried.
 
@@ -924,7 +961,10 @@ The excluded reason set is explicit: any gate escalation reason in §5.5.1,
 `provider_error_all`, `fault_not_observed`, `reset_failed`, `baseline_failed`,
 `injection_failed`, `state_machine_bug`, `lease_expired`,
 `interrupted_unknown_previous_state`, `abandoned`, and any budget end reason.
-Only `verify_ok` is a strict-success end reason.
+Only `verify_ok` is a strict-success end reason. The allowlist is kept literal
+deliberately: strict is intentionally narrow, and adding a new strict-eligible
+end reason is a design change that must update §6.4, §9.2, and the scorer tests.
+This is more auditable than a default-allow excluded-reason set.
 
 `no_fault` runs reach `CLEARED` and require no repair. A control run that
 attempts a repair keeps the `CLEARED` terminal state but records
@@ -1037,6 +1077,9 @@ For every machine:
 
 - every `(state, event)` pair yields either a defined transition or a defined
   rejection;
+- the test loads the transition tables and asserts every `(state, event)` cell
+  is either an explicit row or an explicit reject; a missing cell is a test
+  failure, not a runtime `IllegalTransition`;
 - every terminal state has required invariants;
 - every nonterminal state has a crash action;
 - every state is reachable or explicitly marked historical;
@@ -1173,7 +1216,9 @@ Files:
 
 Acceptance:
 
-- phase writes only in transition shell;
+- phase writes only in transition shell; `run_benchmark.py` no longer writes
+  `status`, `phase`, or `end_reason` directly, and all writes go through
+  `apply()`;
 - setup lease renewal active;
 - reaper writes `interrupted`;
 - resume triage is a table lookup;
@@ -1194,7 +1239,9 @@ Acceptance:
 - intents before execution;
 - named `UNKNOWN_EFFECT` and `SUPERSEDED`;
 - result status typed;
-- legacy artifacts still readable.
+- new writes always use the JSON envelope in `result`, with `result.code`;
+- existing plain-text result values are read as `result.code` only when they are
+  JSON; otherwise they are preserved as legacy `result.text`.
 
 ### Phase 4 — scorer and cleanup
 
@@ -1248,6 +1295,9 @@ from the review are also recorded here for auditability.
 8. Gate escalation reasons are enumerated with their strict/headline treatment;
    run-level end reasons follow the same excluded-numerator/visible-denominator
    rule. See §5.5.1 and §9.2.
+
+No reviewer checkpoint remains open; any future disagreement is a new proposal,
+not a reopened question. The decision summary at the top is authoritative.
 
 ## 16. Appendix A — gate diagram
 
