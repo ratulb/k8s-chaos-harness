@@ -277,7 +277,7 @@ derived views
 
 0. **No-cluster LLM smoke test**
    - `./chaos ping ...` parser at `chaos_cli.py:257-259`; dispatch at
-     `chaos_cli.py:332-333`.
+     `chaos_cli.py:334`.
    - `_ping()` at `chaos_cli.py:214-247` calls `build_backend()`, checks
      `LLMClient.health()`, and then runs one `LLMOutcome.invoke()` completion.
    - It does not load scenarios or touch the cluster; missing endpoint/key
@@ -285,8 +285,8 @@ derived views
 
 1. **CLI launch**
    - `./chaos` calls `chaos_cli.main()` at `chaos:8-10`.
-   - `run` parser at `chaos_cli.py:291-304`; flags include `--resume-of`,
-     `--force-resume`, and `--discard-stale`.
+   - `run` parser at `chaos_cli.py:291-305`; flags include `--batch-id`,
+     `--resume-of`, `--force-resume`, and `--discard-stale`.
    - Launcher builds `launch_id`, argv, and env at `chaos_cli.py:341-355`.
    - Foreground uses `subprocess.call`; detached uses `Popen` with a launch log.
 
@@ -375,7 +375,7 @@ triage:
 
 Resume details:
 
-- CLI flags at `chaos_cli.py:301-304`; runner flags at `run_benchmark.py:395-399`.
+- CLI flags at `chaos_cli.py:302-305`; runner flags at `run_benchmark.py:395-399`.
 - Candidate selection at `run_benchmark.py:590-597`.
 - Retry decision at `run_benchmark.py:599-623`.
 - Retry creation at `run_benchmark.py:344-382`.
@@ -435,8 +435,9 @@ HEAD `5df4539`.
      (`run_benchmark.py:65`, `harness/verification.py:20-27`).
    - Target names are now allow-list validated before entering `run_env`
      (`tools/scenario.py:304-313`), closing the practical injection path.
-   - Scenario commands still interpolate `$TARGET_NODE` without `shlex.quote`
-     (`scenarios/etcd-member-down.json:8`).
+   - Scenario commands now quote `$TARGET_NODE`
+     (`scenarios/etcd-member-down.json:8`); future scenario commands must keep
+     that pattern.
 
 7. **Prompt-mode gate-receipt contradiction — fixed**
    - Repair schemas now require `approval_token` (`tools/tool.py:221-238`).
@@ -515,7 +516,7 @@ HEAD `5df4539`.
       nuke confirmation remain in separate modules with no `TopologyPolicy`.
       (`tools/safety.py:29-64`, `tools/topology.py:639-719`,
       `harness/tooling.py:256-292`, `harness/prompt.py:43-61`,
-      `chaos_cli.py:407-415`).
+      `chaos_cli.py:410-418`).
 
 11. **`mode` changes only topology eligibility — open**
     - `mode` affects capability checks and UI header only; fresh setup still
@@ -534,7 +535,7 @@ HEAD `5df4539`.
 
 14. **Whole-flow testability is weak — partial**
     - `chaos_cli.main(argv=None)` is injectable and returns `int`
-      (`chaos_cli.py:250`, `:714`).
+      (`chaos_cli.py:250`, `:717`).
     - `run_benchmark.main()` still parses `sys.argv` and calls `sys.exit`.
     - Prompt approval still patches `builtins.input`.
 
@@ -569,8 +570,9 @@ HEAD `5df4539`.
      `:569`, `:640`, `:643`, `:675`).
    - Multi-run sweeps remain serial.
 
-4. **`./chaos run` cannot set `--batch-id` — partial**
-   - CLI still lacks `--batch-id` (`chaos_cli.py:291-304`).
+4. **`./chaos run` cannot set `--batch-id` — fixed**
+   - CLI parses `--batch-id` at `chaos_cli.py:298` and forwards it to the runner
+     at `chaos_cli.py:356-357`.
    - Runner honors `args.batch_id` (`run_benchmark.py:394`, `:533-543`,
      `:578-587`).
    - `launch_id` no longer doubles as `batch_id`; it only supplies a fallback.
@@ -670,7 +672,7 @@ Landed:
 1. Verify env symmetry, fixture fault-check env, fixture opt-in, evidence
    preservation on topology change, target validation, receipt rebuild,
    diagnosis attempt cap, event-payload redaction, checkpoint-time lease renewal,
-   and background lease renewal.
+   background lease renewal, scenario target quoting, and CLI batch-id parity.
 2. One `Score` object used by loop, `score.py`, and `replay.py`; explicit
    scorer-version precedence; `verify_output` in records.
 3. Streaming fallback visibility and redacted derived traces/exports; failed

@@ -295,6 +295,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--approve", choices=["policy", "prompt"], default="policy")
     run.add_argument("--runs", type=int, default=1)
     run.add_argument("--seed", type=int, default=0)
+    run.add_argument("--batch-id", default=None)
     run.add_argument("--detach", action="store_true")
     run.add_argument("--ui", choices=["none", "plain", "live"], default="plain")
     run.add_argument("--logs-dir", default=str(ROOT / "logs"))
@@ -351,8 +352,10 @@ def main(argv: list[str] | None = None) -> int:
             "--trace-dir", args.trace_dir,
             "--ui", args.ui,
             "--logs-dir", str(logs_dir),
-            "--launch-id", launch_id,
         ]
+        if args.batch_id:
+            cmd.extend(["--batch-id", args.batch_id])
+        cmd.extend(["--launch-id", launch_id])
         if args.resume_of:
             cmd.extend(["--resume-of", args.resume_of])
         if args.force_resume:

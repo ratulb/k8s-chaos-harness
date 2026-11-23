@@ -242,6 +242,7 @@ class TestChaosCli(unittest.TestCase):
                         "--scenario", "etcd-member-down",
                         "--backend", "ollama",
                         "--approve", "prompt",
+                        "--batch-id", "sweep-1",
                         "--detach",
                         "--ui", "none",
                         "--logs-dir", str(logs),
@@ -252,6 +253,7 @@ class TestChaosCli(unittest.TestCase):
             self.assertTrue(Path(payload["log"]).parent.exists())
             self.assertIn("--approve", payload["command"])
             self.assertEqual(payload["command"][payload["command"].index("--approve") + 1], "prompt")
+            self.assertEqual(payload["command"][payload["command"].index("--batch-id") + 1], "sweep-1")
             self.assertIn("--launch-id", payload["command"])
             self.assertTrue(payload["command"][-1].startswith("launch-"))
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
