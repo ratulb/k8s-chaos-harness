@@ -51,7 +51,6 @@ class Approval:
     run_id: str
     diagnosis: str | None
     source: str
-    token: str | None
     message: str
     raw: Any = None
     attempt: int = 0

@@ -30,15 +30,19 @@ class TestTooling(unittest.TestCase):
         self.assertEqual(schema["function"]["parameters"]["properties"]["node"]["enum"], ["node-a", "node-b"])
 
     def test_repair_handler_resolves_module_attribute_at_call_time(self) -> None:
-        state = AgentState({"acceptable_repairs": [RESTART_MEMBER], "forbidden_repairs": []}, "run-1", "policy")
-        state.diagnosis_submitted = True
-        state.diagnosis_correct = True
-        state.approval_token = "approved:run-1"
+        state = AgentState(
+            {"root_cause": "etcd_member_unreachable", "acceptable_repairs": [RESTART_MEMBER], "forbidden_repairs": []},
+            "run-1",
+            "policy",
+        )
+        Diagnosis(state).execute(
+            Tool(DIAGNOSIS_TOOL, "", kind="diagnosis"),
+            {"root_cause": "etcd_member_unreachable"},
+            "call-0",
+        )
         context = ToolContext(call_id="call-1", repair=Repair(state, TOOL_REGISTRY))
         with patch("tools.tool.repairs.restart_member", return_value="patched") as patched:
-            outcome = TOOL_REGISTRY.get(RESTART_MEMBER).run(
-                {"node": "vm1", "approval_token": "approved:run-1"}, context
-            )
+            outcome = TOOL_REGISTRY.get(RESTART_MEMBER).run({"node": "vm1"}, context)
         self.assertTrue(patched.called)
         self.assertEqual(outcome.message, "patched")
 
@@ -62,7 +66,7 @@ class TestTooling(unittest.TestCase):
         self.assertIsInstance(result, ToolOutcome)
         self.assertTrue(result.diagnosis_submitted)
         self.assertTrue(result.diagnosis_correct)
-        self.assertEqual(result.approval_token, "approved:run-1")
+        self.assertEqual(state.receipt, "approved:run-1")
 
     def test_repair_execute_blocks_without_diagnosis(self) -> None:
         scenario = {"acceptable_repairs": [RESTART_MEMBER], "forbidden_repairs": []}

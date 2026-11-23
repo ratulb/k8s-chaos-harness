@@ -49,7 +49,7 @@ The default probe node is {self.probe_node}.
 Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
 root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
 
-If the diagnosis is accepted, submit_diagnosis returns a gate receipt in the approval_token field. Include that receipt in repair calls; the harness also keeps receipt state and accepts a redacted receipt after resume.
+If the diagnosis is accepted, the harness gate is open internally; do not pass receipts or approval tokens to repair calls.
 submit_diagnosis accepts at most two attempts. If rejected, gather one new decisive observation before the final attempt; do not brute-force labels.
 Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
 Investigate briefly: use at most four assistant turns of read-only tools, then call submit_diagnosis immediately. Do not keep investigating once the likely root cause is clear.

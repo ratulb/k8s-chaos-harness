@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Callable
 
 from common.results import Approval, Refusal, Result, ResultKind
 from common.vocab import ROOT_CAUSE_LABELS
+from harness.gate_runtime import GateRuntime, classify_repair_result
+from harness.machines.gate import MAX_DIAGNOSIS_ATTEMPTS, GatePhase
 from harness.prompt import SystemPrompt
 from tools.naming import normalize_repair_name
 from tools.scenario import Scenario, as_scenario
 from tools.tool import Tool, ToolOutcome
-
-MAX_DIAGNOSIS_ATTEMPTS = 2
 
 
 def normalize_diagnosis(value: object) -> str | None:
@@ -33,41 +33,29 @@ class AgentState:
     scenario: Scenario
     run_id: str
     approve: str
-    diagnosis: str | None = None
-    diagnosis_raw: Any = None
-    diagnosis_submitted: bool = False
-    diagnosis_correct: bool = False
-    diagnosis_attempts: int = 0
-    diagnosis_first_attempt_correct: bool = False
-    approval_token: str | None = None
-    approval_source: str | None = None
-    repair: str | None = None
-    repair_args: dict[str, Any] | None = None
-    policy_violations: list[str] = field(default_factory=list)
-    forbidden_reason: str | None = None
+    gate: GateRuntime | None = None
+    log: Callable[[dict[str, Any]], int] | None = None
 
     def __post_init__(self) -> None:
         self.scenario = as_scenario(self.scenario)
+        if self.gate is None:
+            self.gate = GateRuntime(run_id=self.run_id, log=self.log)
 
     @classmethod
-    def from_snapshot(cls, snapshot: dict[str, Any], scenario: Scenario, run_id: str, approve: str) -> "AgentState":
-        diagnosis = snapshot.get("diagnosis")
+    def from_snapshot(
+        cls,
+        snapshot: dict[str, Any],
+        scenario: Scenario,
+        run_id: str,
+        approve: str,
+        log: Callable[[dict[str, Any]], int] | None = None,
+    ) -> "AgentState":
         return cls(
             scenario=as_scenario(scenario),
             run_id=run_id,
             approve=approve,
-            diagnosis=diagnosis,
-            diagnosis_raw=snapshot.get("diagnosis_raw"),
-            diagnosis_submitted=bool(snapshot.get("diagnosis_submitted", diagnosis is not None)),
-            diagnosis_correct=bool(snapshot.get("diagnosis_correct", False)),
-            diagnosis_attempts=int(snapshot.get("diagnosis_attempts", 0)),
-            diagnosis_first_attempt_correct=bool(snapshot.get("diagnosis_first_attempt_correct", False)),
-            approval_token=snapshot.get("approval_token"),
-            approval_source=snapshot.get("approval_source"),
-            repair=snapshot.get("repair"),
-            repair_args=snapshot.get("repair_args"),
-            policy_violations=list(snapshot.get("policy_violations") or []),
-            forbidden_reason=snapshot.get("forbidden_reason"),
+            gate=GateRuntime.from_snapshot(run_id, snapshot.get("gate"), log=log),
+            log=log,
         )
 
     def snapshot(
@@ -78,45 +66,79 @@ class AgentState:
         tokens_used: int,
         diagnosis_nudged: bool,
     ) -> dict[str, Any]:
+        assert self.gate is not None
         return {
-            "diagnosis": self.diagnosis,
-            "diagnosis_raw": self.diagnosis_raw,
-            "diagnosis_submitted": self.diagnosis_submitted,
-            "diagnosis_attempts": self.diagnosis_attempts,
-            "diagnosis_first_attempt_correct": self.diagnosis_first_attempt_correct,
-            "approval_token": self.approval_token,
-            "diagnosis_correct": self.diagnosis_correct,
-            "approval_source": self.approval_source,
-            "repair": self.repair,
-            "repair_args": self.repair_args,
-            "policy_violations": self.policy_violations,
-            "forbidden_reason": self.forbidden_reason,
+            "gate": self.gate.to_snapshot(),
             "steps": steps,
             "tokens_used": tokens_used,
-            "diagnosis_nudged": diagnosis_nudged,
+            "diagnosis_nudged": self.gate.nudged,
             "trace_path": trace_path,
             "seq": seq,
         }
 
-    def apply(self, outcome: ToolOutcome) -> None:
-        if outcome.diagnosis_submitted:
-            self.diagnosis = outcome.diagnosis
-            self.diagnosis_raw = outcome.diagnosis_raw
-            self.diagnosis_submitted = True
-            self.diagnosis_correct = bool(outcome.diagnosis_correct)
-            self.diagnosis_attempts = outcome.diagnosis_attempts or self.diagnosis_attempts
-            self.diagnosis_first_attempt_correct = (
-                outcome.diagnosis_first_attempt_correct or self.diagnosis_first_attempt_correct
-            )
-            self.approval_token = outcome.approval_token
-            self.approval_source = outcome.approval_source
-        if outcome.repair is not None:
-            self.repair = outcome.repair
-            self.repair_args = outcome.repair_args
-        if outcome.policy_violation:
-            self.policy_violations.append(outcome.policy_violation)
-        if outcome.forbidden_reason:
-            self.forbidden_reason = outcome.forbidden_reason
+    @property
+    def diagnosis(self) -> str | None:
+        assert self.gate is not None
+        return self.gate.state.diagnosis_label
+
+    @property
+    def diagnosis_raw(self) -> Any | None:
+        assert self.gate is not None
+        return self.gate.diagnosis_raw
+
+    @property
+    def diagnosis_submitted(self) -> bool:
+        assert self.gate is not None
+        return self.gate.state.diagnosis_attempts > 0
+
+    @property
+    def diagnosis_correct(self) -> bool:
+        assert self.gate is not None
+        return bool(self.gate.state.diagnosis_correct)
+
+    @property
+    def diagnosis_attempts(self) -> int:
+        assert self.gate is not None
+        return self.gate.state.diagnosis_attempts
+
+    @property
+    def diagnosis_first_attempt_correct(self) -> bool:
+        assert self.gate is not None
+        return self.gate.state.first_attempt_correct
+
+    @property
+    def receipt(self) -> str | None:
+        assert self.gate is not None
+        return self.gate.receipt
+
+    @property
+    def approval_source(self) -> str | None:
+        assert self.gate is not None
+        return self.gate.approval_source
+
+    @property
+    def repair(self) -> str | None:
+        assert self.gate is not None
+        return self.gate.accepted_repair
+
+    @property
+    def repair_args(self) -> dict[str, Any] | None:
+        assert self.gate is not None
+        return self.gate.repair_args
+
+    @property
+    def policy_violations(self) -> list[str]:
+        assert self.gate is not None
+        return self.gate.policy_violations
+
+    @property
+    def forbidden_reason(self) -> str | None:
+        assert self.gate is not None
+        return self.gate.forbidden_reason
+
+    def record_nudge(self, *, step: int | None = None, kind: str = "budget") -> None:
+        assert self.gate is not None
+        self.gate.nudge(step=step, kind=kind)
 
 
 class Diagnosis:
@@ -130,19 +152,21 @@ class Diagnosis:
     ) -> None:
         self.state = state
         self.store = store
-        self.log = log
         self.pause_reporter = pause_reporter
         self.resume_reporter = resume_reporter
 
     def decide(self, tool: Tool, args: dict[str, Any]) -> Result[Approval]:
+        assert self.state.gate is not None
+        gate = self.state.gate
         raw = args.get("root_cause")
         diagnosis = normalize_diagnosis(raw)
-        attempt = self.state.diagnosis_attempts + 1
-        exhausted = self.state.diagnosis_attempts >= MAX_DIAGNOSIS_ATTEMPTS
+        attempt = gate.state.diagnosis_attempts + 1
+        exhausted = gate.state.diagnosis_attempts >= MAX_DIAGNOSIS_ATTEMPTS
         correct = not exhausted and diagnosis == self.state.scenario.root_cause
         first_attempt_correct = correct and attempt == 1
+        no_fault = diagnosis == "no_fault" or self.state.scenario.root_cause == "no_fault"
         approved = correct
-        approval_source = None
+        source = None
         if approved and self.state.approve == "prompt":
             if self.pause_reporter is not None:
                 self.pause_reporter()
@@ -155,33 +179,31 @@ class Diagnosis:
                 if self.resume_reporter is not None:
                     self.resume_reporter()
             approved = answer in {"y", "yes"}
-            approval_source = "operator"
+            source = "operator"
         elif approved:
-            approval_source = "policy"
-        token = f"approved:{self.state.run_id}" if approved else None
+            source = "policy"
+        gate.submit_diagnosis(
+            label=diagnosis,
+            correct=correct,
+            approved=approved,
+            attempts=attempt,
+            first_attempt_correct=first_attempt_correct,
+            is_no_fault=no_fault,
+            source=source,
+            raw=raw,
+        )
         if exhausted:
             reason = "diagnosis attempts exhausted; report findings and escalate without repair"
         elif not correct:
             reason = "diagnosis rejected; gather new evidence before resubmitting; do not brute-force labels"
-        elif self.state.approve == "prompt" and not approved:
+        elif not approved:
             reason = "diagnosis correct; operator declined repair approval"
         else:
             reason = ""
-        decision: Result[Approval]
-        if approved:
-            decision = Result.approval(Approval(
-                run_id=self.state.run_id,
-                diagnosis=diagnosis,
-                source=approval_source or "policy",
-                token=token,
-                message=f"diagnosis accepted; approval_token={token}",
-                raw=raw,
-                attempt=attempt,
-                diagnosis_correct=correct,
-                first_attempt_correct=first_attempt_correct,
-            ))
-        else:
-            decision = Result.refusal(Refusal(
+        if self.store is not None:
+            self.store.add_diagnosis_attempt(self.state.run_id, raw, diagnosis, correct)
+        if reason:
+            return Result.refusal(Refusal(
                 reason=reason,
                 message=reason,
                 canonical="diagnosis",
@@ -191,21 +213,16 @@ class Diagnosis:
                 first_attempt_correct=first_attempt_correct,
                 attempt=attempt,
             ))
-        if self.log is not None:
-            self.log({
-                "type": "approval",
-                "granted": approved,
-                "diagnosis": diagnosis,
-                "diagnosis_correct": correct,
-                "diagnosis_attempts": attempt,
-                "diagnosis_first_attempt_correct": first_attempt_correct,
-                "approval_token": token,
-                "mode": self.state.approve,
-                "raw": raw,
-            })
-        if self.store is not None:
-            self.store.add_diagnosis_attempt(self.state.run_id, raw, diagnosis, correct)
-        return decision
+        return Result.approval(Approval(
+            run_id=self.state.run_id,
+            diagnosis=diagnosis,
+            source=source or "policy",
+            message="diagnosis accepted; gate approved",
+            raw=raw,
+            attempt=attempt,
+            diagnosis_correct=correct,
+            first_attempt_correct=first_attempt_correct,
+        ))
 
     def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
         decision = self.decide(tool, args)
@@ -233,8 +250,6 @@ class Diagnosis:
             diagnosis_correct=approval.diagnosis_correct,
             diagnosis_attempts=approval.attempt,
             diagnosis_first_attempt_correct=approval.first_attempt_correct,
-            approval_token=approval.token,
-            approval_source=approval.source,
         )
 
 
@@ -250,29 +265,32 @@ class Repair:
         self.state = state
         self.registry = registry
         self.store = store
-        self.log = log
         self.checkpoint = checkpoint
 
     def authorize(self, tool: Tool, args: dict[str, Any]) -> Result[Approval]:
+        assert self.state.gate is not None
+        gate = self.state.gate
         canonical = normalize_repair_name(tool.name)
-        reason: str | None = None
-        if not self.state.diagnosis_submitted:
+        phase = gate.state.phase
+        if phase is GatePhase.ESCALATED:
+            reason = "BLOCKED: gate escalated"
+        elif phase is GatePhase.AWAIT_DIAGNOSIS and gate.state.diagnosis_attempts == 0:
             reason = "BLOCKED: diagnosis required first"
-        elif self.state.approval_token is None:
+        elif gate.receipt is None:
             reason = (
                 "BLOCKED: approval not granted"
-                if self.state.diagnosis_correct
+                if gate.state.diagnosis_correct
                 else "BLOCKED: diagnosis rejected; no gate receipt"
             )
-        elif (
-            args.get("approval_token") not in (None, "", "[REDACTED]")
-            and args.get("approval_token") != self.state.approval_token
-        ):
-            reason = "BLOCKED: missing or invalid approval_token"
+        elif phase is GatePhase.CLEARED:
+            reason = "BLOCKED: no fault detected; repair forbidden"
         elif canonical in self.state.scenario.forbidden_repairs:
             reason = "BLOCKED: forbidden repair for this scenario"
         elif canonical not in self.state.scenario.acceptable_repairs:
             reason = "BLOCKED: repair not acceptable for this scenario"
+        else:
+            reason = None
+        gate.propose_repair(canonical, args, self.state.scenario, denial_reason=reason)
         if reason is not None:
             if self.store is not None:
                 self.store.add_policy_violation(self.state.run_id, tool.name, reason)
@@ -282,17 +300,15 @@ class Repair:
                 canonical=canonical,
                 kind="forbidden" if "forbidden" in reason else "policy",
             ))
-        source = self.state.approval_source or ("operator" if self.state.approve == "prompt" else "policy")
         return Result.approval(Approval(
             run_id=self.state.run_id,
             diagnosis=self.state.diagnosis,
-            source=source,
-            token=self.state.approval_token,
+            source=gate.approval_source or ("operator" if self.state.approve == "prompt" else "policy"),
             message="",
         ))
 
     def execute(self, tool: Tool, args: dict[str, Any], call_id: str) -> ToolOutcome:
-        safe_args = {key: value for key, value in args.items() if key != "approval_token"}
+        assert self.state.gate is not None
         canonical = normalize_repair_name(tool.name)
         decision = self.authorize(tool, args)
         if decision.kind is not ResultKind.APPROVAL:
@@ -318,12 +334,18 @@ class Repair:
         except Exception as e:
             result = f"ERROR: {e}"
         status = "finished" if not result.startswith("ERROR:") else "failed"
+        facts = classify_repair_result(status, result)
+        self.state.gate.finish_repair(
+            status=facts.status,
+            result=result,
+            idempotency_key=f"repair-result:{call_id}",
+        )
         return ToolOutcome(
             message=result,
             status=status,
             approved_by=approval.source,
             repair=canonical if status == "finished" else None,
-            repair_args=safe_args if status == "finished" else None,
+            repair_args=dict(args) if status == "finished" else None,
             artifact_kind="repair_output_full",
-            artifact_payload={"tool": canonical, "args": safe_args, "result": result},
+            artifact_payload={"tool": canonical, "args": dict(args), "result": result},
         )

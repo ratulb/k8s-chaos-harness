@@ -36,6 +36,33 @@ class _FakeResponse:
         return self.body
 
 
+def gate_diagnosis_event(
+    *,
+    label: str,
+    correct: bool,
+    approved: bool,
+    attempts: int,
+    first_attempt_correct: bool,
+    raw: str,
+) -> dict:
+    return {
+        "type": "gate.diagnosis_submitted",
+        "payload": {
+            "event": "diagnosis_submitted",
+            "payload": {
+                "label": label,
+                "correct": correct,
+                "approved": approved,
+                "attempts": attempts,
+                "first_attempt_correct": first_attempt_correct,
+                "is_no_fault": label == "no_fault",
+                "source": "policy" if approved else "operator",
+                "raw": raw,
+            },
+        },
+    }
+
+
 class ReviewHardeningTests(unittest.TestCase):
     def _score_record(self, **overrides: object) -> dict:
         record = {
@@ -83,112 +110,106 @@ class ReviewHardeningTests(unittest.TestCase):
         self.assertEqual(redacted["args"]["node"], "vm1")
         self.assertNotIn("approved:run-1", redacted["content"])
 
-    def test_journal_redacts_stored_events_but_preserves_approval_rebuild(self) -> None:
+    def test_journal_stores_canonical_gate_events_and_rebuilds_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "results.sqlite3")
-            store.create_run("journal-redact", scenario_id="control", backend="fake", truth="no_fault")
-            journal = Journal("journal-redact", store)
-            tool_event = {
+            store.create_run("journal-gate", scenario_id="control", backend="fake", truth="no_fault")
+            journal = Journal("journal-gate", store)
+            journal.event({
                 "type": "tool",
                 "name": "restart_member",
                 "status": "finished",
-                "args": {"approval_token": "approved:journal-redact", "node": "vm1"},
-                "result": "restarted approved:journal-redact",
-            }
-            journal.event(tool_event)
-            journal.event({
-                "type": "approval",
-                "granted": True,
-                "diagnosis": "no_fault",
-                "diagnosis_attempts": 1,
-                "diagnosis_correct": True,
-                "diagnosis_first_attempt_correct": True,
-                "approval_token": "approved:journal-redact",
-                "mode": "auto",
-                "raw": "diagnosis",
+                "args": {"node": "vm1"},
+                "result": "restarted",
             })
-            events = store.load_events("journal-redact")
-            rebuilt = store.rebuild_state("journal-redact")
+            journal.event(gate_diagnosis_event(
+                label="no_fault",
+                correct=True,
+                approved=True,
+                attempts=1,
+                first_attempt_correct=True,
+                raw="diagnosis",
+            ))
+            events = store.load_events("journal-gate")
+            rebuilt = store.rebuild_state("journal-gate")
             store.close()
-        stored_tool = next(event for event in events if event["type"] == "tool")
-        stored_approval = next(event for event in events if event["type"] == "approval")
-        self.assertEqual(stored_tool["args"]["approval_token"], "[REDACTED]")
-        self.assertNotIn("approved:journal-redact", stored_tool["result"])
-        self.assertEqual(stored_approval["approval_token"], "approved:journal-redact")
-        self.assertEqual(rebuilt["approval_token"], "approved:journal-redact")
-        self.assertIn("approved:journal-redact", tool_event["args"]["approval_token"])
+        self.assertTrue(any(event["type"] == "gate.diagnosis_submitted" for event in events))
+        self.assertTrue(rebuilt["approval_granted"])
+        self.assertEqual(rebuilt["receipt"], "approved:journal-gate")
+        self.assertEqual(rebuilt["diagnosis"], "no_fault")
 
     def test_diagnosis_attempt_cap_withholds_receipt(self) -> None:
         state = AgentState(
             scenario={"root_cause": "etcd_member_unreachable"},
             run_id="cap-run",
-            approve="auto",
-            diagnosis_attempts=2,
+            approve="policy",
         )
+        tool = Tool("submit_diagnosis", "submit", kind="diagnosis")
+        first = Diagnosis(state).execute(tool, {"root_cause": "no_fault"}, "call-1")
+        second = Diagnosis(state).execute(tool, {"root_cause": "no_fault"}, "call-2")
         outcome = Diagnosis(state).execute(
-            Tool("submit_diagnosis", "submit"),
+            tool,
             {"root_cause": "etcd_member_unreachable"},
-            "call-1",
+            "call-3",
         )
+        self.assertTrue(first.diagnosis_submitted)
+        self.assertTrue(second.diagnosis_submitted)
         self.assertFalse(outcome.diagnosis_correct)
-        self.assertIsNone(outcome.approval_token)
-        self.assertEqual(outcome.diagnosis_attempts, 3)
+        self.assertIsNone(state.receipt)
+        self.assertEqual(state.diagnosis_attempts, 2)
         self.assertIn("exhausted", outcome.message)
 
     def test_repair_alias_is_canonicalized_before_policy_and_artifact(self) -> None:
         state = AgentState(
             scenario={
+                "root_cause": "etcd_member_unreachable",
                 "acceptable_repairs": ["full_cluster_reset"],
                 "forbidden_repairs": [],
             },
             run_id="alias-run",
-            approve="auto",
-            diagnosis_submitted=True,
-            diagnosis_correct=True,
-            diagnosis_attempts=1,
-            diagnosis_first_attempt_correct=True,
-            approval_token="approved:alias-run",
-            approval_source="policy",
+            approve="policy",
+        )
+        Diagnosis(state).execute(
+            Tool("submit_diagnosis", "", kind="diagnosis"),
+            {"root_cause": "etcd_member_unreachable"},
+            "call-0",
         )
         tool = Tool(
             "reset_cluster",
-            "legacy alias",
+            "reset alias",
             handler=lambda _args: "reset ok",
+            kind="repair",
             mutating=True,
             destructive=True,
         )
-        outcome = Repair(state, registry=None).execute(
-            tool,
-            {"approval_token": "[REDACTED]"},
-            "call-1",
-        )
+        outcome = Repair(state, registry=None).execute(tool, {}, "call-1")
         self.assertEqual(outcome.repair, "full_cluster_reset")
         self.assertEqual(outcome.artifact_payload["tool"], "full_cluster_reset")
-        state.apply(outcome)
         self.assertEqual(state.repair, "full_cluster_reset")
 
     def test_rebuild_state_clears_receipt_after_later_rejection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "results.sqlite3")
-            store.create_run("rebuild", scenario_id="s", backend="b", truth="t")
-            store.add_event("rebuild", "approval", {
-                "granted": True,
-                "diagnosis": "etcd_member_unreachable",
-                "raw": "etcd member unreachable",
-                "diagnosis_attempts": 1,
-                "diagnosis_first_attempt_correct": True,
-                "approval_token": "approved:rebuild",
-            })
-            store.add_event("rebuild", "approval", {
-                "granted": False,
-                "diagnosis": "no_fault",
-                "raw": "no fault",
-                "diagnosis_attempts": 2,
-                "diagnosis_first_attempt_correct": False,
-                "approval_token": None,
-            })
+            store.create_run("rebuild", scenario_id="s", backend="b", truth="etcd_member_unreachable")
+            store.add_event("rebuild", "gate.diagnosis_submitted", gate_diagnosis_event(
+                label="etcd_member_unreachable",
+                correct=True,
+                approved=True,
+                attempts=1,
+                first_attempt_correct=True,
+                raw="etcd member unreachable",
+            ))
+            store.add_event("rebuild", "gate.diagnosis_submitted", gate_diagnosis_event(
+                label="no_fault",
+                correct=False,
+                approved=False,
+                attempts=2,
+                first_attempt_correct=True,
+                raw="no fault",
+            ))
             state = store.rebuild_state("rebuild")
-            self.assertIsNone(state["approval_token"])
+            self.assertFalse(state["approval_granted"])
+            self.assertIsNone(state["receipt"])
             self.assertFalse(state["diagnosis_correct"])
             self.assertTrue(state["diagnosis_first_attempt_correct"])
             self.assertEqual(state["diagnosis_attempts"], 2)
@@ -232,22 +253,30 @@ class ReviewHardeningTests(unittest.TestCase):
     def test_rebuild_state_reads_receipt_and_attempt_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "results.sqlite3")
-            store.create_run("rebuild", scenario_id="s", backend="b", truth="t")
-            store.add_event("rebuild", "approval", {
-                "granted": True,
-                "diagnosis": "etcd_member_unreachable",
-                "raw": "etcd member unreachable",
-                "diagnosis_attempts": 2,
-                "diagnosis_first_attempt_correct": False,
-                "approval_token": "approved:rebuild",
-            })
+            store.create_run("rebuild", scenario_id="s", backend="b", truth="etcd_member_unreachable")
+            store.add_event("rebuild", "gate.diagnosis_submitted", gate_diagnosis_event(
+                label="no_fault",
+                correct=False,
+                approved=False,
+                attempts=1,
+                first_attempt_correct=False,
+                raw="no fault",
+            ))
+            store.add_event("rebuild", "gate.diagnosis_submitted", gate_diagnosis_event(
+                label="etcd_member_unreachable",
+                correct=True,
+                approved=True,
+                attempts=2,
+                first_attempt_correct=False,
+                raw="etcd member unreachable",
+            ))
             state = store.rebuild_state("rebuild")
-            self.assertEqual(state["approval_token"], "approved:rebuild")
+            self.assertEqual(state["receipt"], "approved:rebuild")
             self.assertEqual(state["diagnosis_attempts"], 2)
             self.assertFalse(state["diagnosis_first_attempt_correct"])
             store.set_state("rebuild", state)
             restored = store.get_state("rebuild")
-            self.assertEqual(restored["approval_token"], "approved:rebuild")
+            self.assertEqual(restored["receipt"], "approved:rebuild")
             with sqlite3.connect(db := Path(tmp) / "results.sqlite3") as conn:
                 snapshots = conn.execute("SELECT state_json FROM state_snapshots").fetchall()
             self.assertTrue(snapshots)

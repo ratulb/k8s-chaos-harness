@@ -64,7 +64,7 @@ or destructive validation.
 - [x] `submit_diagnosis`
 - [x] Gated repair tools
 - [x] Forbidden reasons
-- [x] Approval token flow
+- [x] Gated repair authorization
 - [x] Gate unit tests (`tests/test_gate.py`)
 - Deliverable: diagnosis required before repair
 - Acceptance: forbidden repairs blocked and logged
@@ -81,7 +81,7 @@ or destructive validation.
 - [x] Tool intent/result write-ahead lifecycle
 - [x] Scenario spec versioning and resume lineage
 - [x] Save/resume state
-- [x] Legacy JSONL import and derived exports
+- [x] JSONL import and derived exports
 - [x] Crash recovery test coverage, offline unit tests
 - [x] One-command wrapper and DB CLI
 - Deliverable: mid-run resume
@@ -121,11 +121,11 @@ or destructive validation.
 - [x] Update internal runbook benchmark example to use `ollama`
 - Deliverable: no ambiguity about what is being built
 - Acceptance: design matches every locked decision; no stale prescriptive
-  legacy backend or required-three-node language remains
+  backend or required-three-node language remains
 
 ### Phase 9B — Backend naming and scenario metadata
-- [x] Rename public legacy backend → `ollama`
-- [x] Normalize stored/imported legacy backend values to `ollama`
+- [x] Rename public self-hosted backend → `ollama`
+- [x] Normalize stored/imported backend values to `ollama`
 - [x] Update `.env.example`, scripts, comments, examples, and docs
 - [x] Remove superseded reviewer/feedback files after salvage
 - [x] Add scenario fields: `risk`, menu summary, `min_etcd_members`, selector
@@ -173,7 +173,7 @@ or destructive validation.
 - [x] Refuse explicit `resume` on topology mismatch
 - [x] Make `status`, `attach`, and `show` read-only with stale warnings
 - [x] Abort active runs before discard; refuse if abort fails
-- [x] Remove automatic `import-legacy` from `run_benchmark.sh`
+- [x] Remove automatic JSONL import from `run_benchmark.sh`
 - Deliverable: stale epochs never contaminate scoring or resume
 - Acceptance: temp-DB tests prove auto-discard, resume refusal, and no discard
   from read-only commands
@@ -221,7 +221,7 @@ or destructive validation.
 - [x] Add optional `--approve prompt`
 - [x] Default remains `--approve policy`
 - [x] Stop Live before prompting
-- [x] Never display approval token
+- [x] Keep derived gate receipts out of operator prompts
 - [x] Mark prompt-approval runs `interactive=1`
 - [x] Exclude interactive runs from headline score by default
 - Deliverable: optional human-in-the-loop without corrupting benchmark rates
@@ -277,47 +277,26 @@ or destructive validation.
 - Acceptance: every scored run has an observed fault, no provider failure, and
   a strict metric backed by auditable fault-check artifacts
 
-## Phase 12 — Explicit state machines (proposed)
-- Design: `docs/STATE_MACHINE_DESIGN.md`
-- Execution plan: `docs/STATE_MACHINE_DESIGN.md` §13; execute the phase gates in
-  order and record evidence here before each cutover
-- [x] Phase 0: pure reducer core, adapters, exhaustive tests, generated diagrams
-- [ ] Phase 1: gate machine cutover
-- [ ] Phase 2: run lifecycle cutover in two slices — shell/lease foundation,
-  then reaper/`--abandon`
-- [ ] Phase 3: tool-call cutover with internal status aliases
-- [ ] Phase 4: `gate-path-v1` annotation scorer and public parity report
-
-### Phase 0 shadow report — 2026-11-23
-
-- Read-only replay sources:
-  - `/tmp/opencode/e2e-final.sqlite3` and its archived copy
-    `/tmp/opencode/archive/20261123T140037Z-c89211/e2e-final.sqlite3`: 7 runs,
-    93 tool calls, 7 mismatches, 0 rejections; identical results.
-  - `/tmp/opencode/e2e-quorum.sqlite3`: 1 run, 22 tool calls, 3 mismatches,
-    0 rejections.
-  - `/tmp/opencode/e2e-fallback.sqlite3`: 5 runs, 56 tool calls, 12 mismatches,
-    0 rejections.
-- Excluding the duplicate archived copy: 13 runs, 171 tool calls, 22 mismatches,
-  0 rejections. There are no gate-field mismatches; all machine tool states
-  replay without rejection.
-- All remaining mismatches are legacy semantic drift, not engine bugs:
-  - 6 `end_reason` fields use legacy `submitted`/`budget_tokens` where the
-    machine derives `verify_ok`/`verify_failed`/`diagnosis_attempts_exhausted`.
-  - 10 status/phase fields are legacy `finished` where the machine reaches
-    `ABORTED` after terminal or abort evidence.
-  - 5 `verify_ok` fields remain populated on those legacy-finished rows; the
-    machine leaves verification undefined on aborted paths.
-  - 1 tool status is `finished` while its result text starts with
-    `timeout waiting for`; the adapter classifies the typed result as
-    `failed`/`timeout`.
-- Scalar defaults without trace evidence are ignored. No DB was mutated and no
-  history was rewritten.
-
-- Public parity report must be recorded here and in generated
-  `docs/STATE_MACHINE.md` before any canonical scorer switch is proposed.
-- `etcd-disk-full` remains excluded from live sweeps per the operator decision
-  recorded above and in `README.md` §6.
-- Deliverable: deterministic, replayable state with auditable crash recovery
-- Acceptance: `fold(events) == live_state` on archived and current DBs; no
-  silently skipped tool rows; canonical scorer unchanged until explicit approval
+## Phase 12 — Explicit state machines
+- Design: `docs/STATE_MACHINE_DESIGN.md`; concept guide:
+  `docs/STATE_MACHINE_PRIMER.md`
+- [x] Pure reducer core, three transition tables, exhaustive tests, and generated
+      diagrams
+- [x] `GateRuntime` is always on; diagnosis, nudges, repair proposals, typed
+      repair outcomes, and `GateState` are canonical
+- [x] Receipt is derived from `GateState` and `run_id`, never transported in tool
+      arguments
+- [ ] `RunState` owns run lifecycle, lease, resume triage, verification, and
+      terminal outcome
+- [ ] `ToolState` owns tool status and outcome; prefix strings are evidence for
+      humans, not authority
+- [ ] Append-only SQLite event log is authoritative; `state_json` and snapshots
+      are rebuildable projections/caches
+- [ ] One canonical scorer reads folded state and `GatePath`
+- [ ] Reaper, `--abandon`, and doctor checks covered by focused and full suites
+- Deliverable: behavior owned by the three state machines with deterministic
+  replay
+- Acceptance: `fold(events) == live_state` for every run; illegal transitions are
+  recorded; no run or tool row is silently skipped
+- Operational cautions: `etcd-disk-full` stays out of live sweeps; never put
+  secrets in traces, prompts, exports, or commits

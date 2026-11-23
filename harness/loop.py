@@ -46,7 +46,7 @@ class AgentLoop:
 
     def run(self, spec: ExperimentSpec, ctx: RunContext) -> RunResult:
         if ctx.store is None:
-            raise ValueError("AgentLoop requires a RunStore; use the legacy facade for detached runs")
+            raise ValueError("AgentLoop requires a RunStore")
         store = cast(RunStore, ctx.store)
         scenario = spec.scenario
         registry = self.tool_registry
@@ -55,7 +55,7 @@ class AgentLoop:
         journal = Journal(run_id=ctx.run_id, store=store, reporter=ctx.reporter)
 
         snapshot = store.get_state(ctx.run_id) if ctx.resume else {}
-        state = AgentState.from_snapshot(snapshot, scenario, ctx.run_id, spec.approve)
+        state = AgentState.from_snapshot(snapshot, scenario, ctx.run_id, spec.approve, log=journal.event)
         messages: list[Message] = [Message.from_dict(item) for item in store.load_messages(ctx.run_id)] if ctx.resume else []
         if not messages:
             prompt = SystemPrompt(topology_tools.frozen_topology())
@@ -144,6 +144,7 @@ class AgentLoop:
                     if budget.can_continue_without_tool_call():
                         nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
                         messages.append(nudge)
+                        state.record_nudge(step=budget.steps, kind="no_tool")
                         nudge.persist(journal, backend="harness")
                         checkpointer.capture()
                         continue
@@ -158,7 +159,6 @@ class AgentLoop:
                     tool = registry.get(str((tool_call.get("function") or {}).get("name") or ""))
                     call = Call.from_tool_call(tool_call, len(messages) - 1).for_tool(tool)
                     execution = call.invoke(tool, context, journal)
-                    state.apply(execution.outcome)
                     messages.append(execution.commit(journal, backend_name))
                     checkpointer.capture()
 
@@ -167,7 +167,7 @@ class AgentLoop:
                     messages.append(nudge)
                     nudge.persist(journal, backend="harness")
                     budget.diagnosis_nudged = True
-                    journal.event({"type": "nudge", "step": budget.steps})
+                    state.record_nudge(step=budget.steps, kind="budget")
                     checkpointer.capture()
 
         if not llm_error:
@@ -191,8 +191,8 @@ class AgentLoop:
             "diagnosis": state.diagnosis,
             "diagnosis_raw": state.diagnosis_raw,
             "truth": scenario.root_cause,
-            "diagnosis_correct": state.diagnosis == scenario.root_cause,
-            "approval_granted": state.approval_token is not None,
+            "diagnosis_correct": state.diagnosis_correct,
+            "approval_granted": state.receipt is not None,
             "diagnosis_attempts": state.diagnosis_attempts,
             "diagnosis_first_attempt_correct": state.diagnosis_first_attempt_correct,
             "repair": state.repair,

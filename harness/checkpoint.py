@@ -68,10 +68,8 @@ class Checkpoint:
         return {
             "diagnosis": self.state.diagnosis,
             "diagnosis_raw": self.state.diagnosis_raw,
-            "diagnosis_correct": (self.state.diagnosis == self.scenario.root_cause)
-            if self.state.diagnosis is not None
-            else None,
-            "approval_granted": self.state.approval_token is not None,
+            "diagnosis_correct": self.state.diagnosis_correct if self.state.diagnosis_submitted else None,
+            "approval_granted": self.state.receipt is not None,
             "repair": self.state.repair,
             "repair_args_json": self.state.repair_args,
             "policy_violations_json": self.state.policy_violations,

@@ -23,6 +23,7 @@ from typing import Any, Iterator
 
 from common.scoring import SCORER_VERSION
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
+from harness.gate_runtime import GateRuntime
 from harness.message import Message
 from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend, normalize_repair_name
 
@@ -1216,53 +1217,34 @@ class SQLiteStore:
         return [dict(row) for row in rows]
 
     def rebuild_state(self, run_id: str) -> dict[str, Any]:
-        """Derive agent resume state from append-only logs."""
+        """Derive agent resume state from the authoritative gate event log."""
         row = self.get_run(run_id)
         events = self.load_events(run_id)
         calls = self.load_tool_calls(run_id)
         tokens_in, tokens_out = self.token_totals(run_id)
+        gate = GateRuntime.from_events(run_id, events)
+        gs = gate.state
         state: dict[str, Any] = {
-            "diagnosis": None,
-            "diagnosis_raw": None,
-            "diagnosis_submitted": False,
-            "diagnosis_correct": False,
-            "approval_token": None,
-            "diagnosis_attempts": 0,
-            "diagnosis_first_attempt_correct": False,
-            "repair": None,
-            "repair_args": None,
+            "gate": gate.to_snapshot(),
+            "diagnosis": gs.diagnosis_label,
+            "diagnosis_raw": gate.diagnosis_raw,
+            "diagnosis_submitted": gs.diagnosis_attempts > 0,
+            "diagnosis_correct": bool(gs.diagnosis_correct),
+            "approval_granted": gate.receipt is not None,
+            "receipt": gate.receipt,
+            "approval_source": gate.approval_source,
+            "diagnosis_attempts": gs.diagnosis_attempts,
+            "diagnosis_first_attempt_correct": gs.first_attempt_correct,
+            "repair": gate.accepted_repair,
+            "repair_args": gate.repair_args,
             "policy_violations": [],
-            "forbidden_reason": None,
-            "steps": 0,
+            "forbidden_reason": gate.forbidden_reason,
+            "steps": sum(1 for event in events if event.get("type") == "assistant"),
             "tokens_used": tokens_in + tokens_out,
-            "diagnosis_nudged": False,
+            "diagnosis_nudged": gate.nudged,
             "trace_path": row.get("trace_path") or f"traces/{run_id}.jsonl",
             "seq": int(row.get("seq") or 0),
         }
-        for event in events:
-            kind = event.get("type")
-            if kind == "assistant":
-                state["steps"] = int(state["steps"]) + 1
-            elif kind == "approval":
-                state["diagnosis_submitted"] = True
-                state["diagnosis_attempts"] = int(event.get("diagnosis_attempts") or 0)
-                state["diagnosis"] = event.get("diagnosis")
-                state["diagnosis_raw"] = event.get("raw")
-                state["diagnosis_correct"] = False
-                state["approval_token"] = None
-                if event.get("granted"):
-                    state["diagnosis_correct"] = True
-                    state["diagnosis_first_attempt_correct"] = bool(event.get("diagnosis_first_attempt_correct"))
-                    state["approval_token"] = event.get("approval_token")
-            elif kind == "nudge":
-                state["diagnosis_nudged"] = True
-            elif kind == "tool" and event.get("name") in REPAIR_TOOLS:
-                text = str(event.get("result") or "")
-                if not text.startswith("BLOCKED:") and not text.startswith("ERROR:"):
-                    args = dict(event.get("args") or {})
-                    args.pop("approval_token", None)
-                    state["repair"] = normalize_repair_name(event.get("name"))
-                    state["repair_args"] = args
         with self._connect() as conn:
             state["policy_violations"] = [
                 f"{row['tool']}: {row['reason']}"
@@ -1282,8 +1264,11 @@ class SQLiteStore:
             cached.setdefault("trace_path", row.get("trace_path") or f"traces/{run_id}.jsonl")
             rebuilt = self.rebuild_state(run_id)
             for key in (
-                "approval_token", "diagnosis_correct", "diagnosis_attempts",
-                "diagnosis_first_attempt_correct",
+                "receipt", "approval_granted", "approval_source",
+                "diagnosis", "diagnosis_raw", "diagnosis_submitted",
+                "diagnosis_correct", "diagnosis_attempts",
+                "diagnosis_first_attempt_correct", "repair", "repair_args",
+                "policy_violations", "forbidden_reason", "diagnosis_nudged",
             ):
                 cached[key] = rebuilt.get(key)
             return cached
@@ -1294,7 +1279,7 @@ class SQLiteStore:
     def set_state(self, run_id: str, state: dict[str, Any], source: str = "checkpoint") -> None:
         cache = dict(state)
         cache.pop("messages", None)
-        cache.pop("approval_token", None)
+        cache.pop("receipt", None)
         seq = int(cache.get("seq") or 0)
         with self._connect() as conn:
             if not seq:

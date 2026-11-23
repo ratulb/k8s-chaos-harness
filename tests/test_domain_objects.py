@@ -21,7 +21,7 @@ from harness.checkpoint import Checkpoint, LeaseRenewer
 from harness.journal import Journal
 from harness.loop import RunResult
 from harness.spec import ExperimentSpec, RunContext
-from harness.tooling import AgentState
+from harness.tooling import AgentState, Diagnosis
 from harness.verification import Verification
 from llm.client import LLMClient
 from llm.response import LLMOutcome, LLMResponse
@@ -57,11 +57,11 @@ class _Client:
 
 class DomainObjectTests(unittest.TestCase):
     def test_result_variants_distinguish_approval_and_refusal(self) -> None:
-        approval = Result.approval(Approval("run-1", "no_fault", "policy", "approved:run-1", "ok"))
+        approval = Result.approval(Approval("run-1", "no_fault", "policy", "ok"))
         refusal = Result.refusal(Refusal("BLOCKED: no", "BLOCKED: no"))
         self.assertTrue(approval.ok)
         self.assertIs(approval.kind, ResultKind.APPROVAL)
-        self.assertEqual(approval.unwrap().token, "approved:run-1")
+        self.assertEqual(approval.unwrap().diagnosis, "no_fault")
         self.assertFalse(refusal.ok)
         self.assertIs(refusal.kind, ResultKind.REFUSAL)
         self.assertEqual(refusal.unwrap().reason, "BLOCKED: no")
@@ -74,19 +74,17 @@ class DomainObjectTests(unittest.TestCase):
 
     def test_checkpoint_captures_state_and_run_projection(self) -> None:
         scenario = Scenario.from_dict({"root_cause": "no_fault"})
-        state = AgentState(
-            scenario=scenario,
-            run_id="checkpoint-run",
-            approve="policy",
-            diagnosis="no_fault",
-            diagnosis_submitted=True,
-            diagnosis_attempts=1,
-            approval_token="approved:checkpoint-run",
-        )
+        state = AgentState(scenario=scenario, run_id="checkpoint-run", approve="policy")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             store = SQLiteStore(root / "results.sqlite3")
             store.create_run("checkpoint-run", scenario_id=scenario.id, backend="fake", truth=scenario.root_cause)
+            state.gate.log = lambda event: store.add_event("checkpoint-run", event["type"], event)
+            Diagnosis(state).execute(
+                Tool("submit_diagnosis", "", kind="diagnosis"),
+                {"root_cause": "no_fault"},
+                "call-1",
+            )
             budget = Budget.from_snapshot({}, scenario)
             budget.start_step()
             budget.add_tokens(3)
@@ -105,7 +103,8 @@ class DomainObjectTests(unittest.TestCase):
             store.close()
         self.assertEqual(snapshot["steps"], 1)
         self.assertEqual(saved["tokens_used"], 3)
-        self.assertEqual(snapshot["approval_token"], "approved:checkpoint-run")
+        self.assertEqual(snapshot["gate"]["events"][0]["type"], "diagnosis_submitted")
+        self.assertEqual(saved["receipt"], "approved:checkpoint-run")
         self.assertEqual(row["diagnosis"], "no_fault")
         self.assertTrue(row["approval_granted"])
         self.assertEqual(row["trace_path"], str(trace_path))
@@ -177,8 +176,7 @@ class DomainObjectTests(unittest.TestCase):
             self.assertTrue(result.record["diagnosis_correct"])
             self.assertTrue(result.verify_ok)
             trace = (root / "traces" / "typed-run.jsonl").read_text(encoding="utf-8")
-            self.assertIn("approval", trace)
-            self.assertIn("[REDACTED]", trace)
+            self.assertIn("gate.diagnosis_submitted", trace)
             self.assertNotIn("approved:typed-run", trace)
 
     def test_response_commits_its_own_audit_trail(self) -> None:

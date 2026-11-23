@@ -193,11 +193,22 @@ class TestSQLiteStore(unittest.TestCase):
         self._make_run()
         self.store.append_message("run-1", "system", "prompt")
         self.store.add_event("run-1", "assistant", {"message": {"role": "assistant"}})
-        self.store.add_event(
-            "run-1",
-            "approval",
-            {"granted": True, "diagnosis": "etcd_member_unreachable", "raw": "etcd_member_unreachable", "approval_token": "approved:run-1"},
-        )
+        self.store.add_event("run-1", "gate.diagnosis_submitted", {
+            "type": "gate.diagnosis_submitted",
+            "payload": {
+                "event": "diagnosis_submitted",
+                "payload": {
+                    "label": "etcd_member_unreachable",
+                    "correct": True,
+                    "approved": True,
+                    "attempts": 1,
+                    "first_attempt_correct": True,
+                    "is_no_fault": False,
+                    "source": "policy",
+                    "raw": "etcd_member_unreachable",
+                },
+            },
+        })
         self.store.add_llm_request("run-1", "fake", 12, 3, 4)
 
         # Simulate a stale cache: state_seq 999 does not match runs.seq 2.
@@ -208,7 +219,7 @@ class TestSQLiteStore(unittest.TestCase):
         self.assertEqual(state["steps"], 1)
         self.assertEqual(state["tokens_used"], 7)
         self.assertEqual(state["diagnosis"], "etcd_member_unreachable")
-        self.assertEqual(state["approval_token"], "approved:run-1")
+        self.assertEqual(state["receipt"], "approved:run-1")
 
     def test_state_snapshots_and_ui_stream(self) -> None:
         self._make_run()

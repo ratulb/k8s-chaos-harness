@@ -52,7 +52,7 @@ class TestRepairGate(unittest.TestCase):
         # approval token), then immediately tries the forbidden repair.
         responses = [
             assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
-            assistant([tool_call("reset_cluster", {"approval_token": "approved:gate-test"})]),
+            assistant([tool_call("reset_cluster", {})]),
             assistant([]),
         ]
         original = agent.LLMClient
@@ -133,7 +133,7 @@ class TestRepairGate(unittest.TestCase):
     def test_prompt_approval_grants_without_showing_token(self):
         responses = [
             assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
-            assistant([tool_call("restart_member", {"approval_token": "approved:gate-prompt"})]),
+            assistant([tool_call("restart_member", {"node": "node-a"})]),
             assistant([]),
         ]
         pause = Mock()
@@ -180,7 +180,7 @@ class TestRepairGate(unittest.TestCase):
     def test_prompt_approval_can_be_declined(self):
         responses = [
             assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
-            assistant([tool_call("restart_member", {"approval_token": "approved:gate-decline"})]),
+            assistant([tool_call("restart_member", {"node": "node-a"})]),
             assistant([]),
         ]
         original = agent.LLMClient
@@ -212,12 +212,12 @@ class TestRepairGate(unittest.TestCase):
         self.assertFalse(rec["approval_granted"])
         self.assertIsNone(rec["repair"])
         repair.assert_not_called()
-        self.assertTrue(any("approval not granted" in v for v in rec["policy_violations"]))
+        self.assertTrue(any("diagnosis required first" in v for v in rec["policy_violations"]))
 
     def test_repair_timeout_result_asks_for_escalation(self):
         responses = [
             assistant([tool_call("submit_diagnosis", {"root_cause": "etcd_member_unreachable"})]),
-            assistant([tool_call("restart_member", {"approval_token": "approved:gate-timeout"})]),
+            assistant([tool_call("restart_member", {"node": "node-a"})]),
             assistant([]),
         ]
         original = agent.LLMClient

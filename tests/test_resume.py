@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import harness.agent as agent
 import run_benchmark
+from harness.gate_runtime import GateRuntime
 from storage.sqlite_store import SQLiteStore
 from tools import cluster_config
 
@@ -61,9 +62,9 @@ class TestResume(unittest.TestCase):
         self.tmp.cleanup()
 
     def _seed_agent_run(self) -> dict:
-        # Simulate a crash after a correct diagnosis was accepted but before a
-        # repair was requested. The approval event in the log is the source of
-        # truth for the approval token on resume.
+        # Simulate a crash after a correct diagnosis opened the gate but before
+        # a repair was requested. The canonical gate event log is the source of
+        # truth on resume; no receipt is carried in the tool call.
         spec = {"id": "etcd-member-down", "root_cause": "etcd_member_unreachable"}
         spec_hash = self.store.hash_spec(spec)
         version = self.store.ensure_scenario(spec["id"], spec_hash, json.dumps(spec))
@@ -80,26 +81,29 @@ class TestResume(unittest.TestCase):
         self.store.append_message("resume-1", "system", "prompt")
         self.store.append_message("resume-1", "user", "investigate")
         self.store.add_event("resume-1", "assistant", {"message": {"role": "assistant"}})
-        seq = self.store.add_event(
-            "resume-1",
-            "approval",
-            {
-                "granted": True,
-                "diagnosis": "etcd_member_unreachable",
-                "raw": "etcd_member_unreachable",
-                "approval_token": "approved:resume-1",
-            },
+        logged: list[dict] = []
+        gate = GateRuntime("resume-1", log=logged.append)
+        gate.submit_diagnosis(
+            label="etcd_member_unreachable",
+            correct=True,
+            approved=True,
+            attempts=1,
+            first_attempt_correct=True,
+            is_no_fault=False,
+            source="policy",
+            raw="etcd_member_unreachable",
         )
+        seq = 0
+        for event in logged:
+            seq = self.store.add_event("resume-1", event["type"], event)
         self.store.set_state(
             "resume-1",
             {
                 "seq": seq,
-                "diagnosis": "etcd_member_unreachable",
-                "diagnosis_raw": "etcd_member_unreachable",
-                "diagnosis_submitted": True,
-                "approval_token": "approved:resume-1",
+                "gate": gate.to_snapshot(),
                 "steps": 1,
                 "tokens_used": 7,
+                "diagnosis_nudged": False,
             },
         )
         return row
@@ -107,7 +111,7 @@ class TestResume(unittest.TestCase):
     def test_resume_reloads_diagnosis_and_finishes_repair(self) -> None:
         self._seed_agent_run()
         responses = [
-            assistant([tool_call("repair-1", "restart_member", {"node": "node-b", "approval_token": "approved:resume-1"})]),
+            assistant([tool_call("repair-1", "restart_member", {"node": "node-b"})]),
             assistant([]),
         ]
         scenario = {
