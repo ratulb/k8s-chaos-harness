@@ -73,7 +73,8 @@ without unsafe guesses. Triggering external remediation workflows is out of scop
   hosted; this is the brain the agent depends on. `./chaos ping` needs it, but no
   cluster.
 - Linux and Python 3
-- `kubectl`/`etcdctl` and SSH access to control-plane nodes for benchmark runs
+- `kubectl` and SSH access to control-plane nodes for benchmark runs; `etcdctl`
+  runs inside etcd pods through `kubectl exec`
 - An existing cluster for benchmark runs; three etcd members are recommended,
   not required
 
@@ -81,11 +82,13 @@ without unsafe guesses. Triggering external remediation workflows is out of scop
 
 The headline metric is `strict_loop_success`: the fraction of runs with an
 observed fault, first-attempt correct diagnosis, passing verification, an
-acceptable repair, and no forbidden action, policy violation, provider failure,
-or budget cutoff (§14). `loop_success` is kept only for historical comparison.
-This is a deliberately narrow end-to-end cleanliness signal, not a verdict on
-whether a conversation was educational or useful. The only current strict data
-point is the five-run pilot: `strict_loop_success = 0.20` (§14). The archived
+acceptable repair, and no forbidden action, policy violation, or provider
+failure (§14). Budget exhaustion remains visible in `runs.end_reason`, `steps`,
+and `tokens_used`, but does not currently fail strict scoring because scoring
+uses the folded verification reason. `loop_success` is kept only for historical
+comparison. This is a deliberately narrow end-to-end cleanliness signal, not a
+verdict on whether a conversation was educational or useful. The five runs in
+the shipped database score `strict_loop_success = 0.4` (§14). The archived
 13-run sweep scored `0.462` on the historical `loop_success` metric; it predates
 fault-present gates and strict scoring, is not comparable to the headline
 metric, and is retained only as historical context. The headline is per
@@ -110,7 +113,7 @@ operator / CI
   -> run_benchmark.py
        validate -> discover/freeze topology -> capability/target
        reset -> baseline -> inject -> fault check -> agent -> final verify + fault-cleared check
-       -> cluster/*.sh, faults/*.sh, verify/*.sh -> live Kubernetes/etcd
+       -> cluster/*.sh, faults/*.sh, scenario verify commands -> live Kubernetes/etcd
        -> LLM backend -> tool registry + diagnosis/repair gates
        -> SQLite events/state/score
              -> live UI, attach, score.py, replay.py, exports
@@ -314,8 +317,8 @@ export CHAOS_LLM_ENDPOINTS='[{"name":"gpu","base_url":"http://127.0.0.1:11435","
 ```
 
 `config_hash` records the selector and name/model chain for fallback runs, so
-resume cannot silently switch to a different policy. Health checks skip known
-dead endpoints before generation when `CHAOS_LLM_HEALTH_SORT=1`.
+resume cannot silently switch to a different policy. Health-aware endpoint
+ordering is enabled by default; set `CHAOS_LLM_HEALTH_SORT=0` to disable it.
 
 **Fallback and comparability rule.** A run that eventually answers on a fallback
 is headline-eligible; earlier candidate failures are not a run-level
@@ -355,7 +358,16 @@ prints a waiting message and makes one bounded attempt. `llm_ready.py` and
 `LLMClient.health()` only prove endpoint reachability, not generation speed.
 
 Prerequisites for benchmark runs: `kubectl` access, SSH access to control-plane
-nodes, and network access for installs.
+nodes, and network access for installs. Benchmark runs also require the
+destructive guard described in §15:
+
+```bash
+export CHAOS_ALLOWED_CLUSTER_CONTEXTS="$(kubectl config current-context)"
+export CHAOS_ALLOWED_CLUSTER_IDS="$(kubectl config current-context)"
+export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(./chaos target show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["topology"]["topology_hash"])')"
+```
+
+If `CHAOS_CLUSTER_ID` is set, allow-list that exact value instead; see §15.
 
 ```bash
 python3 db_cli.py init
@@ -400,9 +412,10 @@ Implemented `./chaos` commands:
 Global `--db`, `--runs-file`, and `--trace-dir` go before the subcommand. `ping`
 uses `CHAOS_PING_BACKEND` when `--backend` is omitted; `run` requires `--backend`.
 
-Every `./chaos` invocation first runs the reaper. Expired leases with no live
-owner become `INTERRUPTED` once per observation key. `./chaos abort <run_id>
---abandon` is the explicit operator exit from `INTERRUPTED`.
+Every successfully parsed `./chaos` invocation runs the reaper before dispatch.
+Expired leases with no live owner become `INTERRUPTED` once per observation key.
+`./chaos abort <run_id> --abandon` is the explicit operator exit from
+`INTERRUPTED`.
 
 `./chaos run` options:
 
@@ -472,8 +485,10 @@ fails, fix `.env`/`CHAOS_LLM_ENDPOINTS` and retry; see §7 for chain semantics.
 
 **Expects.** An initialized DB. Topology changes only produce a warning.
 
-**Does.** Lists recent runs with identity, status, phase, fault/verify fields,
-end reason, and the reaper result. The status query itself takes no lease and
+**Does.** Lists recent runs with run ID, scenario, backend, status, phase, end
+reason, resume count, steps, tokens, update time, topology hash, interactive
+flag, launch ID, and PID, plus the reaper result. Fault/verify details require
+`attach` or direct DB inspection. The status query itself takes no lease and
 starts no runner; CLI startup may first record expired leases.
 
 **Evidence produced / scoring effect.** The query is read-only. Startup reaping
@@ -559,9 +574,9 @@ steps, tokens, diagnosis, repair, end reason, and stream/tool tails.
 
 **Evidence produced / scoring effect.** None.
 
-**Failure modes and recovery.** If the run is detached, check
-`logs/<launch_id>.log` for the launcher PID; if the DB was discarded, the run
-no longer exists.
+**Failure modes and recovery.** If the run is detached, use the launch JSON
+printed by `./chaos run --detach`; it contains the PID and log path. The log
+file contains runner output. If the DB was discarded, the run no longer exists.
 </details>
 
 <details>
@@ -573,17 +588,19 @@ an interrupted run.
 **Expects.** A live run ID, or `all` for normal abort. `--abandon` requires a
 single run ID.
 
-**Does.** Normal abort sends `SIGTERM` unless `--no-kill`, records
-`operator_abort`, and finishes the run as `aborted`. `--abandon` writes
-`run.abandon` and finishes the interrupted run as `aborted` with end reason
-`abandoned`.
+**Does.** Normal abort sends `SIGTERM`, records `operator_abort`, and finishes
+the run as `aborted`. `--no-kill` works only when no targeted run has a live
+owner. `--abandon` writes `run.abandon` and finishes the interrupted run as
+`aborted` with end reason `abandoned`.
 
 **Evidence produced / scoring effect.** Abort event and end reason; the run is
 not a headline success.
 
-**Failure modes and recovery.** If the runner ignores the signal, inspect the
-PID in the launch log and only then use a direct process kill. Verify cluster
-health and restore manually if a repair was in flight.
+**Failure modes and recovery.** If a live owner exists, `--no-kill` refuses the
+abort; use normal abort or verify the process is dead first. If the runner
+ignores the signal, inspect the PID in the launch JSON and only then use a
+direct process kill. Verify cluster health and restore manually if a repair was
+in flight.
 </details>
 
 <details>
@@ -594,13 +611,15 @@ health and restore manually if a repair was in flight.
 **Expects.** Explicit confirmation.
 
 **Does.** Archives the active epoch under `archive/`, deletes the active
-DB/WAL/SHM and traces, truncates `runs.jsonl`, and leaves `logs/` intact.
+DB/WAL/SHM, traces, and cached node-IP file, truncates `runs.jsonl`, and leaves
+`logs/` intact.
 
 **Evidence produced / scoring effect.** Removes run evidence from the active
 epoch; the archive copy is not scored or replayed by default.
 
-**Failure modes and recovery.** None after confirmation. Use only when the
-evidence is deliberately disposable.
+**Failure modes and recovery.** Refuses while active runs have live owners;
+abort them first or confirm they are dead. Use only when the evidence is
+deliberately disposable.
 </details>
 
 <details>
@@ -611,15 +630,16 @@ evidence is deliberately disposable.
 **Expects.** `setup.conf` masters, SSH preflight success, and explicit
 confirmation.
 
-**Does.** Aborts runs, rebuilds the cluster through `k8s-easy-install`, clears
-frozen topology, rediscovers, refreshes IPs, and discards state only on
-success.
+**Does.** Validates masters, SSH-preflights them, aborts runs, rebuilds the
+cluster through `k8s-easy-install`, clears frozen topology, rediscovers,
+refreshes the IP cache twice, and discards state only on success.
 
 **Evidence produced / scoring effect.** Destroys prior run evidence on
 success. It is infrastructure recovery, not model behavior.
 
-**Failure modes and recovery.** On failure the DB is preserved but runs were
-already aborted. Restore the cluster manually and re-run preflight.
+**Failure modes and recovery.** If preflight fails, nothing is aborted. If the
+rebuild fails after preflight, runs were already aborted but the DB is
+preserved. Restore the cluster manually and re-run preflight.
 </details>
 
 <details>
@@ -630,12 +650,13 @@ already aborted. Restore the cluster manually and re-run preflight.
 **Expects.** A readable SQLite DB.
 
 **Does.** Groups the matrix by scenario, backend, topology class, and seed;
-detail sections include every stored run. The matrix excludes resumed and
-interactive runs by default, but includes provider-error and unverified-fault
-runs so excluded groups stay inspectable.
+detail sections include every stored run. The matrix always excludes resumed
+runs and excludes interactive runs unless `--include-interactive` is passed. It
+includes provider-error and unverified-fault runs so excluded groups stay
+inspectable.
 
 **Evidence produced / scoring effect.** Writes derived HTML only; it never
-changes DB truth or scores.
+changes DB truth or scores. CLI startup may still append reaper events.
 
 **Failure modes and recovery.** If a run is missing from the matrix, check
 whether it was resumed or interactive. If it is missing from the detail sections,
@@ -654,8 +675,9 @@ check whether the DB is readable.
 excludes provider errors and unverified faults unless explicitly included.
 
 **Evidence produced / scoring effect.** Reads stored outcomes; does not mutate
-run truth. Flags such as `--include-provider-errors` change the reported cohort
-only.
+run truth. `--include-resumed`, `--include-interactive`,
+`--include-provider-errors`, and `--include-unverified-faults` change the
+reported cohort only.
 
 **Failure modes and recovery.** If counts look surprising, inspect
 `end_reason`, `fault_present`, and `policy_violations` in the DB or replay.
@@ -717,13 +739,14 @@ cluster health before `./chaos run`.
 10. **Agent loop**: the model calls named diagnostic tools and, after a correct
     diagnosis and policy approval, gated repair tools; model-visible output is
     truncated.
-11. **Diagnosis gate**: `submit_diagnosis` requires one exact label, caps
+11. **Diagnosis gate**: `submit_diagnosis` requires a canonical label, caps
     attempts, and returns a run-specific gate receipt when correct.
 12. **Repair gate**: harness-side approval must exist; repair must be neither
     forbidden nor unacceptable for the scenario after alias canonicalization.
 13. **Final verify** checks etcd health again.
 14. **Finish** writes outcome fields, score row, final record, and releases lease.
-15. **Export** derived JSONL/trace/snapshot/UI files unless disabled.
+15. **Export** derived JSONL/trace/snapshot/UI files; `--no-jsonl` disables full
+    export and `runs.jsonl`, but per-run trace JSONL is still written.
 
 ```text
 pending -> running -> finished
@@ -766,7 +789,8 @@ Diagnostic tools:
 | `df_path` | Disk usage for a path on a node |
 | `ls_path` | Directory listing for a path on a node |
 
-`submit_diagnosis` accepts exactly:
+`submit_diagnosis` exposes these canonical labels; common phrases and
+substrings are normalized before comparison:
 
 `no_fault`, `etcd_member_unreachable`, `etcd_member_data_loss`,
 `etcd_quorum_loss`, `etcd_disk_exhaustion`, `etcd_config_error`.
@@ -781,7 +805,7 @@ Gate order:
 
 ```text
 diagnosis submitted
-  -> exact label accepted within the attempt cap
+  -> canonical label accepted within the attempt cap
   -> harness-side approval active
   -> repair name canonicalized
   -> repair not forbidden
@@ -838,7 +862,8 @@ Tool output is truncated to roughly 4,000 characters. Timeouts and
 
 **What it means.** The diagnosis gate and approval source.
 
-**Expects.** One exact `root_cause` label and optional affected node list.
+**Expects.** One canonical `root_cause` label and optional affected node list;
+runtime normalization accepts common phrases and substrings.
 
 **Does.** Checks the label against scenario truth. On success it returns a
 run-specific gate receipt; on rejection it returns no receipt and records the
@@ -883,9 +908,9 @@ with escalation guidance. It does not count as a healthy verification.
 directory, restores/updates its manifest, deletes the pod, and waits for
 readiness.
 
-**Evidence produced / scoring effect.** Acceptable for `etcd-member-wiped` and
-`etcd-wrong-peer-url`; may be blocked or recorded as a policy violation in
-other scenarios.
+**Evidence produced / scoring effect.** Acceptable for `etcd-member-wiped`,
+`etcd-wrong-peer-url`, and `etcd-disk-full`; may be blocked or recorded as a
+policy violation in other scenarios.
 
 **Failure modes and recovery.** More invasive than `restart_member`; if blocked,
 stop and escalate rather than trying another repair.
@@ -933,7 +958,8 @@ a clean agent success.
 
 **What it means.** Display alias for `full_cluster_reset`.
 
-**Expects.** Only the gate receipt.
+**Expects.** No arguments; the harness derives authorization from folded gate
+state.
 
 **Does.** Canonicalizes to `full_cluster_reset` before policy checks, scoring,
 and execution.
@@ -979,15 +1005,18 @@ Tables group into configuration (`scenarios`, `batches`), run lifecycle
 Important `runs` fields: `topology_hash`, `config_hash`, `resume_of`,
 `resume_count`, `interactive`, `launch_id`, `pid`, `status`, `phase`,
 `end_reason`, `truth`, `diagnosis_correct`, `approval_granted`, `repair`,
-`verify_ok`, `seq`, `state_seq`, and lease fields. Provenance fields are
-`model`, `quant`, `temperature`, `seed`, `prompt_hash`, and `harness_git_sha`.
+`verify_ok`, `seq`, `state_seq`, and lease fields. Live provenance fields are
+`model`, `temperature`, `seed`, and `harness_git_sha`; `quant` and `prompt_hash`
+exist for schema/import compatibility but live runs leave them unset.
 
 Mutating tool calls are recorded as intents before execution and updated after.
 An unfinished mutating call marks an unknown-effect crash boundary. State is
-rebuilt when `cached.seq`, `runs.state_seq`, and `runs.seq` disagree.
+rebuilt from the event log whenever `get_state()` is called; sequence-marker
+disagreements are diagnosed and reported by `doctor`.
 
-Legacy backend aliases normalize to `ollama` on DB init and export. `auto` and
-custom `CHAOS_LLM_ENDPOINTS` names are preserved; `runs.backend`/`runs.model`
+Legacy backend aliases normalize to `ollama` on reads, export, and import; DB
+init currently rewrites only the first legacy alias token in stored rows. `auto`
+and custom `CHAOS_LLM_ENDPOINTS` names are preserved; `runs.backend`/`runs.model`
 keep the selected chain identity and are not rewritten to the responder after a
 fallback. The answering backend is preserved in `llm_requests.backend`, messages,
 `llm_response_full`, and `assistant` events (§7). Export writes derived files;
@@ -1002,7 +1031,7 @@ fallback. The answering backend is preserved in `llm_requests.backend`, messages
 | `./chaos run --resume-of <id>` | yes | Refuses; never discards |
 | `./chaos status`, `attach` | yes | Read-only warning |
 | `./chaos state discard --yes` | n/a | Archives the active epoch under `archive/`, then deletes DB/WAL/SHM and `traces/*.jsonl`; truncates `runs.jsonl`; `logs/` survives |
-| `./chaos cluster nuke --yes` | n/a | Rebuilds, rediscovers, then discards on success |
+| `./chaos cluster nuke --yes` | n/a | SSH-preflights, aborts runs, rebuilds, rediscovers, refreshes IP cache, then discards on success |
 
 `--force-resume` bypasses config-hash mismatch only, not topology mismatch.
 Resume is allowed for `running` or `interrupted` runs and does not repeat reset,
@@ -1014,8 +1043,8 @@ unknown outcome. Retries link through `resume_of` and increment `resume_count`.
 
 `discard_state()` refuses live PIDs, aborts non-live active rows, archives the
 active epoch, deletes DB/WAL/SHM, truncates `runs.jsonl`, deletes
-`traces/*.jsonl`, optionally clears IP cache, and reinitializes schema v4.
-`logs/` survives.
+`traces/*.jsonl`, optionally clears IP cache, and reinitializes the current
+schema (v6). `logs/` survives.
 
 ## 14. Observability and reporting
 
@@ -1032,38 +1061,45 @@ end reason, stream/tool/event tails, and topology summary.
 ./chaos replay --output replay.html
 ```
 
-Detach prints `launch_id`, `pid`, and `logs/<launch_id>.log`; the runner also
-appends `logs/<run_id>.log`. `attach` is read-only and tracks event and UI
-cursors independently. `abort` sends `SIGTERM` unless `--no-kill`, records
-`operator_abort`, and finishes as `aborted`.
+Detach prints launch JSON containing `launch_id`, `pid`, and
+`logs/<launch_id>.log`; the runner also appends `logs/<run_id>.log`. `attach` is
+read-only and tracks event and UI cursors independently. `abort` sends
+`SIGTERM` and records `operator_abort`; `--no-kill` only works when no targeted
+run has a live owner.
 
 Replay's matrix groups by scenario, backend, topology class, and seed. It
-excludes resumed and interactive runs by default but includes provider-error and
-unverified-fault runs; detail sections include all stored runs. Text is escaped
-and redacted before rendering.
+always excludes resumed runs and excludes interactive runs unless
+`--include-interactive` is passed. Provider-error and unverified-fault runs are
+included, and detail sections include all stored runs. Text is escaped and
+redacted before rendering.
 
 Score metrics: `runs`, `diagnosis`, `first_attempt_diagnosis`, `verify`,
 `approval`, `strict_loop_success`, `loop_success`, `policy_violations` (fraction
-of runs with any blocked call), `forbidden`, `budget_exhausted`,
+of runs with any blocked call), `forbidden`, `budget_exhausted` (fraction whose
+folded end reason is `budget_steps` or `budget_tokens`),
 `avg_diagnosis_attempts`, `avg_steps`, `avg_tokens`, and `scorer_version`
 (`gate-path-v1`). Streamed responses request provider usage payloads, and live
-token accounting was verified in the five-run pilot.
+token accounting was verified in the shipped five runs.
 
-A run is headline-eligible iff `status='finished'`, `resume_count=0`,
-`interactive=0`, `end_reason` is not `imported_exploratory` or a provider-error or
-unsupported end reason, `truth` is present, and `fault_present=true`. Fallback
-runs are included; a provider error means every configured candidate failed, not
-that an earlier candidate failed before a later one answered. Because current
-score tables group by `runs.backend`, fallback-enabled runs are comparable as
-configured chains, not as clean per-backend baselines; see §7 for the provenance
-rule. `--include-resumed`, `--include-interactive`, `--include-provider-errors`,
-and `--include-unverified-faults` opt into excluded groups for historical
-analysis.
+A run is headline-eligible when `status='finished'` (unless provider errors are
+included), `resume_count=0`, `interactive=0`, `end_reason` is not
+`imported_exploratory`, `provider_error%`, `error`, `fault_not_observed`, or
+`injection_failed`, `truth` is present, and `fault_present=true`; unsupported
+runs use `status='skipped_unsupported'`. Fallback runs are included; a provider
+error means every configured candidate failed, not that an earlier candidate
+failed before a later one answered. Because current score tables group by
+`runs.backend`, fallback-enabled runs are comparable as configured chains, not
+as clean per-backend baselines; see §7 for the provenance rule. For `score.py`,
+`--include-resumed`, `--include-interactive`, `--include-provider-errors`, and
+`--include-unverified-faults` opt into excluded groups; replay exposes only
+`--include-interactive`.
 
 `strict_loop_success=1` additionally requires `diagnosis_correct=true` on the
-first attempt, `approval_granted=true`, `verify_ok=true`, `end_reason=verify_ok`,
-an acceptable repair (or no repair for `no_fault`), no forbidden repair, no
-policy violations, no provider failure, and no budget or step cutoff.
+first attempt, `approval_granted=true`, `verify_ok=true`, folded
+`end_reason=verify_ok`, an acceptable repair (or no repair for `no_fault`), no
+forbidden repair, no policy violations, and no provider failure. A stored
+`runs.end_reason` of `budget_tokens` or `budget_steps` remains visible in run
+metadata but does not currently change the folded reason after verification.
 `loop_success` is the historical
 metric: correct diagnosis, verify pass, and repair presence matching fault
 status. **It does not require a first-attempt diagnosis, an acceptable repair,
@@ -1076,7 +1112,7 @@ python3 score.py --db results.sqlite3 --format md --include-interactive
 ```
 
 <details>
-<summary><b>Historical results (reduced sweep and five-run pilot)</b></summary>
+<summary><b>Historical reduced sweep and shipped five runs</b></summary>
 
 #### Historical evidence (reduced sweep, earlier metric)
 
@@ -1109,31 +1145,30 @@ Coverage is uneven: `ollama` ran four scenarios and the other backends ran
 three. Treat this as smoke evidence, not a backend ranking. Historical sweep
 details remain in git history.
 
-#### Results (five-run pilot)
+#### Results (five runs in shipped DB)
 
-This pilot ran after fault-present gates, strict scoring, live calibration, and
-the health-verification fix. It used an isolated DB and is a diagnostic sample,
-not a backend ranking.
+The shipped `results.sqlite3` is a diagnostic sample, not a backend ranking; all
+five runs used `ollama`. Recompute it with `python3 score.py --db results.sqlite3
+--format md`.
 
 | Scope | Runs | Diagnosis | Verify | `strict_loop_success` | Runs with policy violations |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Overall | 5 | 100% | 80% | 20% | 60% |
+| Overall | 5 | 40% | 60% | 40% | 60% |
+| `ollama` | 5 | 40% | 60% | 40% | 60% |
 
 **How to read the gap between verify and strict:**
 
-- **80% verify** means 4 of 5 runs ended with a healthy cluster. The OpenRouter
-  run correctly diagnosed the fault and called `restart_member`, but the repair
-  tool reported `timeout waiting for etcd-vm3`. The model then spent the rest of
-  its budget investigating with read-only tools, and final verification failed.
-  The original 90-second repair timeout default was raised to 180 seconds for
-  the re-pilot; see §15.
-- **20% strict** means only the Ollama control run was fully clean under the
-  narrow metric. The Ollama member-down run tried an unacceptable but blocked
-  repair. The Groq run tried a blocked repair and hit the token budget. The
-  Cloudflare run tried the forbidden `snapshot_restore_full` and hit the token
-  budget. The OpenRouter run had the repair timeout, budget exhaustion, and
-  failed verification.
-- **No provider errors** in this pilot means these failures were model/tool
+- **60% verify** means three runs ended with a healthy cluster:
+  `control-healthy-noisy`, `etcd-member-down`, and `etcd-wrong-peer-url`. The
+  wiped-member and quorum-loss runs failed verification.
+- **40% strict** means only the control and member-down runs were clean under
+  the current narrow metric. The member-down run has
+  `runs.end_reason='budget_tokens'` and 67,463 tokens, but the folded reason is
+  `verify_ok`, so it still scores `strict_loop_success=1`; see §14.
+- **60% policy violations** came from the wiped-member, quorum-loss, and
+  wrong-peer-url runs; the wrong-peer-url run verified successfully but still
+  failed strict scoring.
+- **No provider errors** in this DB means these failures were model/tool
   behavior, not API 413, 429, or 5xx failures.
 
 **What these numbers do not mean:**
@@ -1171,7 +1206,8 @@ crediting a diagnosis or repair when nothing was actually broken.
 **What it means.** The submitted root-cause label matched scenario truth, and
 the gate issued a run-specific gate receipt.
 
-**Expects.** One exact label from the allowed set, submitted before repair.
+**Expects.** One canonical label from the allowed set, submitted before repair;
+common phrases and substrings are normalized.
 
 **Does.** Records diagnosis attempts; wrong labels receive no token.
 
@@ -1183,52 +1219,60 @@ requested.
 <details>
 <summary><b><code>repair</code>, acceptable repair, and forbidden repair</b></summary>
 
-**What it means.** Which named repair the model executed, if any, and whether
-the scenario allowed it.
+**What it means.** Which named repair was accepted/proposed, if any, and
+whether the scenario allowed it. Actual execution is tracked separately by
+`repair_executed`.
 
 **Expects.** Active harness-side approval plus scenario policy approval.
 
 **Does.** Records the attempted repair and its arguments; blocked calls do not
 reach the repair implementation.
 
-**Scoring effect.** Strict success requires an acceptable repair. Forbidden or
-unacceptable attempts become `policy_violations`; forbidden attempts also set
-`forbidden_reason`.
+**Scoring effect.** Strict success requires an acceptable repair for fault runs
+and no repair proposal for `no_fault`. Forbidden or unacceptable attempts become
+`policy_violations`; forbidden attempts also set `forbidden_reason`.
 </details>
 
 <details>
 <summary><b><code>verify_ok</code></b></summary>
 
-**What it means.** The final etcd-health verification passed after the agent
-loop.
+**What it means.** The combined final health and fault-cleared verification
+passed after the agent loop.
 
 **Expects.** A healthy 3/3 etcd view with quorum, or the equivalent for the
-discovered topology.
+discovered topology, plus a cleared scenario-specific fault.
 
-**Does.** Polls health within the verification timeout and stores the output.
+**Does.** Polls health and the fault-cleared predicate within the verification
+timeout and stores the output.
 
 **Scoring effect.** Required for both historical `loop_success` and strict
 success. A healthy cluster after a timeout can still fail strict scoring for
-budget/policy reasons.
+policy/provider reasons. Stored budget cutoffs remain visible in
+`runs.end_reason`, steps, and tokens but do not currently fail strict scoring.
 </details>
 
 <details>
 <summary><b><code>end_reason</code></b></summary>
 
-**What it means.** Why the run loop ended.
+**What it means.** There are two related reasons: stored `runs.end_reason`
+records the agent, setup, provider, or operator outcome, while the folded
+run-state `end_reason` is what the scorer reads.
 
-**Expects.** Values include `submitted`, `diagnosis_attempts_exhausted`,
-`budget_steps`, `budget_tokens`, `agent_stopped`, `injection_failed`,
-`fault_not_observed`, `reset_failed`, `baseline_failed`, `verify_ok`,
-`verify_failed`, `operator_abort`, `state_discard`, `abandoned`,
-`provider_error_*`, `unsupported`, `skipped_unsupported`, and imported
-`imported_exploratory`.
+**Expects.** Stored values include `submitted`, `agent_stopped`,
+`budget_steps`, `budget_tokens`, `error`, `provider_error_*`,
+`injection_failed`, `fault_not_observed`, `reset_failed`, `baseline_failed`,
+`operator_abort`, `state_discard`, `abandoned`, unsupported reasons such as
+`unsupported_topology`, imported `imported`/`imported_exploratory`, and
+resume-abort reasons such as `unsafe_resume_phase`, `resume_config_mismatch`,
+and `unknown_repair_side_effect`. Unsupported runs use status
+`skipped_unsupported`. Folded reasons include `verify_ok` and `verify_failed`.
 
 **Does.** Distinguishes ordinary completion from budget exhaustion, setup
-failure, and provider failure.
+failure, provider failure, and verification outcome.
 
 **Scoring effect.** Provider errors and fault-not-observed runs are excluded
-from headline rates. Budget cutoffs remain visible and fail strict success.
+from headline rates. Strict requires folded `end_reason=verify_ok`; a stored
+`budget_tokens` or `budget_steps` value does not currently fail strict success.
 </details>
 
 <details>
@@ -1236,22 +1280,23 @@ from headline rates. Budget cutoffs remain visible and fail strict success.
 
 **What it means.** A deliberately narrow clean end-to-end repair signal.
 
-**Expects.** Observed fault, first-attempt correct diagnosis, approval, acceptable
-repair, no forbidden repair, no policy violation, no run-level provider failure,
-no budget cutoff, and passing verification. Earlier fallback candidates that
-failed before another candidate answered do not fail this criterion; the
-answering backend is recorded as provenance (§7).
+**Expects.** Observed fault, first-attempt correct diagnosis, approval,
+acceptable repair, no forbidden repair, no policy violation, no run-level
+provider failure, and folded `end_reason=verify_ok` with passing verification.
+Stored budget cutoffs do not currently fail this criterion. Earlier fallback
+candidates that failed before another candidate answered do not fail this
+criterion; the answering backend is recorded as provenance (§7).
 
 **Does.** Answers “did the model do the whole loop cleanly?”, not “was the
 conversation educational or useful?”.
 
-**Scoring effect.** This is the headline metric. The pilot explanation above
-shows why a run can be useful while still failing strict success.
+**Scoring effect.** This is the headline metric. The shipped-data explanation
+above shows why a run can be useful while still failing strict success.
 </details>
 
 ## 15. Operations and safety
 
-Safe/read-only:
+Non-cluster-affecting / non-destructive:
 
 ```bash
 ./chaos status
@@ -1264,6 +1309,9 @@ python3 db_cli.py doctor --strict
 bash cluster/verify_etcd_healthy.sh
 python3 scripts/llm_ready.py
 ```
+
+These do not change cluster state, but CLI startup may append reaper events and
+`./chaos replay` writes derived HTML.
 
 Destructive or host-affecting:
 
@@ -1287,13 +1335,14 @@ export CHAOS_ALLOWED_CLUSTER_CONTEXTS=kubernetes-admin@kubernetes
 export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(./chaos target show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["topology"]["topology_hash"])')"
 ```
 
-Either `CHAOS_ALLOWED_CLUSTER_CONTEXTS` must include the current `kubectl config
-current-context`, or `CHAOS_ALLOWED_CLUSTER_IDS` must include `CHAOS_CLUSTER_ID`
-(which defaults to that context). `CHAOS_ALLOWED_TOPOLOGY_HASHES` is optional;
-when set, the active hash must match the value printed by `./chaos target show
---json`. The guard also applies to `CHAOS_TOPOLOGY_JSON` fixtures, and `./chaos
-run` rejects fixture topology unless `CHAOS_ALLOW_FIXTURE_RUNS=1`. Fixtures are
-for offline tests only and must never be used against a live cluster.
+`CHAOS_CLUSTER_ID` overrides the kubectl context for both identity checks. If
+it is set, include that exact value in `CHAOS_ALLOWED_CLUSTER_CONTEXTS` or in
+`CHAOS_ALLOWED_CLUSTER_IDS`; otherwise the current `kubectl config
+current-context` is used. `CHAOS_ALLOWED_TOPOLOGY_HASHES` is optional; when set,
+the active hash must match the value printed by `./chaos target show --json`.
+The guard also applies to `CHAOS_TOPOLOGY_JSON` fixtures, and `./chaos run`
+rejects fixture topology unless `CHAOS_ALLOW_FIXTURE_RUNS=1`. Fixtures are for
+offline tests only and must never be used against a live cluster.
 
 A topology hash change does not silently erase evidence. The runner archives the
 active epoch under `archive/` and exits with an explanatory message. Pass
@@ -1327,7 +1376,7 @@ were already aborted. Override the installer with `K8S_EASY_INSTALL`.
 
 ```bash
 python3 -m unittest discover -s tests -v
-OLLAMA_MODEL=qwen3:8b python3 -m unittest discover -s tests -v
+CHAOS_LIVE_BACKEND_TESTS=1 OLLAMA_MODEL=qwen3:8b python3 -m unittest tests.test_backends -v
 CHAOS_LIVE_BACKEND_TESTS=1 python3 -m unittest tests.test_backends -v
 ```
 
@@ -1374,8 +1423,8 @@ unreadable DB.
 - UI/replay redact secrets; gate receipts are derived from folded state and
   stripped from persisted caches
 - topology-mismatch archive does not clear the node IP cache; CLI discard/nuke do
-- `--no-jsonl` disables export, but topology-mismatch discard still truncates the
-  default `runs.jsonl`
+- `--no-jsonl` disables full export and `runs.jsonl`, but per-run trace JSONL is
+  still written; topology-mismatch discard still truncates default `runs.jsonl`
 - the full fresh cross-backend sweep and refreshed artifacts remain pending
 
 The maintained status and roadmap live in `docs/ARCHITECTURE.md` §12. Historical
@@ -1397,7 +1446,8 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `docs/STATE_MACHINE.md` | Generated state-machine reference; edit the generator or machine tables |
 | `scripts/README.md` | Helper-script details |
 
-Older design, phase, and state-machine documents were retired after their useful
-content was assimilated. Git history preserves the originals.
+Historical review artifacts remain in the repo root (`statemachine.md`,
+`state_machine_review.md`, and `new_feedback.md`) and are not maintained operator
+documentation.
 
 </details>
