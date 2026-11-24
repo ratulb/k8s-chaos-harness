@@ -25,9 +25,9 @@ def main() -> None:
     sub.add_parser("init")
     sub.add_parser("migrate")
 
-    legacy = sub.add_parser("import-legacy")
-    legacy.add_argument("--runs", default="runs.jsonl")
-    legacy.add_argument("--trace-dir", default="traces")
+    import_runs = sub.add_parser("import-runs")
+    import_runs.add_argument("--runs", default="runs.jsonl")
+    import_runs.add_argument("--trace-dir", default="traces")
 
     doctor = sub.add_parser("doctor")
     doctor.add_argument("--strict", action="store_true")
@@ -58,8 +58,8 @@ def main() -> None:
         _print_json({"database": str(store.path), "initialized": True})
     elif args.command == "migrate":
         _print_json(store.migrate())
-    elif args.command == "import-legacy":
-        _print_json(store.import_legacy(args.runs, args.trace_dir))
+    elif args.command == "import-runs":
+        _print_json(store.import_runs(args.runs, args.trace_dir))
     elif args.command == "doctor":
         report = store.doctor()
         _print_json(report)

@@ -15,7 +15,7 @@ B3 (cross-machine coordination). §8.4 names the fold order (tool → gate → r
 
 B4 (reaper idempotency). §3.2 invariant 6 now distinguishes producer-seq idempotency from generated-event idempotency, and §6.6 specifies idempotency_key = "reap:{run_id}:{previous_state}:{lease_expires_at}" with a same-transaction check. §11.2's doctor check is now "semantically duplicate generated transitions with the same idempotency_key," which is the right wording.
 
-B5 (illegal transition contract). §4.4's caller contract — run loop aborts with state_machine_bug, reaper logs and skips, resume fails closed, shadow logs and continues on legacy — is exactly the discipline needed. §6.4's "An ILLEGAL_TRANSITION reaching the run machine is always a harness bug" makes this explicit.
+B5 (illegal transition contract). §4.4's caller contract — run loop aborts with state_machine_bug, reaper logs and skips, resume fails closed, shadow logs and continues with a shadow record — is exactly the discipline needed. §6.4's "An ILLEGAL_TRANSITION reaching the run machine is always a harness bug" makes this explicit.
 
 B6 (tool status compatibility). §7.2's v1-persisted-status + result.code scheme is the right lowest-risk answer, and §14's mitigation row matches it. This avoids silently skipping rows in old score.py/replay.py queries.
 
@@ -66,7 +66,7 @@ T6. §13 Phase 2's file list includes harness/reaper.py and chaos abort --abando
 
 T7. §13 Phase 3 doesn't mention the result.code migration. §7.2 says new states are persisted as finished/failed + result.code in the existing result TEXT column as JSON. But existing rows may have plain-text result values (like "superseded_after_resume" from run_benchmark.py:288-298, per §2.3). Fix: add a sentence to Phase 3's acceptance: "Existing plain-text result values are read as
 result.code
- only when they're JSON; otherwise they're treated as a legacy result.text and preserved. New writes always use the JSON envelope." This is the compatibility contract that makes "old rows remain readable" true.
+ only when they're JSON; otherwise they're treated as a plain result.text and preserved. New writes always use the JSON envelope." This is the readability contract that makes "old rows remain readable" true.
 
 T8. §15's resolved-checkpoints list has eight items, but the six original reviewer questions plus B8 (no-fault strictness) and B2 (escalation-reason enum) — that's eight, matching — but the document doesn't say which of the six original questions are now decisions vs. open. The header says "resolved as decisions; two semantic questions from the review are also recorded here for auditability." That's clear enough, but a reader scanning for "what's still open" won't find it. Fix: add a one-line note at the end of §15: "No reviewer checkpoint remains open; any future disagreement is a new proposal, not a reopened question." That's the closure statement that makes the decision summary at the top authoritative.
 

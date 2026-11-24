@@ -4,7 +4,7 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from harness.engine import run_scenario as _legacy_run_scenario
+from harness import engine
 from harness.loop import AgentLoop, RunResult
 from harness.message import Message
 from harness.prompt import SystemPrompt
@@ -58,7 +58,7 @@ def run_scenario(
     run_env: dict[str, str] | None = None,
 ) -> dict:
     agent = Agent()
-    return _legacy_run_scenario(
+    return engine.run_scenario(
         scenario,
         backend,
         run_id,

@@ -27,7 +27,7 @@ from harness.gate_runtime import GateRuntime
 from harness.message import Message
 from harness.run_runtime import RunRuntime
 from harness.tool_runtime import ToolLedger
-from tools.naming import LEGACY_BACKEND_TOKENS, normalize_backend, normalize_repair_name
+from tools.naming import BACKEND_ALIAS_TOKENS, normalize_backend, normalize_repair_name
 
 SCHEMA_VERSION = 6
 
@@ -734,19 +734,19 @@ class SQLiteStore:
                     conn.execute(f"ALTER TABLE tool_calls ADD COLUMN {column} {definition}")
             conn.execute(
                 "UPDATE batches SET backend='ollama' WHERE backend=?",
-                (LEGACY_BACKEND_TOKENS[0],),
+                (BACKEND_ALIAS_TOKENS[0],),
             )
             conn.execute(
                 "UPDATE runs SET backend='ollama' WHERE backend=?",
-                (LEGACY_BACKEND_TOKENS[0],),
+                (BACKEND_ALIAS_TOKENS[0],),
             )
             conn.execute(
                 "UPDATE messages SET backend='ollama' WHERE backend=?",
-                (LEGACY_BACKEND_TOKENS[0],),
+                (BACKEND_ALIAS_TOKENS[0],),
             )
             conn.execute(
                 "UPDATE llm_requests SET backend='ollama' WHERE backend=?",
-                (LEGACY_BACKEND_TOKENS[0],),
+                (BACKEND_ALIAS_TOKENS[0],),
             )
             conn.execute(
                 "INSERT OR REPLACE INTO schema_meta(version, applied_at, notes) VALUES (?, ?, ?)",
@@ -1552,7 +1552,7 @@ class SQLiteStore:
         if not include_resumed:
             clauses.append("resume_count=0")
         if not include_aborted:
-            clauses.append("(end_reason IS NULL OR end_reason != 'legacy_exploratory')")
+            clauses.append("(end_reason IS NULL OR end_reason != 'imported_exploratory')")
         if not include_interactive:
             clauses.append("interactive=0")
         if not include_provider_errors:
@@ -1645,7 +1645,7 @@ class SQLiteStore:
             "stream_chunks": stream_count,
         }
 
-    def import_legacy(
+    def import_runs(
         self, runs_path: str | Path = "runs.jsonl", trace_dir: str | Path = "traces"
     ) -> dict[str, Any]:
         runs_path = Path(runs_path)
@@ -1653,7 +1653,7 @@ class SQLiteStore:
         if not runs_path.exists():
             return {"imported": 0, "skipped": 0, "trace_events": 0, "batch_id": None}
 
-        batch_id = f"legacy-import-{uuid.uuid4().hex[:8]}"
+        batch_id = f"import-{uuid.uuid4().hex[:8]}"
         batch_created = False
         imported = 0
         skipped = 0
@@ -1674,16 +1674,16 @@ class SQLiteStore:
             if not batch_created:
                 self.create_batch(
                     batch_id=batch_id,
-                    command=["db_cli.py", "import-legacy"],
+                    command=["db_cli.py", "import-runs"],
                     scenario_ids=[],
-                    backend="legacy",
-                    config_hash="legacy",
+                    backend="imported",
+                    config_hash="imported",
                 )
                 batch_created = True
 
             exploratory = "approval_granted" not in record
             scenario_id = str(record.get("scenario", "unknown"))
-            version = self.ensure_scenario(scenario_id, "legacy", "{}")
+            version = self.ensure_scenario(scenario_id, "imported", "{}")
             events = []
             trace_path = trace_dir / f"{run_id}.jsonl"
             if trace_path.exists():
@@ -1702,15 +1702,15 @@ class SQLiteStore:
                 batch_id=batch_id,
                 scenario_id=scenario_id,
                 scenario_version=version,
-                spec_hash="legacy",
+                spec_hash="imported",
                 backend=backend,
                 seed=0,
                 status="aborted" if exploratory else "finished",
-                phase="legacy_import",
-                end_reason="legacy_exploratory" if exploratory else "imported",
+                phase="imported",
+                end_reason="imported_exploratory" if exploratory else "imported",
                 truth=record.get("truth"),
                 started_at=min(timestamps) if timestamps else self._now(),
-                config_hash="legacy",
+                config_hash="imported",
             )
             terminal_fields = {
                 key: value for key, value in record.items() if key in RECORD_TO_COLUMN and key != "run_id"
@@ -1719,8 +1719,8 @@ class SQLiteStore:
                 {
                     "backend": backend,
                     "status": "aborted" if exploratory else "finished",
-                    "phase": "legacy_import",
-                    "end_reason": "legacy_exploratory" if exploratory else "imported",
+                    "phase": "imported",
+                    "end_reason": "imported_exploratory" if exploratory else "imported",
                     "finished_at": max(timestamps) if timestamps else self._now(),
                 }
             )

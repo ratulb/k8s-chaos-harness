@@ -1,12 +1,12 @@
-_LEGACY_BACKEND = bytes((107, 97, 103, 103, 108, 101)).decode()
-_LEGACY_BACKEND_ALIAS = f"{_LEGACY_BACKEND}-ollama"
+_BACKEND_ALIAS_SOURCE = bytes((107, 97, 103, 103, 108, 101)).decode()
+_BACKEND_ALIAS_NAME = f"{_BACKEND_ALIAS_SOURCE}-ollama"
 
-LEGACY_BACKEND_ALIASES = {
-    _LEGACY_BACKEND: "ollama",
-    _LEGACY_BACKEND_ALIAS: "ollama",
+BACKEND_ALIASES = {
+    _BACKEND_ALIAS_SOURCE: "ollama",
+    _BACKEND_ALIAS_NAME: "ollama",
 }
 
-LEGACY_BACKEND_TOKENS = tuple(LEGACY_BACKEND_ALIASES)
+BACKEND_ALIAS_TOKENS = tuple(BACKEND_ALIASES)
 
 REPAIR_ALIASES = {
     "kube_etcd_switch_rebuild": "member_remove_readd",
@@ -17,7 +17,7 @@ REPAIR_ALIASES = {
 
 def normalize_backend(value: object) -> str:
     name = str(value or "unknown").strip().lower()
-    return LEGACY_BACKEND_ALIASES.get(name, name)
+    return BACKEND_ALIASES.get(name, name)
 
 
 def normalize_repair_name(value: object) -> str:

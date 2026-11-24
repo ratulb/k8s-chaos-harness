@@ -12,28 +12,6 @@ from tools.scenario import as_scenario
 from tools.tool import TOOL_REGISTRY
 
 
-def _legacy_spec(
-    scenario: Any,
-    backend: Any,
-    inject_cmd: str,
-    verify_cmd: str,
-    trace_dir: str,
-    verify_timeout: int,
-    approve: str,
-    run_env: dict[str, str] | None,
-) -> ExperimentSpec:
-    return ExperimentSpec(
-        scenario=as_scenario(scenario),
-        backend=backend,
-        inject_cmd=inject_cmd,
-        verify_cmd=verify_cmd,
-        verify_timeout=verify_timeout,
-        trace_dir=trace_dir,
-        run_env=dict(run_env or {}),
-        approve=approve,
-    )
-
-
 def run_scenario(
     scenario: Any,
     backend: Any,
@@ -76,9 +54,15 @@ def run_scenario(
                 interactive=approve == "prompt",
             )
     try:
-        spec = _legacy_spec(
-            scenario, backend, inject_cmd, verify_cmd, trace_dir,
-            verify_timeout, approve, run_env,
+        spec = ExperimentSpec(
+            scenario=as_scenario(scenario),
+            backend=backend,
+            inject_cmd=inject_cmd,
+            verify_cmd=verify_cmd,
+            verify_timeout=verify_timeout,
+            trace_dir=trace_dir,
+            run_env=dict(run_env or {}),
+            approve=approve,
         )
         ctx = RunContext(
             run_id=run_id,

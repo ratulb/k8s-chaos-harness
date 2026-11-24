@@ -57,7 +57,7 @@ The authoritative run store and score table live at the repository root:
 
 ```bash
 python3 db_cli.py init
-python3 db_cli.py import-legacy
+python3 db_cli.py import-runs
 python3 db_cli.py doctor --strict
 python3 score.py --db results.sqlite3 --format md
 ```

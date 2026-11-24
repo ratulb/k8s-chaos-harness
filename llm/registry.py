@@ -7,7 +7,7 @@ from typing import Any
 
 from llm.backends import configured_backends
 from llm.client import Backend
-from tools.naming import LEGACY_BACKEND_ALIASES, normalize_backend
+from tools.naming import BACKEND_ALIASES, normalize_backend
 
 AUTO_BACKEND = "auto"
 
@@ -47,7 +47,7 @@ def _custom_backends() -> list[Backend]:
         model = str(item.get("model") or "").strip()
         if not name or not base_url or not model:
             raise ValueError(f"CHAOS_LLM_ENDPOINTS[{index}] requires name, base_url, and model")
-        if name == AUTO_BACKEND or name in LEGACY_BACKEND_ALIASES or name in names:
+        if name == AUTO_BACKEND or name in BACKEND_ALIASES or name in names:
             raise ValueError(f"CHAOS_LLM_ENDPOINTS[{index}] has reserved or duplicate name {name!r}")
         if not _env_flag(str(item.get("enabled", "1")), True):
             continue

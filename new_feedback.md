@@ -10,7 +10,7 @@ Provenance: the backend that actually answered is recorded in llm_requests, mess
 
 config_hash records the selector and name/model chain, so resume can't silently switch policy.
 
-That's a real change in design, not just docs. It has one immediate consequence you should decide on before going private: the README still says in §1 and §2 "there is no fallback chain" — wait, no, the published §1 now says "Comparable backends with explicit provenance … auto and configured fallback chains keep runs alive when one endpoint fails." So §1 has been updated. But check §14's scoring: "A run is headline-eligible iff … end_reason is not legacy_exploratory or a provider-error or unsupported end reason." With fallback chains, a run that succeeds after one provider failed is now headline-eligible, and its provenance is recorded — but the README does not say whether a run whose primary failed and whose fallback answered is (a) counted normally with provenance noted, (b) annotated as fallback in the score, or (c) excluded from cross-backend comparability. This is the single most important design question the new feature creates, and it's not answered anywhere in the README.
+That's a real change in design, not just docs. It has one immediate consequence you should decide on before going private: the README still says in §1 and §2 "there is no fallback chain" — wait, no, the published §1 now says "Comparable backends with explicit provenance … auto and configured fallback chains keep runs alive when one endpoint fails." So §1 has been updated. But check §14's scoring: "A run is headline-eligible iff … end_reason is not imported_exploratory or a provider-error or unsupported end reason." With fallback chains, a run that succeeds after one provider failed is now headline-eligible, and its provenance is recorded — but the README does not say whether a run whose primary failed and whose fallback answered is (a) counted normally with provenance noted, (b) annotated as fallback in the score, or (c) excluded from cross-backend comparability. This is the single most important design question the new feature creates, and it's not answered anywhere in the README.
 
 What got fixed from my earlier review
 Several of the publication blockers are resolved in this version:
@@ -21,7 +21,7 @@ A3 (token → gate receipt). Renamed throughout, with a clear threat-model parag
 
 A1 (fault-injection semantics). §10 step 9 now splits injection_failed (command failure) from fault_not_observed (stimulus not proven present), both excluded from headline and strict. §15 agrees. Consistent.
 
-A6 (headline metric drift). §1 leads with strict_loop_success = 0.20 and explicitly demotes the 46.2% legacy number.
+A6 (headline metric drift). §1 leads with strict_loop_success = 0.20 and explicitly demotes the 46.2% earlier number.
 
 P0 fixes. §17 says "The P0 verify-env, fixture-env, lease, shell-validation, and gate-receipt gaps have been addressed." Commit Harden event redaction and lease renewal suggests P0.4/P0.5 landed; Neutralize public references and Close CLI batch-id and scenario quoting gaps suggest P1.15 and P2.4 landed. That matches my recommended sequence (fix P0 before refactor).
 
@@ -30,7 +30,7 @@ What's still wrong or newly wrong
 
 --discard-stale is documented in §10 step 5, §15, and §16 but not in §9's ./chaos run options table. Add it. Also, the CLI in §9's command list doesn't show it — if it's accepted by ./chaos run, the command synopsis should show it.
 
-injection_failed is not in §14's <details> end_reason list. The list enumerates submitted, budget_tokens, agent_stopped, fault_not_observed, reset_failed, baseline_failed, operator_abort, provider_error_* — but not injection_failed or skipped_unsupported. The §4 Core concepts table added injection_failed and legacy_exploratory, but the full enum still lives in ≥3 partial lists. This was my chunk-2 issue #6 / A8; still open.
+injection_failed is not in §14's <details> end_reason list. The list enumerates submitted, budget_tokens, agent_stopped, fault_not_observed, reset_failed, baseline_failed, operator_abort, provider_error_* — but not injection_failed or skipped_unsupported. The §4 Core concepts table added injection_failed and imported_exploratory, but the full enum still lives in ≥3 partial lists. This was my chunk-2 issue #6 / A8; still open.
 
 §9's run-options table says --backend <name> is required, but §7 says --backend auto is the default and the command synopsis shows --backend ollama|groq|openrouter|cloudflare. With custom endpoint names and auto now valid, the option table and synopsis are stale. Update to --backend <name|auto> and mention CHAOS_LLM_ENDPOINTS names.
 

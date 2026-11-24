@@ -86,7 +86,7 @@ or budget cutoff (§14). `loop_success` is kept only for historical comparison.
 This is a deliberately narrow end-to-end cleanliness signal, not a verdict on
 whether a conversation was educational or useful. The only current strict data
 point is the five-run pilot: `strict_loop_success = 0.20` (§14). The archived
-13-run sweep scored `0.462` on the legacy `loop_success` metric; it predates
+13-run sweep scored `0.462` on the historical `loop_success` metric; it predates
 fault-present gates and strict scoring, is not comparable to the headline
 metric, and is retained only as historical context. The headline is per
 configured chain when fallback is enabled: a run that answers on a fallback is
@@ -143,7 +143,7 @@ never sees fault scripts or scoring truth.
 | Resume | Continuation of an unfinished agent session; refuses topology changes |
 | Gate receipt | Protocol marker returned after a correct diagnosis; a correctness handshake, not a secret or human authorization |
 | Verification | Final `cluster/verify_etcd_healthy.sh` result |
-| End reason | Terminal cause: `injection_failed` means the fault command failed; `fault_not_observed` means the stimulus was not proven present; `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `legacy_exploratory` marks imported legacy runs without approval evidence and is excluded from headline score |
+| End reason | Terminal cause: `injection_failed` means the fault command failed; `fault_not_observed` means the stimulus was not proven present; `reset_failed`/`baseline_failed` mean the cluster was unclean before injection; `imported_exploratory` marks imported runs without approval evidence and is excluded from headline score |
 | Headline score | Default aggregate over clean, finished, non-interactive, non-resumed runs |
 
 Internally, `tools/scenario.py:Scenario` wraps scenario JSON,
@@ -236,7 +236,7 @@ The exclusion is an operator decision recorded in
 
 Repair aliases are display-only: `kube_etcd_switch_rebuild` canonicalizes to
 `member_remove_readd`, `reset_cluster` canonicalizes to `full_cluster_reset`, and
-`snapshot_restore_full` is retained as the legacy name for `full_cluster_reset`.
+`snapshot_restore_full` is also accepted as an alternate name for `full_cluster_reset`.
 Policy is evaluated on the canonical name, so an alias can never get different
 treatment from its target.
 
@@ -422,14 +422,14 @@ Lower-level commands:
 
 ```bash
 python3 db_cli.py --db results.sqlite3 SUBCOMMAND
-python3 db_cli.py --db results.sqlite3 import-legacy
+python3 db_cli.py --db results.sqlite3 import-runs
 python3 run_benchmark.py --scenario etcd-member-down --backend ollama --runs 1
 python3 score.py --db results.sqlite3 --format md
 python3 replay.py --db results.sqlite3 --output replay.html
 ```
 
 For `db_cli.py`, global `--db` goes before the subcommand. Its subcommands are
-`init`, `migrate`, `import-legacy`, `doctor`, `status`, `export`, `prune`, and
+`init`, `migrate`, `import-runs`, `doctor`, `status`, `export`, `prune`, and
 `resume`. `run_benchmark.sh` is the older init/run/score wrapper. The generated
 `menu.sh` picker calls `./chaos run` and accepts its run flags; use `./chaos
 attach` and `./chaos status` separately for monitoring.
@@ -640,7 +640,7 @@ whether they were resumed, interactive, or in an excluded end-reason group.
 
 **Expects.** Finished runs with truth labels and score rows.
 
-**Does.** Reports diagnosis, verify, approval, `strict_loop_success`, legacy
+**Does.** Reports diagnosis, verify, approval, `strict_loop_success`, historical
 `loop_success`, policy violations, forbidden actions, steps, and tokens. It
 excludes provider errors and unverified faults unless explicitly included.
 
@@ -658,17 +658,16 @@ only.
 **What it means.** Low-level authoritative DB maintenance.
 
 **Expects.** Global `--db` before the subcommand. Subcommands are `init`,
-`migrate`, `import-legacy`, `doctor`, `status`, `export`, `prune`, and `resume`.
+`migrate`, `import-runs`, `doctor`, `status`, `export`, `prune`, and `resume`.
 
-**Does.** Initializes schema, validates/migrates state, imports explicit
-legacy data, exports derived files, prunes old runs, and resumes eligible
-runs.
+**Does.** Initializes schema, validates/migrates state, imports explicit run
+data, exports derived files, prunes old runs, and resumes eligible runs.
 
 **Evidence produced / scoring effect.** Directly changes authoritative state;
 this is not a derived report.
 
 **Failure modes and recovery.** Run `doctor --strict` after any migration or
-manual repair. `import-legacy` is explicit and does not import
+manual repair. `import-runs` is explicit and does not import
 `.snapshots.jsonl` or `.ui.jsonl` artifacts.
 </details>
 
@@ -901,13 +900,13 @@ than `restart_member`.
 <details>
 <summary><b><code>full_cluster_reset</code> / <code>snapshot_restore_full</code></b></summary>
 
-**What it means.** Full cluster reset used as a last-resort repair. The legacy
-name `snapshot_restore_full` is retained for compatibility.
+**What it means.** Full cluster reset used as a last-resort repair. The alternate
+name `snapshot_restore_full` is accepted.
 
 **Expects.** Only the gate receipt; no snapshot argument.
 
 **Does.** Runs `cluster/reset_cluster.sh` with a 1800-second timeout. No etcd
-snapshot is read or restored despite the legacy name.
+snapshot is read or restored despite the alternate name.
 
 **Evidence produced / scoring effect.** Acceptable only for
 `etcd-quorum-loss`; explicitly forbidden in the other fault scenarios and in
@@ -981,7 +980,7 @@ custom `CHAOS_LLM_ENDPOINTS` names are preserved; `runs.backend`/`runs.model`
 keep the selected chain identity and are not rewritten to the responder after a
 fallback. The answering backend is preserved in `llm_requests.backend`, messages,
 `llm_response_full`, and `assistant` events (§7). Export writes derived files;
-`import-legacy` is explicit migration and does not import `.snapshots.jsonl` or
+`import-runs` is explicit migration and does not import `.snapshots.jsonl` or
 `.ui.jsonl`.
 
 ## 13. State lifecycle
@@ -1036,7 +1035,7 @@ Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `strict_loop_success`,
 usage payloads, and live token accounting was verified in the five-run pilot.
 
 A run is headline-eligible iff `status='finished'`, `resume_count=0`,
-`interactive=0`, `end_reason` is not `legacy_exploratory` or a provider-error or
+`interactive=0`, `end_reason` is not `imported_exploratory` or a provider-error or
 unsupported end reason, `truth` is present, and `fault_present=true`. Fallback
 runs are included; a provider error means every configured candidate failed, not
 that an earlier candidate failed before a later one answered. Because current
@@ -1049,7 +1048,7 @@ analysis.
 `strict_loop_success=1` additionally requires `diagnosis_correct=true` on the
 first attempt, `approval_granted=true`, `verify_ok=true`, an acceptable repair
 (or no repair for `no_fault`), no forbidden repair, no policy violations, no
-provider failure, and no budget or step cutoff. `loop_success` is the legacy
+provider failure, and no budget or step cutoff. `loop_success` is the historical
 metric: correct diagnosis, verify pass, and repair presence matching fault
 status. **It does not require a first-attempt diagnosis, an acceptable repair,
 approval, cleanliness, or absence of forbidden actions.**
@@ -1063,7 +1062,7 @@ python3 score.py --db results.sqlite3 --format md --include-interactive
 <details>
 <summary><b>Historical results (reduced sweep and five-run pilot)</b></summary>
 
-#### Historical evidence (reduced sweep, legacy metric)
+#### Historical evidence (reduced sweep, earlier metric)
 
 The full cross-backend sweep is pending. The archived 2026-11-21 reduced sweep
 preceded fault-present gates and strict scoring. It is retained only as
@@ -1192,7 +1191,7 @@ discovered topology.
 
 **Does.** Polls health within the verification timeout and stores the output.
 
-**Scoring effect.** Required for both legacy `loop_success` and strict
+**Scoring effect.** Required for both historical `loop_success` and strict
 success. A healthy cluster after a timeout can still fail strict scoring for
 budget/policy reasons.
 </details>
@@ -1205,7 +1204,7 @@ budget/policy reasons.
 **Expects.** Values such as `submitted`, `budget_steps`, `budget_tokens`,
 `agent_stopped`, `injection_failed`, `fault_not_observed`, `reset_failed`,
 `baseline_failed`, `operator_abort`, `provider_error_*`,
-`skipped_unsupported`, or imported `legacy_exploratory`.
+`skipped_unsupported`, or imported `imported_exploratory`.
 
 **Does.** Distinguishes ordinary completion from budget exhaustion, setup
 failure, and provider failure.

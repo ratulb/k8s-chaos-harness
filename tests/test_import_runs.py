@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Legacy JSONL import tests.
+"""JSONL run import tests.
 
-The old harness wrote append-only files. These tests prove that import is
-idempotent, skips malformed/pre-gate records for headline scoring, and never
-mutates the source files.
+These tests prove that import is idempotent, skips malformed/pre-gate records for
+headline scoring, and never mutates the source files.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from storage.sqlite_store import SQLiteStore
-from tools.naming import LEGACY_BACKEND_TOKENS
+from tools.naming import BACKEND_ALIAS_TOKENS
 
 
 def record(run_id: str, *, pre_gate: bool = False, backend: str = "groq") -> dict:
@@ -41,7 +40,7 @@ def record(run_id: str, *, pre_gate: bool = False, backend: str = "groq") -> dic
     return rec
 
 
-class TestLegacyImport(unittest.TestCase):
+class TestRunImport(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
@@ -55,8 +54,8 @@ class TestLegacyImport(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_import_dedupes_and_excludes_exploratory_records(self) -> None:
-        good = record("legacy-good")
-        exploratory = record("legacy-old", pre_gate=True)
+        good = record("import-good")
+        exploratory = record("import-old", pre_gate=True)
         self.runs_path.write_text(
             "\n".join([
                 json.dumps(good),
@@ -66,40 +65,40 @@ class TestLegacyImport(unittest.TestCase):
             ]) + "\n",
             encoding="utf-8",
         )
-        (self.trace_dir / "legacy-good.jsonl").write_text(
+        (self.trace_dir / "import-good.jsonl").write_text(
             json.dumps({"type": "assistant", "ts": 100.0, "message": {"role": "assistant"}}) + "\n",
             encoding="utf-8",
         )
         source_before = self.runs_path.read_text(encoding="utf-8")
 
-        result = self.store.import_legacy(self.runs_path, self.trace_dir)
+        result = self.store.import_runs(self.runs_path, self.trace_dir)
         self.assertEqual(result["imported"], 2)
         self.assertEqual(result["skipped"], 2)
         self.assertEqual(result["trace_events"], 1)
         self.assertEqual(self.runs_path.read_text(encoding="utf-8"), source_before)
 
         scored = self.store.load_records()
-        self.assertEqual([r["run_id"] for r in scored], ["legacy-good"])
+        self.assertEqual([r["run_id"] for r in scored], ["import-good"])
         with self.store._connect() as conn:
-            old = conn.execute("SELECT status, end_reason FROM runs WHERE run_id='legacy-old'").fetchone()
+            old = conn.execute("SELECT status, end_reason FROM runs WHERE run_id='import-old'").fetchone()
         self.assertEqual(old["status"], "aborted")
-        self.assertEqual(old["end_reason"], "legacy_exploratory")
+        self.assertEqual(old["end_reason"], "imported_exploratory")
 
         # A second import is a no-op because run_id is the idempotency key.
-        second = self.store.import_legacy(self.runs_path, self.trace_dir)
+        second = self.store.import_runs(self.runs_path, self.trace_dir)
         self.assertEqual(second["imported"], 0)
         self.assertEqual(second["skipped"], 4)
 
-    def test_legacy_backend_normalizes_to_ollama(self) -> None:
-        legacy = record("legacy-external", backend=LEGACY_BACKEND_TOKENS[0])
-        self.runs_path.write_text(json.dumps(legacy) + "\n", encoding="utf-8")
+    def test_backend_alias_normalizes_to_ollama(self) -> None:
+        aliased = record("import-external", backend=BACKEND_ALIAS_TOKENS[0])
+        self.runs_path.write_text(json.dumps(aliased) + "\n", encoding="utf-8")
         source_before = self.runs_path.read_text(encoding="utf-8")
 
-        self.store.import_legacy(self.runs_path, self.trace_dir)
+        self.store.import_runs(self.runs_path, self.trace_dir)
 
         with self.store._connect() as conn:
             row = conn.execute(
-                "SELECT backend FROM runs WHERE run_id='legacy-external'"
+                "SELECT backend FROM runs WHERE run_id='import-external'"
             ).fetchone()
         self.assertEqual(row["backend"], "ollama")
         self.assertEqual(self.runs_path.read_text(encoding="utf-8"), source_before)
@@ -108,13 +107,13 @@ class TestLegacyImport(unittest.TestCase):
         self.assertEqual(exported[0]["backend"], "ollama")
 
     def test_export_regenerates_jsonl_from_database(self) -> None:
-        self.runs_path.write_text(json.dumps(record("legacy-good")) + "\n", encoding="utf-8")
-        self.store.import_legacy(self.runs_path, self.trace_dir)
+        self.runs_path.write_text(json.dumps(record("import-good")) + "\n", encoding="utf-8")
+        self.store.import_runs(self.runs_path, self.trace_dir)
         export_path = self.root / "exported.jsonl"
         stats = self.store.export_all(export_path, self.trace_dir)
         self.assertEqual(stats["runs"], 1)
         exported = [json.loads(line) for line in export_path.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(exported[0]["run_id"], "legacy-good")
+        self.assertEqual(exported[0]["run_id"], "import-good")
 
 
 if __name__ == "__main__":

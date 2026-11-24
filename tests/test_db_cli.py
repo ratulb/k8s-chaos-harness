@@ -92,7 +92,7 @@ class TestDbCli(unittest.TestCase):
         self.assertTrue(wrapper.exists())
         result = subprocess.run(["bash", "-n", str(wrapper)], capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertNotIn("import-legacy", wrapper.read_text(encoding="utf-8"))
+        self.assertNotIn("import-runs", wrapper.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
