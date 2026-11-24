@@ -9,13 +9,12 @@ etcd failures in a live Kubernetes cluster.
 > context or an explicit cluster ID and the active topology hash are allow-listed
 > (§15).
 
-This README is the main guide: motivation, architecture, data model, operator
-workflow, and troubleshooting. `DESIGN.md` is the canonical decision record,
-`PHASES.md` is current status, and `docs/ARCHITECTURE.md` is a focused
-supplement.
+This README is the full operator guide. `docs/ARCHITECTURE.md` is the maintained
+description of the current system, and `docs/STATE_MACHINE.md` is the generated
+state-machine reference.
 
-> **Authority.** If anything conflicts, current code plus `DESIGN.md` win;
-> `PHASES.md` is status.
+> **Authority.** Code is executable truth. If a document disagrees with the
+> implementation, fix the document. Secondary reference material is collapsible.
 
 Contents:
 
@@ -121,8 +120,9 @@ Legend: the operator, `./chaos`, and `run_benchmark.py` are orchestration;
 cluster scripts, the LLM backend, tool registry/gates, SQLite, and reports are
 external systems or outputs.
 
-A reverse-engineered architecture, workflow trace, and design-gap inventory is
-in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The maintained system overview is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+The generated transition reference is in
+[docs/STATE_MACHINE.md](docs/STATE_MACHINE.md).
 
 SQLite is both the coordination layer and the history. The runner writes
 
@@ -222,9 +222,8 @@ cluster is penalized.
 
 `etcd-disk-full` is excluded from live benchmark sweeps: filling an etcd data
 filesystem can leave the member unrecoverable and require host-level cleanup.
-The exclusion is an operator decision recorded in `PHASES.md` ("Skipped or
-deferred live work") and in `docs/STATE_MACHINE_DESIGN.md` §12.7; scenario
-validation still accepts the fault.
+The exclusion is an operator decision recorded in
+`docs/ARCHITECTURE.md` §9; scenario validation still accepts the fault.
 
 | Scenario | Acceptable repairs | Forbidden repairs |
 | --- | --- | --- |
@@ -390,11 +389,15 @@ Implemented `./chaos` commands:
 ./chaos scenario list|show|validate|menu ...
 ./chaos run --scenario <id> --backend <name|auto> [--discard-stale] [options]
 ./chaos attach <run_id> [--after-seq N] [--follow] [--interval S] [--json]
-./chaos abort <run_id|all> [--yes] [--no-kill]
+./chaos abort <run_id|all> [--yes] [--no-kill] [--abandon]
 ./chaos state discard [--yes]
 ./chaos cluster nuke [--yes]
 ./chaos replay [--output replay.html] [--include-interactive]
 ```
+
+Every `./chaos` invocation first runs the reaper. Expired leases with no live
+owner become `INTERRUPTED` once per observation key. `./chaos abort <run_id>
+--abandon` is the explicit operator exit from `INTERRUPTED`.
 
 `./chaos run` options:
 
@@ -409,8 +412,8 @@ Implemented `./chaos` commands:
 
 The `repair` mode changes capability and reporting context, but the current
 runner still resets, verifies baseline, and injects. It is best-effort, not a
-no-injection incident workflow. The design's
-`recovered|partial|unverified|cannot_proceed` statuses are not implemented.
+no-injection incident workflow. The `recovered|partial|unverified|cannot_proceed`
+statuses are not implemented.
 
 `./chaos` is the intended entry point; the `python3 ...` commands below are the
 underlying tools it wraps.
@@ -463,9 +466,11 @@ fails, fix `.env`/`CHAOS_LLM_ENDPOINTS` and retry; see §7 for chain semantics.
 **Expects.** An initialized DB. Topology changes only produce a warning.
 
 **Does.** Lists recent runs with identity, status, phase, fault/verify fields,
-and end reason. It takes no lease and starts no runner.
+end reason, and the reaper result. The status query itself takes no lease and
+starts no runner; CLI startup may first record expired leases.
 
-**Evidence produced / scoring effect.** None. It never writes run data.
+**Evidence produced / scoring effect.** The query is read-only. Startup reaping
+may append `run.lease_expired` for runs whose leases expired with no live owner.
 
 **Failure modes and recovery.** If the DB is unreadable, run `python3 db_cli.py
 doctor --strict`; if topology changed, inspect `./chaos target show` before
@@ -553,14 +558,18 @@ no longer exists.
 </details>
 
 <details>
-<summary><b><code>./chaos abort &lt;run_id|all&gt; [--yes] [--no-kill]</code></b></summary>
+<summary><b><code>./chaos abort &lt;run_id|all&gt; [--yes] [--no-kill] [--abandon]</code></b></summary>
 
-**What it means.** Operator stop for a running benchmark.
+**What it means.** Operator stop for a running benchmark, or explicit abandon of
+an interrupted run.
 
-**Expects.** A live run ID, or `all`.
+**Expects.** A live run ID, or `all` for normal abort. `--abandon` requires a
+single run ID.
 
-**Does.** Sends `SIGTERM` unless `--no-kill`, records `operator_abort`, and
-finishes the run as `aborted`.
+**Does.** Normal abort sends `SIGTERM` unless `--no-kill`, records
+`operator_abort`, and finishes the run as `aborted`. `--abandon` writes
+`run.abandon` and finishes the interrupted run as `aborted` with end reason
+`abandoned`.
 
 **Evidence produced / scoring effect.** Abort event and end reason; the run is
 not a headline success.
@@ -708,6 +717,7 @@ cluster health before `./chaos run`.
 
 ```text
 pending -> running -> finished
+             |-> interrupted -> resume triage or --abandon
              |-> aborted
              |-> skipped_unsupported
 ```
@@ -715,8 +725,10 @@ pending -> running -> finished
 > **Reset failure is an infrastructure failure, not an agent failure.** These
 > runs abort before injection, so they say nothing about diagnosis or repair.
 
-`interrupted` is recognized for resume candidates but is not written by the
-current runner; crashed runs usually remain `running` until abort or discard.
+A crashed run does not record its own crash. The CLI startup reaper observes an
+expired lease with no live owner and writes `run.lease_expired` once per
+observation key, parking the run in `interrupted` with `previous_state`. Use
+`./chaos abort <run_id> --abandon` to exit that state explicitly.
 
 ## 11. Agent tools and gates
 
@@ -1005,7 +1017,7 @@ end reason, stream/tool/event tails, and topology summary.
 ./chaos run --scenario etcd-member-down --backend ollama --detach --ui plain
 ./chaos attach <run_id>
 ./chaos attach <run_id> --follow
-./chaos abort <run_id|all> [--yes] [--no-kill]
+./chaos abort <run_id|all> [--yes] [--no-kill] [--abandon]
 ./chaos replay --output replay.html
 ```
 
@@ -1048,7 +1060,10 @@ python3 score.py --db results.sqlite3 --format json
 python3 score.py --db results.sqlite3 --format md --include-interactive
 ```
 
-### Historical evidence (reduced sweep, legacy metric)
+<details>
+<summary><b>Historical results (reduced sweep and five-run pilot)</b></summary>
+
+#### Historical evidence (reduced sweep, legacy metric)
 
 The full cross-backend sweep is pending. The archived 2026-11-21 reduced sweep
 preceded fault-present gates and strict scoring. It is retained only as
@@ -1076,10 +1091,10 @@ historical context; its `loop_success` values are **not comparable** to the
 | `openrouter` | `etcd-wrong-peer-url` | 0% | 100% | 0% | 0% |
 
 Coverage is uneven: `ollama` ran four scenarios and the other backends ran
-three. Treat this as smoke evidence, not a backend ranking. See `PHASES.md` for
-sweep history.
+three. Treat this as smoke evidence, not a backend ranking. Historical sweep
+details remain in git history.
 
-### Results (five-run pilot)
+#### Results (five-run pilot)
 
 This pilot ran after fault-present gates, strict scoring, live calibration, and
 the health-verification fix. It used an isolated DB and is a diagnostic sample,
@@ -1116,6 +1131,8 @@ valuable if the agent reports the limitation clearly, avoids unsafe guesses, and
 escalates to the operator. The current numeric metrics do not yet grade
 escalation quality; inspect `./chaos replay` and the stored traces for that.
 Building external remediation workflows is deliberately out of scope.
+
+</details>
 
 ### Scoring field reference
 
@@ -1249,8 +1266,8 @@ The full guard contract is:
 ```bash
 export CHAOS_CLUSTER_ID=lab
 export CHAOS_ALLOWED_CLUSTER_IDS=lab
-export CHAOS_ALLOWED_TOPOLOGY_HASHES=238169dc38781e8235c409c124863bf20d871c3aae4b7dc7f924a39739ff1d9b
 export CHAOS_ALLOWED_CLUSTER_CONTEXTS=kubernetes-admin@kubernetes
+export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(./chaos target show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["topology"]["topology_hash"])')"
 ```
 
 `CHAOS_ALLOWED_CLUSTER_CONTEXTS` must match the current `kubectl config
@@ -1298,11 +1315,16 @@ CHAOS_LIVE_BACKEND_TESTS=1 python3 -m unittest tests.test_backends -v
 
 `CHAOS_LIVE_BACKEND_TESTS=1` requires a reachable backend and will spend tokens.
 
-`python3 db_cli.py doctor --strict` checks schema version, finished runs missing
-final records, in-flight tool calls, and `runs.seq` versus maximum
-`trace_events.seq`. It does not check cluster health, artifact checksums, missing
-trace files, or UI stream completeness. `db_cli.py status` uses the writer
-connection; `./chaos status` uses read-only counts and stale topology warnings.
+`python3 db_cli.py doctor --strict` checks schema version, final records, score
+rows, terminal reasons, expired leases with live owners, in-flight tools, unknown
+mutating effects, stale sequence markers, stale caches, missing canonical events,
+rejections, duplicate generated keys, interrupted metadata, and cache/fold drift.
+It does not check cluster health, artifact checksums, missing trace files, or UI
+stream completeness. `db_cli.py status` uses the writer connection; `./chaos
+status` uses read-only counts and stale topology warnings.
+
+<details>
+<summary><b>Troubleshooting table</b></summary>
 
 | Symptom | Meaning |
 | --- | --- |
@@ -1316,59 +1338,48 @@ connection; `./chaos status` uses read-only counts and stale topology warnings.
 | `verify_ok=false` | Final health check failed; inspect tool calls |
 | stale topology warning | Read-only DB belongs to another topology identity |
 
+</details>
+
 Read-only helpers swallow missing/corrupt DB errors, so empty output can mean an
 unreadable DB.
 
 ## 17. Current status and limitations
 
-Live status as of 2026-11-21. The README review baseline was `1952bb2`;
-`docs/ARCHITECTURE.md` was last fully audited at `5df4539`. Both may lag current
-code, and current code wins.
+<details>
+<summary><b>Current implementation snapshot</b></summary>
 
 - live topology discovery and `chaos cluster nuke` acceptance passed
-- the three lab control planes returned Ready after rebuild
-- live backend smoke passed
-- a reduced 13-run cross-backend sweep completed
-- the cluster and local DB were rebuilt clean afterwards
+- all five injected fault-present observers were calibrated live
 - prompt approval is validated offline only
-- non-destructive live smoke passed after calibration
-- all five fault-present observers were calibrated live and passed
-- a five-run cross-backend pilot completed in an isolated DB
-- the full fresh cross-backend sweep remains pending
-- `--seed` is metadata, not sampling control
-- `--ui plain` and `--ui live` use the same renderer
-- streamed token usage was verified in live pilots
 - `./chaos doctor|score|export` and `--reference-only` are not implemented
-- repair-mode semantics do not yet match the design's incident-mode statuses
-- UI/replay redact secrets; gate receipts are redacted from messages, traces,
-  artifacts, and state snapshots, while the approval event keeps the value needed
-  for rebuild
+- repair-mode semantics do not yet match the incident-mode statuses
+- UI/replay redact secrets; gate receipts are derived from folded state and
+  stripped from persisted caches
 - topology-mismatch archive does not clear the node IP cache; CLI discard/nuke do
 - `--no-jsonl` disables export, but topology-mismatch discard still truncates the
   default `runs.jsonl`
+- the full fresh cross-backend sweep and refreshed artifacts remain pending
 
-These are user-visible limitations only. Open work is tracked in `PHASES.md`
-(status/roadmap) and `docs/ARCHITECTURE.md` §5/§7 (known engineering gaps and
-refactor order). P0 status follows `docs/ARCHITECTURE.md` §5: P0.1 final-verify
-env, P0.2 fixture fault-check env, P0.3 gate-receipt rebuild, P0.4 lease renewal,
-P0.5 event/artifact redaction, and P0.7 prompt-mode receipt are fixed; P0.6 shell
-interpolation and P0.8 unknown mutating tool calls are partial. The remaining
-highest-priority work is the incremental `Scenario`/`ExperimentSpec` and
-`RunStore` refactor.
+The maintained status and roadmap live in `docs/ARCHITECTURE.md` §12. Historical
+results remain in git history and derived artifacts, not in this guide.
+
+</details>
 
 ## 18. Documentation map
+
+<details>
+<summary><b>Maintained documents</b></summary>
 
 Start here: README → §8 Quickstart → §10 One run, end to end.
 
 | Document | Role |
 | --- | --- |
-| `README.md` | Main guide: motivation, concepts, architecture, operation, troubleshooting |
-| `DESIGN.md` | Canonical decisions and locked constraints |
-| `PHASES.md` | Status, acceptance history, remaining work |
-| `docs/ARCHITECTURE.md` | Reverse-engineered current architecture, workflow trace, P0/P1/P2 gap inventory, candidate target design and code layout (§6, commit-pinned) |
+| `README.md` | Full operator guide: concepts, commands, configuration, safety, troubleshooting |
+| `docs/ARCHITECTURE.md` | Maintained description of the current system and roadmap |
+| `docs/STATE_MACHINE.md` | Generated state-machine reference; edit the generator or machine tables |
 | `scripts/README.md` | Helper-script details |
-| `docs/STATE_MACHINE_DESIGN.md` | Proposed state-machine design; not yet implemented |
 
-Historical reviewer documents under `docs/archive/` were retired at commit
-`5df4539` after their useful details were salvaged. When documents conflict,
-current code plus `DESIGN.md` and `PHASES.md` win.
+Older design, phase, and state-machine documents were retired after their useful
+content was assimilated. Git history preserves the originals.
+
+</details>
