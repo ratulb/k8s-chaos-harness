@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Score aggregation tests for SQLite and JSONL inputs.
-
-Headline rates must exclude resumed runs because they contain an intervention.
-The DB path and legacy path should otherwise agree on ordinary finished runs.
-"""
+"""Score aggregation tests for authoritative SQLite runs."""
 from __future__ import annotations
 
 import json
@@ -17,6 +13,9 @@ from pathlib import Path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import score
+from harness.gate_runtime import GateRuntime
+from harness.run_runtime import RunRuntime
+from harness.tool_runtime import ToolLedger
 from storage.sqlite_store import SQLiteStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -63,11 +62,45 @@ class TestScoreDb(unittest.TestCase):
             resume_count=resume_count,
             interactive=interactive,
         )
-        self.store.finish_run(run_id, finished_record(run_id, True))
+        log = lambda event: self.store.add_event(run_id, event["type"], event)
+        run = RunRuntime(run_id, log=log)
+        run.create()
+        run.lease()
+        run.begin_reset()
+        run.reset_ok()
+        run.baseline_ok()
+        run.inject_ok()
+        run.fault_observed()
+        gate = GateRuntime(run_id, log=log)
+        gate.submit_diagnosis(
+            label="etcd_member_unreachable",
+            correct=True,
+            approved=True,
+            attempts=1,
+            first_attempt_correct=True,
+            source="policy",
+        )
+        gate.propose_repair(
+            "restart_member",
+            {"node": "node-b"},
+            {"acceptable_repairs": ["restart_member"], "forbidden_repairs": []},
+        )
+        tool = ToolLedger(run_id, log=log)
+        tool_call = tool.for_call("call-1", "restart_member", True, False)
+        tool_call.start()
+        tool_call.success()
+        gate.finish_repair(status="success")
+        run.agent_done(gate_terminal="repaired", gate_reason="verify_ok")
+        run.verified()
+        self.store.add_event(run_id, "assistant", {"tokens": 100})
+        self.store.finish_run(
+            run_id,
+            finished_record(run_id, True),
+            status=run.state.status,
+            end_reason=run.end_reason,
+        )
 
     def test_load_records_default_excludes_resumed_runs(self) -> None:
-        # One clean run and one resumed run: only the clean run belongs in the
-        # headline table. --include-resumed is an explicit opt-in.
         self._seed("clean", 0)
         self._seed("resumed", 1)
         default = self.store.load_records()
@@ -75,6 +108,8 @@ class TestScoreDb(unittest.TestCase):
         self.assertEqual([r["run_id"] for r in default], ["clean"])
         self.assertEqual(len(included), 2)
         self.assertEqual(score.summarize(default)["runs"], 1)
+        self.assertEqual(default[0]["scorer_version"], "gate-path-v1")
+        self.assertTrue(default[0]["strict_loop_success"])
 
     def test_score_cli_db_matches_expected_counts(self) -> None:
         self._seed("clean", 0)
@@ -84,6 +119,7 @@ class TestScoreDb(unittest.TestCase):
         payload = json.loads(result.stdout)
         self.assertEqual(payload["overall"]["runs"], 1)
         self.assertEqual(payload["overall"]["diagnosis"], 1.0)
+        self.assertEqual(payload["overall"]["strict_loop_success"], 1.0)
 
         with_resumed = subprocess.run(cmd + ["--include-resumed"], capture_output=True, text=True, check=True)
         payload = json.loads(with_resumed.stdout)
@@ -102,25 +138,18 @@ class TestScoreDb(unittest.TestCase):
         result = subprocess.run(cmd + ["--include-interactive"], capture_output=True, text=True, check=True)
         self.assertEqual(json.loads(result.stdout)["overall"]["runs"], 2)
 
-    def test_legacy_loader_filters_interactive_and_unsupported(self) -> None:
-        runs_path = Path(self.tmp.name) / "runs.jsonl"
-        lines = [
-            finished_record("plain", True),
-            dict(finished_record("interactive", True), interactive=True),
-            dict(finished_record("unsupported", True), status="skipped_unsupported", end_reason="unsupported_topology"),
-        ]
-        runs_path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
-        default = score.load(str(runs_path))
-        included = score.load(str(runs_path), include_interactive=True)
-        self.assertEqual([r["run_id"] for r in default], ["plain"])
-        self.assertEqual([r["run_id"] for r in included], ["plain", "interactive"])
-
-    def test_legacy_loader_also_filters_resume_count(self) -> None:
-        runs_path = Path(self.tmp.name) / "runs.jsonl"
-        lines = [finished_record("plain", True), dict(finished_record("retry", True), resume_count=1)]
-        runs_path.write_text("".join(json.dumps(line) + "\n" for line in lines), encoding="utf-8")
-        self.assertEqual(len(score.load(str(runs_path))), 1)
-        self.assertEqual(len(score.load(str(runs_path), include_resumed=True)), 2)
+    def test_db_excludes_provider_errors_by_default(self) -> None:
+        self._seed("clean", 0)
+        self.store.create_run(
+            "provider",
+            scenario_id="etcd-member-down",
+            backend="fake",
+            truth="etcd_member_unreachable",
+        )
+        self.store.finish_run("provider", finished_record("provider", True), status="aborted", end_reason="provider_error_429")
+        self.assertEqual([r["run_id"] for r in self.store.load_records()], ["clean"])
+        included = self.store.load_records(include_provider_errors=True)
+        self.assertIn("provider", [r["run_id"] for r in included])
 
 
 if __name__ == "__main__":

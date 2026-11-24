@@ -292,7 +292,7 @@ or destructive validation.
       humans, not authority
 - [x] Append-only SQLite event log is authoritative; `state_json` and snapshots
       are rebuildable projections/caches
-- [ ] One canonical scorer reads folded state and `GatePath`
+- [x] One canonical scorer reads folded state and `GatePath`
 - [ ] Reaper, `--abandon`, and doctor checks covered by focused and full suites
 - Deliverable: behavior owned by the three state machines with deterministic
   replay

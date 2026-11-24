@@ -21,6 +21,8 @@ import run_benchmark
 import score
 from common.errors import LLMError, classify_llm_error
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
+from harness.gate_runtime import GateRuntime
+from harness.run_runtime import RunRuntime
 from llm.client import Backend, LLMClient
 from storage import sqlite_store
 from tools import schemas
@@ -42,13 +44,46 @@ def make_record(run_id: str, **overrides: object) -> dict:
         "repair": "restart_member",
         "repair_acceptable": True,
         "repair_forbidden": False,
-        "policy_violations": [],
         "fault_present": True,
-        "end_reason": "submitted",
+        "end_reason": "verify_ok",
         "steps": 5,
         "tokens_used": 100,
     }
     record.update(overrides)
+    truth = str(record["truth"])
+    repair = record.get("repair")
+    violations: list[str] = []
+    if record.get("repair_forbidden"):
+        violations.append(f"{repair or 'repair'}: forbidden repair for this scenario")
+    if record.get("repair_acceptable") is False:
+        violations.append(f"{repair or 'repair'}: repair not acceptable for this scenario")
+    terminal = "no_fault_cleared" if truth == "no_fault" else "repaired"
+    visited = ["await_diagnosis", "no_fault_cleared"] if truth == "no_fault" else ["await_diagnosis", "approved", "repaired"]
+    record.update({
+        "gate_path": {
+            "visited": visited,
+            "terminal": terminal,
+            "terminal_reason": None,
+            "diagnosis_submitted": True,
+            "first_attempt_correct": bool(record.get("diagnosis_first_attempt_correct", True)),
+            "receipt_issued": bool(record.get("approval_granted")),
+            "repair_proposed": bool(repair) or bool(record.get("repair_forbidden")),
+            "repair_executed": bool(repair) and not bool(record.get("repair_forbidden")),
+            "repair_status": "success" if repair else None,
+            "violations": violations,
+        },
+        "run": {
+            "state": {
+                "status": "finished",
+                "phase": "finished",
+                "end_reason": record["end_reason"],
+                "fault_present": bool(record["fault_present"]),
+                "verify_ok": bool(record["verify_ok"]),
+            },
+        },
+        "tool_states": {},
+        "diagnosis_attempts": record.get("diagnosis_attempts", 1),
+    })
     return record
 
 
@@ -89,22 +124,6 @@ class TestHardening(unittest.TestCase):
         self.assertFalse(score.strict_success(records[1]))
         self.assertFalse(score.strict_success(records[2]))
         self.assertFalse(score.strict_success(records[3]))
-
-    def test_legacy_loader_filters_provider_errors(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "runs.jsonl"
-            path.write_text(
-                "".join(json.dumps(item) + "\n" for item in [
-                    make_record("good"),
-                    make_record("provider", end_reason="provider_error_413"),
-                ]),
-                encoding="utf-8",
-            )
-            self.assertEqual([r["run_id"] for r in score.load(str(path))], ["good"])
-            self.assertEqual(
-                [r["run_id"] for r in score.load(str(path), include_provider_errors=True)],
-                ["good", "provider"],
-            )
 
     def test_db_loader_filters_provider_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,6 +230,26 @@ class TestHardening(unittest.TestCase):
                 backend="fake",
                 truth="no_fault",
             )
+            log = lambda event: store.add_event("control", event["type"], event)
+            run = RunRuntime("control", log=log)
+            run.create()
+            run.lease()
+            run.begin_reset()
+            run.reset_ok()
+            run.baseline_ok()
+            run.inject_ok()
+            run.fault_observed()
+            gate = GateRuntime("control", log=log)
+            gate.submit_diagnosis(
+                label="no_fault",
+                correct=True,
+                approved=True,
+                attempts=1,
+                first_attempt_correct=True,
+                is_no_fault=True,
+            )
+            run.agent_done(gate_terminal="no_fault_cleared", gate_reason="verify_ok")
+            run.verified()
             record = make_record(
                 "control",
                 scenario="control-healthy-noisy",
@@ -222,8 +261,8 @@ class TestHardening(unittest.TestCase):
             store.finish_run(
                 "control",
                 record,
-                status="finished",
-                score={"scorer_version": "test-v1", "repair_acceptable": True},
+                status=run.state.status,
+                end_reason=run.end_reason,
             )
             loaded = store.load_records()
             self.assertEqual(len(loaded), 1)

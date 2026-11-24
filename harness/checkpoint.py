@@ -65,6 +65,8 @@ class Checkpoint:
         )
         snapshot["run"] = self.run.to_snapshot()
         snapshot["tools"] = self.tools.to_snapshot()
+        assert self.state.gate is not None
+        snapshot["gate_path"] = self.state.gate.path().to_dict()
         self.store.set_state(self.run_id, snapshot)
         if self.run.renew_lease:
             self.store.renew_lease(self.run_id)

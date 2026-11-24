@@ -31,6 +31,51 @@ class RepairResultFacts:
     detail: str | None = None
 
 
+@dataclass(frozen=True)
+class GatePath:
+    visited: tuple[str, ...]
+    terminal: str
+    terminal_reason: str | None
+    diagnosis_submitted: bool
+    first_attempt_correct: bool
+    receipt_issued: bool
+    repair_proposed: bool
+    repair_executed: bool
+    repair_status: str | None
+    violations: tuple[str, ...]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "visited": list(self.visited),
+            "terminal": self.terminal,
+            "terminal_reason": self.terminal_reason,
+            "diagnosis_submitted": self.diagnosis_submitted,
+            "first_attempt_correct": self.first_attempt_correct,
+            "receipt_issued": self.receipt_issued,
+            "repair_proposed": self.repair_proposed,
+            "repair_executed": self.repair_executed,
+            "repair_status": self.repair_status,
+            "violations": list(self.violations),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> "GatePath | None":
+        if not isinstance(value, Mapping):
+            return None
+        return cls(
+            visited=tuple(str(item) for item in value.get("visited") or ()),
+            terminal=str(value.get("terminal") or GatePhase.AWAIT_DIAGNOSIS.value),
+            terminal_reason=value.get("terminal_reason"),
+            diagnosis_submitted=bool(value.get("diagnosis_submitted")),
+            first_attempt_correct=bool(value.get("first_attempt_correct")),
+            receipt_issued=bool(value.get("receipt_issued")),
+            repair_proposed=bool(value.get("repair_proposed")),
+            repair_executed=bool(value.get("repair_executed")),
+            repair_status=value.get("repair_status"),
+            violations=tuple(str(item) for item in value.get("violations") or ()),
+        )
+
+
 def _scenario_value(scenario: Any, name: str, default: Any) -> Any:
     if isinstance(scenario, Mapping):
         return scenario.get(name, default)
@@ -207,6 +252,32 @@ class GateRuntime:
             if "forbidden" in detail.lower():
                 return detail
         return None
+
+    def path(self) -> GatePath:
+        repair_status = self.state.repair_status
+        repair_executed = self.state.phase is GatePhase.REPAIRED
+        for event in reversed(self.events):
+            if event.type is GateEvent.REPAIR_FINISHED:
+                repair_executed = repair_executed or str(event.payload.get("status")) == "success"
+                if repair_status is None:
+                    repair_status = str(event.payload.get("status"))
+                break
+        return GatePath(
+            visited=tuple(phase.value for phase in self.state.visited),
+            terminal=self.state.phase.value,
+            terminal_reason=self.state.end_reason,
+            diagnosis_submitted=any(
+                event.type is GateEvent.DIAGNOSIS_SUBMITTED for event in self.events
+            ),
+            first_attempt_correct=self.state.first_attempt_correct,
+            receipt_issued=self.state.receipt_issued,
+            repair_proposed=self.state.repair_proposed or any(
+                event.type is GateEvent.REPAIR_PROPOSED for event in self.events
+            ),
+            repair_executed=repair_executed,
+            repair_status=repair_status,
+            violations=tuple(self.policy_violations),
+        )
 
     def emission(self) -> tuple[MachineEvent[GateEvent], ...]:
         return tuple(self.events)

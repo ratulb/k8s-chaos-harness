@@ -21,7 +21,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator
 
-from common.scoring import SCORER_VERSION
+from common.scoring import SCORER_VERSION, Score
 from common.vocab import DESTRUCTIVE_TOOLS, DIAGNOSIS_TOOL, REPAIR_TOOLS
 from harness.gate_runtime import GateRuntime
 from harness.message import Message
@@ -96,14 +96,6 @@ SCORE_COLUMNS = {
     "diagnosis_attempts": "INTEGER",
     "diagnosis_first_attempt_correct": "INTEGER",
     "strict_loop_success": "INTEGER",
-}
-
-SCORE_BOOL_FIELDS = {
-    "diagnosis_first_attempt_correct",
-    "repair_acceptable",
-    "repair_forbidden",
-    "strict_loop_success",
-    "loop_success",
 }
 
 RUN_JSON_COLUMNS = {"repair_args_json", "policy_violations_json", "state_json"}
@@ -1315,6 +1307,7 @@ class SQLiteStore:
         gs = gate.state
         state: dict[str, Any] = {
             "gate": gate.to_snapshot(),
+            "gate_path": gate.path().to_dict(),
             "run": run.to_snapshot(),
             "tools": tools.to_snapshot(),
             "tool_states": tools.projections(),
@@ -1446,10 +1439,27 @@ class SQLiteStore:
         record["backend"] = normalize_backend(record.get("backend"))
         return record
 
-    @staticmethod
-    def _score_rank(score: dict[str, Any]) -> tuple[int, float]:
-        preferred = 1 if score.get("scorer_version") == SCORER_VERSION else 0
-        return preferred, float(score.get("created_at") or 0)
+    def score_for_run(
+        self,
+        run_id: str,
+        record: dict[str, Any] | None = None,
+        score: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if score is None:
+            state = self.rebuild_state(run_id)
+            enriched = dict(record or self.record_from_row(self.get_run(run_id)))
+            enriched.update({
+                "gate_path": state.get("gate_path"),
+                "run": state.get("run"),
+                "tool_states": state.get("tool_states"),
+                "diagnosis": state.get("diagnosis"),
+                "diagnosis_correct": state.get("diagnosis_correct"),
+                "diagnosis_attempts": state.get("diagnosis_attempts"),
+            })
+            score = Score.from_record(enriched).to_dict()
+        score = dict(score)
+        score["scorer_version"] = SCORER_VERSION
+        return score
 
     def finish_run(
         self,
@@ -1477,10 +1487,15 @@ class SQLiteStore:
         self.update_run(run_id, **fields)
         if state is not None:
             self.set_state(run_id, state)
+        folded = state or self.rebuild_state(run_id)
+        gate_path = folded.get("gate_path")
+        if gate_path:
+            self.add_artifact(run_id, "gate_path", self._dumps(gate_path), "application/json")
+        score = self.score_for_run(run_id, record, score)
         if score is not None:
             payload = {
                 "run_id": run_id,
-                "scorer_version": score.get("scorer_version", "legacy-record-v1"),
+                "scorer_version": score.get("scorer_version", SCORER_VERSION),
                 "diagnosis": score.get("diagnosis"),
                 "diagnosis_correct": score.get("diagnosis_correct"),
                 "diagnosis_attempts": score.get("diagnosis_attempts"),
@@ -1530,7 +1545,10 @@ class SQLiteStore:
         include_provider_errors: bool = False,
         include_unverified_faults: bool = False,
     ) -> list[dict[str, Any]]:
-        clauses = ["status='finished'"]
+        clauses = [
+            "(status='finished' OR (status='aborted' AND end_reason LIKE 'provider_error%'))"
+            if include_provider_errors else "status='finished'"
+        ]
         if not include_resumed:
             clauses.append("resume_count=0")
         if not include_aborted:
@@ -1545,33 +1563,23 @@ class SQLiteStore:
         sql += " ORDER BY COALESCE(started_at, 0), run_id"
         with self._connect() as conn:
             rows = conn.execute(sql).fetchall()
-            run_ids = [row["run_id"] for row in rows]
-            score_rows: list[sqlite3.Row] = []
-            if run_ids:
-                placeholders = ",".join("?" for _ in run_ids)
-                score_rows = conn.execute(
-                    f"SELECT * FROM scores WHERE run_id IN ({placeholders})", run_ids
-                ).fetchall()
-        score_by_run: dict[str, dict[str, Any]] = {}
-        for row in score_rows:
-            score = dict(row)
-            run_id = str(score["run_id"])
-            current = score_by_run.get(run_id)
-            if current is None or self._score_rank(score) > self._score_rank(current):
-                score_by_run[run_id] = score
         records: list[dict[str, Any]] = []
         for row in rows:
             if row["truth"] is None:
                 continue
             record = self.record_from_row(dict(row))
-            score = score_by_run.get(str(row["run_id"]), {})
-            score_keys = (
-                "diagnosis_attempts", "diagnosis_first_attempt_correct", "repair_acceptable",
-                "repair_forbidden", "strict_loop_success", "loop_success", "scorer_version",
-            )
-            for key in score_keys:
-                if key in score and score[key] is not None:
-                    record[key] = bool(score[key]) if key in SCORE_BOOL_FIELDS else score[key]
+            run_id = str(row["run_id"])
+            state = self.rebuild_state(run_id)
+            record.update({
+                "gate_path": state.get("gate_path"),
+                "run": state.get("run"),
+                "tool_states": state.get("tool_states"),
+                "diagnosis": state.get("diagnosis"),
+                "diagnosis_correct": state.get("diagnosis_correct"),
+                "diagnosis_attempts": state.get("diagnosis_attempts"),
+            })
+            score = self.score_for_run(run_id, record)
+            record.update(score)
             records.append(record)
         return records
 

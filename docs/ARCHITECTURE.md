@@ -182,9 +182,11 @@ per observation key. `--abandon` is the explicit operator exit from
 ## 6. Scoring
 
 One canonical scorer, `gate-path-v1`, reads folded `GatePath`, `RunState`, and
-`ToolState` values. `strict_loop_success` is the only headline metric. Funnel
-counts are views over the same path. Resumed, interactive, provider-error,
-unsupported, and unverified-fault runs follow the canonical exclusion rules.
+`ToolState` values. `GatePath` is derived from gate events and stored as a
+`gate_path` artifact; score rows are projections recomputed from the fold.
+`strict_loop_success` is the only headline metric. Funnel counts are views over
+the same path. Resumed, interactive, provider-error, unsupported, and
+unverified-fault runs follow the canonical exclusion rules.
 
 Fallback-enabled headline rates are grouped by `chain_id`. Per-backend baselines
 use `CHAOS_LLM_FALLBACK=0`.

@@ -70,16 +70,35 @@ class ReviewHardeningTests(unittest.TestCase):
             "diagnosis": "etcd_quorum_loss",
             "diagnosis_correct": True,
             "diagnosis_attempts": 1,
-            "diagnosis_first_attempt_correct": True,
             "approval_granted": True,
             "verify_ok": True,
             "repair": "snapshot_restore_full",
-            "repair_forbidden": False,
-            "policy_violations": [],
             "fault_present": True,
-            "end_reason": "submitted",
+            "end_reason": "verify_ok",
         }
         record.update(overrides)
+        record["gate_path"] = {
+            "visited": ["await_diagnosis", "approved", "repaired"],
+            "terminal": "repaired",
+            "terminal_reason": None,
+            "diagnosis_submitted": True,
+            "first_attempt_correct": bool(record.get("diagnosis_first_attempt_correct", True)),
+            "receipt_issued": bool(record["approval_granted"]),
+            "repair_proposed": True,
+            "repair_executed": True,
+            "repair_status": "success",
+            "violations": [],
+        }
+        record["run"] = {
+            "state": {
+                "status": "finished",
+                "phase": "finished",
+                "end_reason": record["end_reason"],
+                "fault_present": bool(record["fault_present"]),
+                "verify_ok": bool(record["verify_ok"]),
+            },
+        }
+        record["tool_states"] = {}
         return record
 
     def test_score_canonicalizes_alias_and_uses_current_version(self) -> None:
@@ -215,23 +234,23 @@ class ReviewHardeningTests(unittest.TestCase):
             self.assertEqual(state["diagnosis_attempts"], 2)
             store.close()
 
-    def test_load_records_preserves_integer_diagnosis_attempts(self) -> None:
+    def test_load_records_folds_integer_diagnosis_attempts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "results.sqlite3")
             store.create_run("attempts", scenario_id="s", backend="b", truth="etcd_member_unreachable")
+            for attempts in (1, 2):
+                store.add_event("attempts", "gate.diagnosis_submitted", gate_diagnosis_event(
+                    label="no_fault",
+                    correct=False,
+                    approved=False,
+                    attempts=attempts,
+                    first_attempt_correct=False,
+                    raw="no fault",
+                ))
             record = self._score_record(repair="restart_member")
-            store.finish_run(
-                "attempts",
-                record,
-                status="finished",
-                score={
-                    "scorer_version": SCORER_VERSION,
-                    "diagnosis_attempts": 3,
-                    "diagnosis_first_attempt_correct": False,
-                },
-            )
+            store.finish_run("attempts", record, status="finished")
             loaded = store.load_records()[0]
-            self.assertEqual(loaded["diagnosis_attempts"], 3)
+            self.assertEqual(loaded["diagnosis_attempts"], 2)
             self.assertFalse(loaded["diagnosis_first_attempt_correct"])
             store.close()
 

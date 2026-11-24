@@ -259,7 +259,14 @@ class AgentLoop:
         }
         journal.event({"type": "record", "record": record})
         final_state = checkpointer.capture()
-        score = Score.from_record(record, set(scenario.acceptable_repairs)).to_dict()
+        assert state.gate is not None
+        score_record = dict(record)
+        score_record.update({
+            "gate_path": state.gate.path().to_dict(),
+            "run": run.to_snapshot(),
+            "tool_states": tool_ledger.projections(),
+        })
+        score = Score.from_record(score_record, set(scenario.acceptable_repairs)).to_dict()
         store.finish_run(
             ctx.run_id, record, status=run.state.status,
             end_reason=end_reason, state=final_state, score=score,

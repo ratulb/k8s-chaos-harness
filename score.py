@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate authoritative SQLite runs, or legacy JSONL, into comparison tables."""
+"""Aggregate authoritative SQLite runs into comparison tables."""
 from __future__ import annotations
 
 import argparse
@@ -7,45 +7,10 @@ import json
 import os
 import sys
 from collections import defaultdict
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from common.scoring import ACCEPTABLE_BY_TRUTH, SCORER_VERSION, Score, is_excluded
+from common.scoring import SCORER_VERSION, Score
 from storage.sqlite_store import SQLiteStore
-
-
-def load(
-    path: str,
-    include_resumed: bool = False,
-    include_interactive: bool = False,
-    include_provider_errors: bool = False,
-    include_unverified_faults: bool = False,
-) -> list[dict]:
-    p = Path(path)
-    if not p.exists():
-        return []
-    out = []
-    for line in p.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            rec = json.loads(line)
-        except Exception:
-            continue
-        if "approval_granted" not in rec:
-            continue
-        if not include_resumed and rec.get("resume_count", 0):
-            continue
-        if not include_interactive and rec.get("interactive"):
-            continue
-        if rec.get("status") == "skipped_unsupported" or "unsupported" in str(rec.get("end_reason", "")):
-            continue
-        if not include_provider_errors and is_excluded(rec, require_fault=False):
-            continue
-        if not include_unverified_faults and rec.get("fault_present") is not True:
-            continue
-        out.append(rec)
-    return out
 
 
 def acceptable_repair(rec: dict) -> bool:
@@ -64,7 +29,7 @@ def summarize(recs: list[dict]) -> dict:
         "diagnosis": round(sum(s.diagnosis_correct for s in scores) / n, 3),
         "first_attempt_diagnosis": round(sum(s.diagnosis_first_attempt_correct for s in scores) / n, 3),
         "verify": round(sum(s.recovered for s in scores) / n, 3),
-        "approval": round(sum(bool(r.get("approval_granted")) for r in recs) / n, 3),
+        "approval": round(sum(s.receipt_issued for s in scores) / n, 3),
         "strict_loop_success": round(sum(s.strict_loop_success for s in scores) / n, 3),
         "loop_success": round(sum(s.loop_success for s in scores) / n, 3),
         "policy_violations": round(sum(bool(s.policy_violations) for s in scores) / n, 3),
@@ -79,8 +44,7 @@ def summarize(recs: list[dict]) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--runs", default="runs.jsonl")
-    ap.add_argument("--db", default=None)
+    ap.add_argument("--db", default="results.sqlite3")
     ap.add_argument("--format", choices=["json", "md"], default="md")
     ap.add_argument("--include-resumed", action="store_true")
     ap.add_argument("--include-interactive", action="store_true")
@@ -88,17 +52,8 @@ def main() -> None:
     ap.add_argument("--include-unverified-faults", action="store_true")
     args = ap.parse_args()
 
-    if args.db:
-        with SQLiteStore(args.db) as store:
-            recs = store.load_records(
-                include_resumed=args.include_resumed,
-                include_interactive=args.include_interactive,
-                include_provider_errors=args.include_provider_errors,
-                include_unverified_faults=args.include_unverified_faults,
-            )
-    else:
-        recs = load(
-            args.runs,
+    with SQLiteStore(args.db) as store:
+        recs = store.load_records(
             include_resumed=args.include_resumed,
             include_interactive=args.include_interactive,
             include_provider_errors=args.include_provider_errors,
