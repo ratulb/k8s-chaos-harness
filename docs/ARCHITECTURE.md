@@ -38,9 +38,10 @@ summaries, and UI streams are derived outputs.
 
 Explicit non-goals include generic Kubernetes autopilot behavior, full Kubernetes
 API fault emulation, model-visible fault injection, model-visible scoring truth,
-and production remediation. Repair mode is best effort: it records attempted,
-succeeded, failed, and unverifiable outcomes and never claims recovery without
-verification.
+and production remediation. Repair mode is best effort: it changes prompt and
+reporting context but still resets, verifies baseline, and injects. The
+`recovered|partial|unverified|cannot_proceed` incident statuses are not
+implemented.
 
 ## 2. System at a glance
 
@@ -249,24 +250,26 @@ pin one endpoint with `CHAOS_LLM_FALLBACK=0`. Temperature is fixed at `0.2`;
 
 A live reachable cluster is the source of truth. `setup.conf` is a rebuild recipe
 and fallback host list, never an override for live discovery. `CHAOS_TOPOLOGY_JSON`
-is for tests and offline inspection; normal runs refuse fixture topology unless
-the explicit test-only opt-in is set.
+is for tests and offline inspection; `./chaos run` refuses fixture topology unless
+`CHAOS_ALLOW_FIXTURE_RUNS=1` is set.
 
 The topology hash includes sorted control-plane names/IPs, etcd member identity,
 member count, and probe node. It excludes health, Ready state, transient faults,
 and scores, so recovery alone does not create a new epoch. Quorum is
 `floor(N / 2) + 1`; selectors resolve against the frozen topology.
 
-`tools/safety.py` enforces context, cluster, and topology allow-lists before
-destructive actions. A normal run with a changed topology archives the old epoch
-and exits; `--discard-stale` is required for intentional deletion. Resume refuses
-a topology change. `./chaos status`, attach, and target show are read-only and
-warn instead of deleting.
+`tools/safety.py` requires either the current kubectl context or the configured
+cluster ID to be allow-listed before destructive actions. It checks the topology
+hash only when `CHAOS_ALLOWED_TOPOLOGY_HASHES` is set. A normal run with a changed
+topology archives the old epoch and exits; `--discard-stale` is required for
+intentional archival and deletion. Resume refuses a topology change. `./chaos
+status`, attach, and target show are read-only and warn instead of deleting.
 
 Messages, events, artifacts, exports, UI chunks, and state caches are redacted at
 write time. Gate receipts are derived and stripped from persisted caches. Never
-put secrets in traces or commits. `etcd-disk-full` remains excluded from live
-sweeps because filling an etcd data filesystem can require host-level recovery.
+put secrets in traces or commits. `etcd-disk-full` is excluded by operator
+convention from live sweeps because filling an etcd data filesystem can require
+host-level recovery; validation and `menu.sh` still include the scenario.
 
 ## 10. Operator surface
 

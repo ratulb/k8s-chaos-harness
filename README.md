@@ -5,9 +5,9 @@ etcd failures in a live Kubernetes cluster.
 
 > **Destructive benchmark.** `./chaos run`, fault scripts, reset scripts, state
 > discard, and cluster nuke can break or erase a cluster. Use a disposable lab
-> cluster only. Live benchmark runs are default-deny until the current kubectl
-> context or an explicit cluster ID and the active topology hash are allow-listed
-> (§15).
+> cluster only. Live benchmark runs are default-deny until either the current
+> kubectl context or an explicit cluster ID is allow-listed; a topology hash is
+> checked only when an allow-list is configured (§15).
 
 This README is the full operator guide. `docs/ARCHITECTURE.md` is the maintained
 description of the current system, and `docs/STATE_MACHINE.md` is the generated
@@ -220,19 +220,19 @@ rules, budgets, scripts, and menu metadata.
 `control-healthy-noisy` is the false-positive control: repairing a healthy
 cluster is penalized.
 
-`etcd-disk-full` is excluded from live benchmark sweeps: filling an etcd data
-filesystem can leave the member unrecoverable and require host-level cleanup.
-The exclusion is an operator decision recorded in
-`docs/ARCHITECTURE.md` §9; scenario validation still accepts the fault.
+`etcd-disk-full` is excluded by operator convention from live benchmark sweeps:
+filling an etcd data filesystem can leave the member unrecoverable and require
+host-level cleanup. The exclusion is not enforced by validation or the generated
+menu; scenario validation and `menu.sh` still include the fault.
 
 | Scenario | Acceptable repairs | Forbidden repairs |
 | --- | --- | --- |
 | `control-healthy-noisy` | none | all repair tools |
-| `etcd-disk-full` | `restart_member`, `member_remove_readd` | `snapshot_restore_full` |
-| `etcd-member-down` | `restart_member` | `snapshot_restore_full` |
-| `etcd-member-wiped` | `member_remove_readd` | `snapshot_restore_full` |
+| `etcd-disk-full` | `restart_member`, `member_remove_readd` | `full_cluster_reset` |
+| `etcd-member-down` | `restart_member` | `full_cluster_reset` |
+| `etcd-member-wiped` | `member_remove_readd` | `full_cluster_reset` |
 | `etcd-quorum-loss` | `restart_member`, `full_cluster_reset` | none |
-| `etcd-wrong-peer-url` | `restart_member`, `member_remove_readd` | `snapshot_restore_full` |
+| `etcd-wrong-peer-url` | `restart_member`, `member_remove_readd` | `full_cluster_reset` |
 
 Repair aliases are display-only: `kube_etcd_switch_rebuild` canonicalizes to
 `member_remove_readd`, `reset_cluster` canonicalizes to `full_cluster_reset`, and
@@ -299,9 +299,10 @@ commands can wait.
 | `CHAOS_TOPOLOGY_JSON` | Offline topology fixture |
 | `CHAOS_LOCAL_NODE` | Local-node override for host avoidance |
 
-Temperature is fixed at `0.2`; `--seed` is recorded metadata, not model
-sampling control. Run from the repository root because `.env` and some default
-paths are working-directory sensitive; `./chaos run` uses the root for children.
+Benchmark agent turns use temperature `0.2`; `./chaos ping` uses `0`. `--seed` is
+recorded metadata, not model sampling control. Run from the repository root
+because `.env` and some default paths are working-directory sensitive; `./chaos
+run` uses the root for children.
 
 Extra endpoints are configured as a JSON list. Use `api_key_env` rather than
 putting keys in `.env` text:
@@ -383,17 +384,21 @@ python3 score.py --db results.sqlite3 --format md
 Implemented `./chaos` commands:
 
 ```text
+./chaos [--db PATH] [--runs-file PATH] [--trace-dir DIR] <command> ...
 ./chaos ping ["message"] [--backend auto|ollama|groq|openrouter|cloudflare|<custom-name>]
 ./chaos status [--limit N] [--json]
 ./chaos target show [--json] [--mode benchmark|repair]
 ./chaos scenario list|show|validate|menu ...
-./chaos run --scenario <id> --backend <name|auto> [--discard-stale] [options]
+./chaos run --scenario <id> --backend <name|auto> [--runs N] [--seed N] [--batch-id ID] [options]
 ./chaos attach <run_id> [--after-seq N] [--follow] [--interval S] [--json]
 ./chaos abort <run_id|all> [--yes] [--no-kill] [--abandon]
 ./chaos state discard [--yes]
 ./chaos cluster nuke [--yes]
 ./chaos replay [--output replay.html] [--include-interactive]
 ```
+
+Global `--db`, `--runs-file`, and `--trace-dir` go before the subcommand. `ping`
+uses `CHAOS_PING_BACKEND` when `--backend` is omitted; `run` requires `--backend`.
 
 Every `./chaos` invocation first runs the reaper. Expired leases with no live
 owner become `INTERRUPTED` once per observation key. `./chaos abort <run_id>
@@ -404,11 +409,11 @@ owner become `INTERRUPTED` once per observation key. `./chaos abort <run_id>
 | Option | Meaning |
 | --- | --- |
 | `--scenario`, `--backend` | Required scenario ID; backend accepts `auto`, public names, or `CHAOS_LLM_ENDPOINTS` custom names |
-| `--mode`, `--approve` | `benchmark` (default) or `repair` (best-effort incident context; see caveat below) |
-| `--runs`, `--seed` | Batch size and recorded seed |
+| `--mode`, `--approve` | `benchmark` (default) or `repair` (best-effort incident context; see caveat below); approval may be `policy` or `prompt` |
+| `--runs`, `--seed`, `--batch-id` | Batch size, recorded seed, and explicit batch ID |
 | `--ui`, `--detach`, `--logs-dir` | Rendering and detached launch/logging |
 | `--resume-of`, `--force-resume`, `--no-jsonl` | Resume and export controls |
-| `--discard-stale` | Intentional deletion of a stale topology epoch; default is archive and exit |
+| `--discard-stale` | Intentional archival and deletion of a stale topology epoch; default is archive and exit |
 
 The `repair` mode changes capability and reporting context, but the current
 runner still resets, verifies baseline, and injects. It is best-effort, not a
@@ -446,7 +451,7 @@ Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 cluster.
 
 **Expects.** One configured backend or `CHAOS_LLM_ENDPOINTS` chain. `auto` is the
-default for `ping`.
+default for `ping` unless `CHAOS_PING_BACKEND` is set.
 
 **Does.** Resolves the backend chain, checks health, sends the prompt, and
 prints the reply.
@@ -586,11 +591,11 @@ health and restore manually if a repair was in flight.
 
 **Expects.** Explicit confirmation.
 
-**Does.** Deletes the active DB/WAL/SHM and all traces, truncates
-`runs.jsonl`, and leaves `logs/` intact. There is no archive.
+**Does.** Archives the active epoch under `archive/`, deletes the active
+DB/WAL/SHM and traces, truncates `runs.jsonl`, and leaves `logs/` intact.
 
-**Evidence produced / scoring effect.** Removes all run evidence; nothing can
-be scored or replayed afterward.
+**Evidence produced / scoring effect.** Removes run evidence from the active
+epoch; the archive copy is not scored or replayed by default.
 
 **Failure modes and recovery.** None after confirmation. Use only when the
 evidence is deliberately disposable.
@@ -623,14 +628,16 @@ already aborted. Restore the cluster manually and re-run preflight.
 **Expects.** A readable SQLite DB.
 
 **Does.** Groups the matrix by scenario, backend, topology class, and seed;
-detail sections include all runs. By default the matrix excludes resumed and
-interactive runs.
+detail sections include every stored run. The matrix excludes resumed and
+interactive runs by default, but includes provider-error and unverified-fault
+runs so excluded groups stay inspectable.
 
 **Evidence produced / scoring effect.** Writes derived HTML only; it never
 changes DB truth or scores.
 
-**Failure modes and recovery.** If the replay is missing recent runs, check
-whether they were resumed, interactive, or in an excluded end-reason group.
+**Failure modes and recovery.** If a run is missing from the matrix, check
+whether it was resumed or interactive. If it is missing from the detail sections,
+check whether the DB is readable.
 </details>
 
 <details>
@@ -700,9 +707,11 @@ cluster health before `./chaos run`.
 7. **Reset** with `cluster/restore_clean_state.sh`, timeout 900 seconds.
 8. **Baseline verify** with `cluster/verify_etcd_healthy.sh`; failure means
    `aborted` with `reset_failed` or `baseline_failed` (see §16).
-9. **Inject** the fault with a 120-second timeout. An injection-command failure
-   aborts as `injection_failed`; a failed fault-present check aborts as
-   `fault_not_observed`. Both are excluded from headline and strict scoring.
+9. **Inject** the fault with the scenario command timeout (`timeout_seconds`,
+   currently 300 seconds with a 120-second floor). An injection-command failure
+   aborts as `injection_failed`; a failed fault-present check uses the scenario
+   `fault_present_timeout_seconds` and aborts as `fault_not_observed`. Both are
+   excluded from headline and strict scoring.
 10. **Agent loop**: the model calls named diagnostic tools and, after a correct
     diagnosis and policy approval, gated repair tools; model-visible output is
     truncated.
@@ -848,7 +857,7 @@ observation before the last attempt; do not repair without a gate receipt.
 
 **What it means.** Least-invasive member recovery.
 
-**Expects.** A node name and the gate receipt when available.
+**Expects.** A node name only; the harness derives the gate receipt from folded state.
 
 **Does.** Restores a clean etcd manifest, deletes the static pod if needed, and
 waits up to `CHAOS_REPAIR_READY_TIMEOUT` seconds (default 180) for readiness.
@@ -866,7 +875,7 @@ with escalation guidance. It does not count as a healthy verification.
 
 **What it means.** Rebuild one member's etcd membership and data directory.
 
-**Expects.** A node name and the gate receipt when available.
+**Expects.** A node name only; the harness derives the gate receipt from folded state.
 
 **Does.** Removes the member via a healthy peer, re-adds it, wipes its data
 directory, restores/updates its manifest, deletes the pod, and waits for
@@ -903,7 +912,7 @@ than `restart_member`.
 **What it means.** Full cluster reset used as a last-resort repair. The alternate
 name `snapshot_restore_full` is accepted.
 
-**Expects.** Only the gate receipt; no snapshot argument.
+**Expects.** No arguments and no snapshot argument; authorization comes from folded state.
 
 **Does.** Runs `cluster/reset_cluster.sh` with a 1800-second timeout. No etcd
 snapshot is read or restored despite the alternate name.
@@ -987,10 +996,10 @@ fallback. The answering backend is preserved in `llm_requests.backend`, messages
 
 | Action | If topology changed | Result |
 | --- | --- | --- |
-| normal `./chaos run` | yes | Archives stale state under `archive/<timestamp>/`, then exits unless `--discard-stale` is passed |
+| normal `./chaos run` | yes | Archives stale state under `archive/`, then exits unless `--discard-stale` is passed |
 | `./chaos run --resume-of <id>` | yes | Refuses; never discards |
 | `./chaos status`, `attach` | yes | Read-only warning |
-| `./chaos state discard --yes` | n/a | Deletes active epoch, DB/WAL/SHM, and all `traces/*.jsonl`; truncates `runs.jsonl`; `logs/` survives; no archive |
+| `./chaos state discard --yes` | n/a | Archives the active epoch under `archive/`, then deletes DB/WAL/SHM and `traces/*.jsonl`; truncates `runs.jsonl`; `logs/` survives |
 | `./chaos cluster nuke --yes` | n/a | Rebuilds, rediscovers, then discards on success |
 
 `--force-resume` bypasses config-hash mismatch only, not topology mismatch.
@@ -1001,9 +1010,10 @@ A retry named `<old-run-id>-retryN` is created when the old run is in an unsafe
 setup phase, config hash differs without force, or a mutating tool call has an
 unknown outcome. Retries link through `resume_of` and increment `resume_count`.
 
-`discard_state()` refuses live PIDs, aborts non-live active rows, deletes DB/WAL/
-SHM, truncates `runs.jsonl`, deletes `traces/*.jsonl`, optionally clears IP
-cache, and reinitializes schema v4. `logs/` survives.
+`discard_state()` refuses live PIDs, aborts non-live active rows, archives the
+active epoch, deletes DB/WAL/SHM, truncates `runs.jsonl`, deletes
+`traces/*.jsonl`, optionally clears IP cache, and reinitializes schema v4.
+`logs/` survives.
 
 ## 14. Observability and reporting
 
@@ -1026,13 +1036,16 @@ cursors independently. `abort` sends `SIGTERM` unless `--no-kill`, records
 `operator_abort`, and finishes as `aborted`.
 
 Replay's matrix groups by scenario, backend, topology class, and seed. It
-excludes resumed and interactive runs by default; detail sections include all
-runs. Text is escaped and redacted before rendering.
+excludes resumed and interactive runs by default but includes provider-error and
+unverified-fault runs; detail sections include all stored runs. Text is escaped
+and redacted before rendering.
 
-Score metrics: `runs`, `diagnosis`, `verify`, `approval`, `strict_loop_success`,
-`loop_success`, `policy_violations` (fraction of runs with any blocked call),
-`forbidden`, `avg_steps`, `avg_tokens`. Streamed responses request provider
-usage payloads, and live token accounting was verified in the five-run pilot.
+Score metrics: `runs`, `diagnosis`, `first_attempt_diagnosis`, `verify`,
+`approval`, `strict_loop_success`, `loop_success`, `policy_violations` (fraction
+of runs with any blocked call), `forbidden`, `budget_exhausted`,
+`avg_diagnosis_attempts`, `avg_steps`, `avg_tokens`, and `scorer_version`
+(`gate-path-v1`). Streamed responses request provider usage payloads, and live
+token accounting was verified in the five-run pilot.
 
 A run is headline-eligible iff `status='finished'`, `resume_count=0`,
 `interactive=0`, `end_reason` is not `imported_exploratory` or a provider-error or
@@ -1046,9 +1059,10 @@ and `--include-unverified-faults` opt into excluded groups for historical
 analysis.
 
 `strict_loop_success=1` additionally requires `diagnosis_correct=true` on the
-first attempt, `approval_granted=true`, `verify_ok=true`, an acceptable repair
-(or no repair for `no_fault`), no forbidden repair, no policy violations, no
-provider failure, and no budget or step cutoff. `loop_success` is the historical
+first attempt, `approval_granted=true`, `verify_ok=true`, `end_reason=verify_ok`,
+an acceptable repair (or no repair for `no_fault`), no forbidden repair, no
+policy violations, no provider failure, and no budget or step cutoff.
+`loop_success` is the historical
 metric: correct diagnosis, verify pass, and repair presence matching fault
 status. **It does not require a first-attempt diagnosis, an acceptable repair,
 approval, cleanliness, or absence of forbidden actions.**
@@ -1201,10 +1215,12 @@ budget/policy reasons.
 
 **What it means.** Why the run loop ended.
 
-**Expects.** Values such as `submitted`, `budget_steps`, `budget_tokens`,
-`agent_stopped`, `injection_failed`, `fault_not_observed`, `reset_failed`,
-`baseline_failed`, `operator_abort`, `provider_error_*`,
-`skipped_unsupported`, or imported `imported_exploratory`.
+**Expects.** Values include `submitted`, `diagnosis_attempts_exhausted`,
+`budget_steps`, `budget_tokens`, `agent_stopped`, `injection_failed`,
+`fault_not_observed`, `reset_failed`, `baseline_failed`, `verify_ok`,
+`verify_failed`, `operator_abort`, `state_discard`, `abandoned`,
+`provider_error_*`, `unsupported`, `skipped_unsupported`, and imported
+`imported_exploratory`.
 
 **Does.** Distinguishes ordinary completion from budget exhaustion, setup
 failure, and provider failure.
@@ -1269,17 +1285,18 @@ export CHAOS_ALLOWED_CLUSTER_CONTEXTS=kubernetes-admin@kubernetes
 export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(./chaos target show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["topology"]["topology_hash"])')"
 ```
 
-`CHAOS_ALLOWED_CLUSTER_CONTEXTS` must match the current `kubectl config
-current-context`; `CHAOS_CLUSTER_ID` plus `CHAOS_ALLOWED_CLUSTER_IDS` is the
-alternative identity anchor. `CHAOS_ALLOWED_TOPOLOGY_HASHES` may be pinned to the
-hash printed by `./chaos target show --json`. The guard also applies to
-`CHAOS_TOPOLOGY_JSON` fixtures passed to `./chaos run`; fixtures are test-only
-and must never be used against a live cluster.
+Either `CHAOS_ALLOWED_CLUSTER_CONTEXTS` must include the current `kubectl config
+current-context`, or `CHAOS_ALLOWED_CLUSTER_IDS` must include `CHAOS_CLUSTER_ID`
+(which defaults to that context). `CHAOS_ALLOWED_TOPOLOGY_HASHES` is optional;
+when set, the active hash must match the value printed by `./chaos target show
+--json`. The guard also applies to `CHAOS_TOPOLOGY_JSON` fixtures, and `./chaos
+run` rejects fixture topology unless `CHAOS_ALLOW_FIXTURE_RUNS=1`. Fixtures are
+for offline tests only and must never be used against a live cluster.
 
 A topology hash change does not silently erase evidence. The runner archives the
-active epoch under `archive/<timestamp>/` and exits with an explanatory message.
-Pass `--discard-stale` only when a fresh epoch is intentional. Resume always
-refuses a topology change.
+active epoch under `archive/` and exits with an explanatory message. Pass
+`--discard-stale` only when a fresh epoch is intentional. Resume always refuses a
+topology change.
 
 Every fault injection is followed by a bounded fault-present check before the
 agent starts. An injection-command failure aborts as `injection_failed`; an

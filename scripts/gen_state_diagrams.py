@@ -67,7 +67,7 @@ FOOTER = [
     "",
     "`db_cli.py doctor --strict` checks terminal reasons, score-row invariants, expired leases, illegal transitions, unknown mutating outcomes, duplicate generated keys, interrupted metadata, cache/fold drift, and missing canonical events.",
     "",
-    "Replay and live views show folded machine states with compact transition descriptions. Destructive guard allow-lists, topology-mismatch refusal, `etcd-disk-full` exclusion, fixture opt-in, and write-time redaction remain operational boundaries outside the machines.",
+    "Replay and live views show folded machine states with compact transition descriptions. Destructive guard allow-lists, topology-mismatch refusal, the operator convention to exclude `etcd-disk-full` from live sweeps, fixture opt-in, and write-time redaction remain operational boundaries outside the machines.",
 ]
 
 
@@ -160,7 +160,7 @@ def build_document() -> str:
         "",
         "The pure reducer maps state plus event to a new state and declarative effects. Runtimes emit canonical events with deterministic idempotency keys; replay and folding deduplicate by `seq`/key. Illegal transitions become `state_transition_rejected` events, and duplicate generated keys are reported by doctor.",
         "",
-        "Diagram nodes and the first table column are machine-state names. The second table column is the persisted value used in SQLite. Gate states use wire values such as `no_fault_cleared`; run states appear as `status:phase`; tool phases collapse to persisted statuses, so the machine-state column is needed to distinguish them.",
+        "Diagram nodes are persisted values. The state table distinguishes machine states in the first column from persisted values in the second column. Gate states use wire values such as `no_fault_cleared`; run states appear as `status:phase`; tool phases collapse to persisted statuses, so the machine-state column is needed to distinguish them.",
         "",
     ]
     for title, machine in MACHINES:
