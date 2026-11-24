@@ -26,7 +26,7 @@ from tools.tool import TOOL_REGISTRY, ToolContext
 from tools.truncate import truncate
 
 
-def _print_llm_message(direction: str, step: int, message: dict[str, Any]) -> None:
+def print_llm_message(direction: str, step: int, message: dict[str, Any]) -> None:
     payload = Message.redact_payload(message)
     print(
         f"[llm {direction} {step}] {json.dumps(payload, sort_keys=True, default=str)}",
@@ -162,7 +162,7 @@ class AgentLoop:
                 budget.start_step()
                 if spec.verbose:
                     for message in messages[printed_messages:]:
-                        _print_llm_message("request", budget.steps, message.to_dict())
+                        print_llm_message("request", budget.steps, message.to_dict())
                 outcome = LLMOutcome.invoke(
                     client,
                     [message.to_dict() for message in messages],
@@ -185,7 +185,7 @@ class AgentLoop:
                 budget.add_tokens(response.usage.total_tokens)
                 messages.append(msg)
                 if spec.verbose:
-                    _print_llm_message("response", budget.steps, msg.to_dict())
+                    print_llm_message("response", budget.steps, msg.to_dict())
                 printed_messages = len(messages)
                 checkpointer.capture()
 

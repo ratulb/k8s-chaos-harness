@@ -385,7 +385,7 @@ Implemented `./chaos` commands:
 
 ```text
 ./chaos [--db PATH] [--runs-file PATH] [--trace-dir DIR] <command> ...
-./chaos ping ["message"] [--backend auto|ollama|groq|openrouter|cloudflare|<custom-name>]
+./chaos ping ["message"] [--backend auto|ollama|groq|openrouter|cloudflare|<custom-name>] [--verbose]
 ./chaos status [--limit N] [--json]
 ./chaos target show [--json] [--mode benchmark|repair]
 ./chaos scenario list|show|validate|menu ...
@@ -446,7 +446,7 @@ Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
 ### CLI operation reference
 
 <details>
-<summary><b><code>./chaos ping ["message"] [--backend auto|&lt;name&gt;]</code></b></summary>
+<summary><b><code>./chaos ping ["message"] [--backend auto|&lt;name&gt;] [--verbose]</code></b></summary>
 
 **What it means.** A one-shot LLM smoke test; it needs an endpoint/key but no
 cluster.
@@ -455,7 +455,8 @@ cluster.
 default for `ping` unless `CHAOS_PING_BACKEND` is set.
 
 **Does.** Resolves the backend chain, checks health, sends the prompt, and
-prints the reply.
+prints the reply. `--verbose` also prints the redacted request and response
+messages.
 
 **Evidence produced / scoring effect.** Prints the backend/model that answered
 and any fallback path. It creates no run and affects no score.

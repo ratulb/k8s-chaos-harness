@@ -468,6 +468,35 @@ class TestHardening(unittest.TestCase):
         self.assertIn("pong", out.getvalue())
         self.assertIn("first call may load the model", err.getvalue())
         self.assertEqual(client.messages[-1], {"role": "user", "content": "hello brain"})
+        self.assertNotIn("[llm request", out.getvalue())
+        self.assertNotIn("[llm response", out.getvalue())
+
+    def test_ping_verbose_prints_conversation(self) -> None:
+        class PingClient:
+            def __init__(self, backend: object) -> None:
+                self.messages: list[dict] = []
+
+            def health(self) -> bool:
+                return True
+
+            def chat(self, messages: list[dict], **kwargs: object) -> dict:
+                self.messages = messages
+                return {
+                    "choices": [{"message": {"role": "assistant", "content": "pong"}}],
+                    "usage": {"total_tokens": 2},
+                }
+
+        client = PingClient(object())
+        out = io.StringIO()
+        with patch.object(chaos_cli, "LLMClient", lambda backend: client), redirect_stdout(out), redirect_stderr(io.StringIO()):
+            code = chaos_cli.main(["ping", "hello brain", "--backend", "ollama", "--verbose"])
+        self.assertEqual(code, 0)
+        output = out.getvalue()
+        self.assertIn("=== ping conversation ===", output)
+        self.assertIn("[llm request 1]", output)
+        self.assertIn("You are a concise assistant", output)
+        self.assertIn("[llm response 1]", output)
+        self.assertIn("pong", output)
 
     def test_ping_uses_bounded_single_attempt_and_shows_reasoning_fallback(self) -> None:
         class PingClient:

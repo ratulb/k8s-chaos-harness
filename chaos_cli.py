@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 from llm.client import LLMClient
 from llm.env import load_env
 from llm.registry import AUTO_BACKEND, backend_choices, resolve_backend
+from harness.loop import print_llm_message
 from harness.reaper import abandon_run, reap_expired
 from llm.response import LLMOutcome
 from replay import write_replay as write_replay_file
@@ -212,7 +213,7 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
-def _ping(backend_name: str, message: str | None) -> int:
+def _ping(backend_name: str, message: str | None, verbose: bool = False) -> int:
     try:
         backend = resolve_backend(backend_name)
     except ValueError as exc:
@@ -238,16 +239,21 @@ def _ping(backend_name: str, message: str | None) -> int:
         except EOFError:
             message = ""
     message = message or "Reply with exactly: pong"
+    messages = [
+        {"role": "system", "content": "You are a concise assistant. Reply directly to the user."},
+        {"role": "user", "content": message},
+    ]
+    if verbose:
+        print("=== ping conversation ===", flush=True)
+        for item in messages:
+            print_llm_message("request", 1, item)
     print(
         f"Waiting for {backend.name} / {backend.model}; the first call may load the model...",
         file=sys.stderr,
     )
     outcome = LLMOutcome.invoke(
         client,
-        [
-            {"role": "system", "content": "You are a concise assistant. Reply directly to the user."},
-            {"role": "user", "content": message},
-        ],
+        messages,
         temperature=0,
         max_tokens=256,
         timeout=180,
@@ -257,6 +263,8 @@ def _ping(backend_name: str, message: str | None) -> int:
         print(f"LLM ping failed: {outcome.result.error}", file=sys.stderr)
         return 1
     response = outcome.result.unwrap()
+    if verbose:
+        print_llm_message("response", 1, response.primary.to_dict())
     content = (response.primary.content or "").strip()
     if not content:
         choice = (response.raw.get("choices") or [{}])[0]
@@ -288,6 +296,7 @@ def main(argv: list[str] | None = None) -> int:
     ping = sub.add_parser("ping", help="Check the configured LLM brain with a one-shot prompt; no cluster needed")
     ping.add_argument("message", nargs="?", default=None)
     ping.add_argument("--backend", default=os.environ.get("CHAOS_PING_BACKEND", AUTO_BACKEND), choices=choices)
+    ping.add_argument("--verbose", action="store_true")
 
     state = sub.add_parser("state")
     state_sub = state.add_subparsers(dest="state_command", required=True)
@@ -368,7 +377,7 @@ def main(argv: list[str] | None = None) -> int:
         reaper_result = {"error": str(exc)}
 
     if args.command == "ping":
-        return _ping(args.backend, args.message)
+        return _ping(args.backend, args.message, args.verbose)
 
     if args.command == "run":
         launch_id = f"launch-{uuid.uuid4().hex[:8]}"
