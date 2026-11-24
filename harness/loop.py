@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, cast
@@ -23,6 +24,14 @@ from llm.response import LLMOutcome
 from tools import topology as topology_tools
 from tools.tool import TOOL_REGISTRY, ToolContext
 from tools.truncate import truncate
+
+
+def _print_llm_message(direction: str, step: int, message: dict[str, Any]) -> None:
+    payload = Message.redact_payload(message)
+    print(
+        f"[llm {direction} {step}] {json.dumps(payload, sort_keys=True, default=str)}",
+        flush=True,
+    )
 
 
 @dataclass(frozen=True)
@@ -96,6 +105,7 @@ class AgentLoop:
 
         budget = Budget.from_snapshot(snapshot, scenario)
         llm_error = False
+        printed_messages = 0
         end_reason = "submitted" if state.diagnosis_submitted else "agent_stopped"
 
         start_projection = run.projection()
@@ -143,11 +153,16 @@ class AgentLoop:
         if not ctx.resume:
             journal.artifact("setup_output_full", {"output": ctx.setup_output})
         checkpointer.capture()
+        if spec.verbose:
+            print(f"=== llm conversation {ctx.run_id} ===", flush=True)
 
         client = self.client_factory(spec.backend)
         with LeaseRenewer(lambda: store.renew_lease(ctx.run_id) if run.renew_lease else None):
             while not budget.exhausted and not run.terminal:
                 budget.start_step()
+                if spec.verbose:
+                    for message in messages[printed_messages:]:
+                        _print_llm_message("request", budget.steps, message.to_dict())
                 outcome = LLMOutcome.invoke(
                     client,
                     [message.to_dict() for message in messages],
@@ -169,6 +184,9 @@ class AgentLoop:
                 msg = response.primary
                 budget.add_tokens(response.usage.total_tokens)
                 messages.append(msg)
+                if spec.verbose:
+                    _print_llm_message("response", budget.steps, msg.to_dict())
+                printed_messages = len(messages)
                 checkpointer.capture()
 
                 tool_calls = msg.tool_calls
@@ -223,7 +241,8 @@ class AgentLoop:
         verify_projection.pop("end_reason", None)
         store.update_run(ctx.run_id, **verify_projection, end_reason=end_reason)
         journal.event({"type": "verify_started", "verify_timeout": spec.verify_timeout})
-        verification = Verification.run(spec)
+        targets = [item for item in str(spec.run_env.get("TARGET_NODES", "")).split() if item]
+        verification = Verification.run(spec, scenario=scenario, targets=targets)
         verification.commit(journal)
         verify_ok = verification.ok
         verify_output = verification.output

@@ -335,6 +335,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument("--force-resume", action="store_true")
     run.add_argument("--no-jsonl", action="store_true")
     run.add_argument("--discard-stale", action="store_true")
+    run.add_argument("--verbose", action="store_true")
 
     target = sub.add_parser("target")
     target_sub = target.add_subparsers(dest="target_command", required=True)
@@ -400,6 +401,8 @@ def main(argv: list[str] | None = None) -> int:
             cmd.append("--no-jsonl")
         if args.discard_stale:
             cmd.append("--discard-stale")
+        if args.verbose:
+            cmd.append("--verbose")
         env = os.environ.copy()
         env["CHECKPOINT_DB"] = args.db
         if not args.detach:

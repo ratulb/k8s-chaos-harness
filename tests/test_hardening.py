@@ -221,6 +221,25 @@ class TestHardening(unittest.TestCase):
         present, _ = fault_checks.check_fault_present({"id": "control-healthy-noisy"}, [])
         self.assertTrue(present)
 
+    def test_fault_cleared_uses_same_predicate(self) -> None:
+        scenario = {"id": "etcd-wrong-peer-url"}
+        with patch(
+            "tools.fault_checks.check_fault_present",
+            return_value=(True, "registered peer URL is https://10.2.0.4:2399"),
+        ):
+            cleared, detail = fault_checks.check_fault_cleared(scenario, ["node-b"], {})
+        self.assertFalse(cleared)
+        self.assertIn("2399", detail)
+        with patch(
+            "tools.fault_checks.check_fault_present",
+            return_value=(False, "registered peer URL is still https://10.2.0.4:2399"),
+        ):
+            cleared, detail = fault_checks.check_fault_cleared(scenario, ["node-b"], {})
+        self.assertTrue(cleared)
+        self.assertIn("2399", detail)
+        cleared, _ = fault_checks.check_fault_cleared({"id": "control-healthy-noisy"}, [], {})
+        self.assertTrue(cleared)
+
     def test_no_fault_strict_success_from_db(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SQLiteStore(Path(tmp) / "results.sqlite3")
@@ -347,6 +366,38 @@ class TestHardening(unittest.TestCase):
                     "SELECT kind FROM run_artifacts WHERE run_id=?", ("fault-check",)
                 )}
             self.assertIn("fault_check", kinds)
+            store.close()
+
+    def test_reset_failure_does_not_claim_baseline_passed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SQLiteStore(Path(tmp) / "results.sqlite3")
+            row = store.create_run(
+                "reset-failure",
+                scenario_id="etcd-member-down",
+                backend="fake",
+                truth="etcd_member_unreachable",
+            )
+            scenario = {
+                "id": "etcd-member-down",
+                "root_cause": "etcd_member_unreachable",
+            }
+            with patch("run_benchmark._run", return_value=(False, "reset failed")):
+                record = run_benchmark._run_fresh(
+                    store,
+                    row,
+                    scenario,
+                    SimpleNamespace(name="fake"),
+                    "echo inject",
+                    "echo verify",
+                    "echo reset",
+                    {},
+                    30,
+                    str(Path(tmp) / "traces"),
+                    None,
+                )
+            self.assertFalse(record["reset_ok"])
+            self.assertFalse(record["baseline_ok"])
+            self.assertEqual(record["end_reason"], "reset_failed")
             store.close()
 
     def test_fresh_run_uses_scenario_timeout_for_injection(self) -> None:

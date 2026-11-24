@@ -65,8 +65,9 @@ persistence
   live UI, attach, replay, score.py = read-only views
 ```
 
-The runner owns destructive setup: reset, baseline, injection, and final verify.
-The model never sees fault scripts, truth labels, or scoring inputs. Tools expose
+The runner owns destructive setup: reset, baseline, injection, final verify, and
+the post-agent fault-cleared check. The model never sees fault scripts, truth
+labels, or scoring inputs. Tools expose
 only named read-only diagnostics and gated repairs.
 
 ## 3. Ownership map
@@ -233,7 +234,8 @@ source of truth.
 
 `strict_loop_success` is the headline metric. It requires an observed fault,
 finished run, strict gate terminal, first-attempt correct diagnosis, receipt,
-passing verification, no violations, `end_reason=verify_ok`, acceptable repair or
+passing verification and fault-cleared check, no violations,
+`end_reason=verify_ok`, acceptable repair or
 no repair for `no_fault`, and no exclusion reason. `loop_success` is historical
 only and must not be quoted as the current headline.
 

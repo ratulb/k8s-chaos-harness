@@ -109,7 +109,7 @@ operator / CI
   -> ./chaos (status, target, scenario, run, attach, abort, state, nuke, replay)
   -> run_benchmark.py
        validate -> discover/freeze topology -> capability/target
-       reset -> baseline -> inject -> agent -> final verify
+       reset -> baseline -> inject -> fault check -> agent -> final verify + fault-cleared check
        -> cluster/*.sh, faults/*.sh, verify/*.sh -> live Kubernetes/etcd
        -> LLM backend -> tool registry + diagnosis/repair gates
        -> SQLite events/state/score
@@ -412,6 +412,7 @@ owner become `INTERRUPTED` once per observation key. `./chaos abort <run_id>
 | `--mode`, `--approve` | `benchmark` (default) or `repair` (best-effort incident context; see caveat below); approval may be `policy` or `prompt` |
 | `--runs`, `--seed`, `--batch-id` | Batch size, recorded seed, and explicit batch ID |
 | `--ui`, `--detach`, `--logs-dir` | Rendering and detached launch/logging |
+| `--verbose` | Print the agent/LLM message exchange to stdout or the detached log |
 | `--resume-of`, `--force-resume`, `--no-jsonl` | Resume and export controls |
 | `--discard-stale` | Intentional archival and deletion of a stale topology epoch; default is archive and exit |
 
@@ -1351,7 +1352,7 @@ status` uses read-only counts and stale topology warnings.
 | `skipped_unsupported` | Capability check marked scenario ineligible |
 | `BLOCKED: diagnosis required first` | Repair called before diagnosis |
 | `BLOCKED: forbidden repair for this scenario` | Repair policy rejected tool |
-| `verify_ok=false` | Final health check failed; inspect tool calls |
+| `verify_ok=false` | Final health check or fault-cleared check failed; inspect tool calls and `fault_cleared` artifact |
 | stale topology warning | Read-only DB belongs to another topology identity |
 
 </details>

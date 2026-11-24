@@ -201,6 +201,23 @@ def check_fault_present(
     return False, f"no fault predicate for scenario {scenario_id!r}"
 
 
+def check_fault_cleared(
+    scenario: Any,
+    targets: list[str],
+    env: dict[str, str] | None = None,
+) -> tuple[bool, str]:
+    value = as_scenario(scenario)
+    check_env = os.environ if env is None else env
+    if check_env.get("CHAOS_FAULT_CHECK_MODE") == "fixture":
+        return True, "fixture mode skips final fault check"
+    if value.id in {"control-healthy-noisy", "control_healthy_noisy"}:
+        return True, "control scenario requires no fault stimulus"
+    present, detail = check_fault_present(value, targets, env)
+    if present:
+        return False, detail
+    return True, detail
+
+
 def wait_for_fault(
     scenario: Any,
     targets: list[str],

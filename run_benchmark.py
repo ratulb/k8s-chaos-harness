@@ -172,6 +172,7 @@ def _run_fresh(
     logs_dir: str | None = None,
     mode: str = "benchmark",
     approve: str = "policy",
+    verbose: bool = False,
 ) -> dict:
     scenario = as_scenario(scenario)
     run_id = run_row["run_id"]
@@ -182,7 +183,7 @@ def _run_fresh(
 
     setup_parts: list[str] = []
     reset_ok = True
-    baseline_ok = True
+    baseline_ok = False
 
     store.update_run(run_id, status="running", phase="resetting")
     if reset_cmd:
@@ -274,6 +275,7 @@ def _run_fresh(
         run_env=run_env,
         approve=approve,
         mode=mode,
+        verbose=verbose,
     )
     ctx = RunContext(
         run_id=run_id,
@@ -313,6 +315,7 @@ def _run_resume(
     mode: str = "benchmark",
     approve: str = "policy",
     run_env: dict[str, str] | None = None,
+    verbose: bool = False,
 ) -> dict:
     scenario = as_scenario(scenario)
     run_id = row["run_id"]
@@ -375,6 +378,7 @@ def _run_resume(
         run_env=dict(run_env or {}),
         approve=approve,
         mode=mode,
+        verbose=verbose,
     )
     ctx = RunContext(
         run_id=run_id,
@@ -463,6 +467,7 @@ def main() -> None:
     ap.add_argument("--ui", choices=["none", "plain", "live"], default="none")
     ap.add_argument("--logs-dir", default=None)
     ap.add_argument("--approve", choices=["policy", "prompt"], default="policy")
+    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
 
     root = os.path.dirname(os.path.abspath(__file__))
@@ -701,6 +706,7 @@ def main() -> None:
                     store, new_row, scenario, backend, inject_cmd, verify_cmd,
                     reset_cmd, run_env, timeout, trace_dir, runs_path,
                     args.ui, logs_dir, args.mode, args.approve,
+                    verbose=args.verbose,
                 )
             else:
                 if args.ui == "none":
@@ -708,6 +714,7 @@ def main() -> None:
                 rec = _run_resume(
                     store, row, scenario, backend, root, trace_dir, runs_path,
                     args.ui, logs_dir, args.mode, args.approve, run_env,
+                    verbose=args.verbose,
                 )
             print(json.dumps(rec), flush=True)
         store.update_batch(batch_id, "complete")
@@ -742,6 +749,7 @@ def main() -> None:
             store, run_row, scenario, backend, inject_cmd, verify_cmd,
             reset_cmd, run_env, timeout, trace_dir, runs_path,
             args.ui, logs_dir, args.mode, args.approve,
+            verbose=args.verbose,
         )
         print(json.dumps(rec), flush=True)
 

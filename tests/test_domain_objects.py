@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -19,7 +21,7 @@ from harness.agent import Agent, build_agent
 from harness.call import Call, CallExecution
 from harness.checkpoint import Checkpoint, LeaseRenewer
 from harness.journal import Journal
-from harness.loop import RunResult
+from harness.loop import AgentLoop, RunResult
 from harness.run_runtime import RunRuntime
 from harness.spec import ExperimentSpec, RunContext
 from harness.tool_runtime import ToolLedger
@@ -78,6 +80,73 @@ class DomainObjectTests(unittest.TestCase):
         self.assertIs(agent.client_factory, LLMClient)
         self.assertIs(agent.tool_registry, TOOL_REGISTRY)
         self.assertEqual(agent, build_agent())
+
+    def test_verbose_prints_agent_llm_conversation(self) -> None:
+        scenario = Scenario.from_dict({
+            "id": "control-healthy-noisy",
+            "root_cause": "no_fault",
+            "max_steps": 5,
+            "max_tokens": 100,
+            "diagnosis_deadline_steps": 2,
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("verbose-run", scenario_id=scenario.id, backend="fake", truth="no_fault")
+            spec = ExperimentSpec(
+                scenario=scenario,
+                backend=_Backend(),
+                inject_cmd="",
+                verify_cmd="true",
+                trace_dir=str(root / "traces"),
+                run_env={},
+                verbose=True,
+            )
+            ctx = RunContext(run_id="verbose-run", store=store)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                AgentLoop(
+                    client_factory=lambda backend: _Client(),
+                    tool_registry=TOOL_REGISTRY,
+                ).run(spec, ctx)
+            store.close()
+        output = stdout.getvalue()
+        self.assertIn("=== llm conversation verbose-run ===", output)
+        self.assertIn("[llm request 1]", output)
+        self.assertIn("[llm response 1]", output)
+        self.assertIn("etcd fault diagnosis and repair agent", output)
+        self.assertIn("submit_diagnosis", output)
+
+    def test_quiet_runs_do_not_print_conversation(self) -> None:
+        scenario = Scenario.from_dict({
+            "id": "control-healthy-noisy",
+            "root_cause": "no_fault",
+            "max_steps": 5,
+            "max_tokens": 100,
+            "diagnosis_deadline_steps": 2,
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("quiet-run", scenario_id=scenario.id, backend="fake", truth="no_fault")
+            spec = ExperimentSpec(
+                scenario=scenario,
+                backend=_Backend(),
+                inject_cmd="",
+                verify_cmd="true",
+                trace_dir=str(root / "traces"),
+                run_env={},
+            )
+            ctx = RunContext(run_id="quiet-run", store=store)
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                AgentLoop(
+                    client_factory=lambda backend: _Client(),
+                    tool_registry=TOOL_REGISTRY,
+                ).run(spec, ctx)
+            store.close()
+        self.assertNotIn("[llm request", stdout.getvalue())
+        self.assertNotIn("[llm response", stdout.getvalue())
 
     def test_checkpoint_captures_state_and_run_projection(self) -> None:
         scenario = Scenario.from_dict({"root_cause": "no_fault"})
@@ -379,6 +448,75 @@ class DomainObjectTests(unittest.TestCase):
         self.assertIs(verification.result.kind, ResultKind.FAILURE)
         self.assertIn("output", artifact["content"])
         self.assertTrue(any(event["type"] == "verify" for event in events))
+
+    def test_verification_fails_when_fault_is_not_cleared(self) -> None:
+        detail = "registered peer URL is https://10.2.0.4:2399"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = SQLiteStore(root / "results.sqlite3")
+            store.create_run("verify-fault", scenario_id="etcd-wrong-peer-url", backend="fake", truth="etcd_config_error")
+            journal = Journal("verify-fault", store)
+            spec = ExperimentSpec(
+                scenario=Scenario.from_dict({"root_cause": "etcd_config_error"}),
+                backend=_Backend(),
+                inject_cmd="",
+                verify_cmd="true",
+                run_env=os.environ.copy(),
+            )
+            with patch(
+                "harness.verification.fault_checks.check_fault_cleared",
+                return_value=(False, detail),
+            ):
+                verification = Verification.run(
+                    spec,
+                    scenario={"id": "etcd-wrong-peer-url"},
+                    targets=["node-b"],
+                )
+            verification.commit(journal)
+            events = store.load_events("verify-fault")
+            with store._connect() as conn:
+                artifacts = {
+                    row["kind"]: row
+                    for row in conn.execute(
+                        "SELECT kind, content FROM run_artifacts WHERE run_id=?", ("verify-fault",)
+                    )
+                }
+            store.close()
+        self.assertFalse(verification.ok)
+        self.assertFalse(verification.fault_cleared)
+        self.assertIn("FAULT CLEARED", verification.output)
+        self.assertIn(detail, artifacts["fault_cleared"]["content"])
+        self.assertTrue(any(
+            event["type"] == "verify" and event.get("fault_cleared") is False
+            for event in events
+        ))
+
+    def test_no_op_calibration_fails_every_fault_scenario(self) -> None:
+        fault_scenarios = [
+            "etcd-member-down",
+            "etcd-member-wiped",
+            "etcd-quorum-loss",
+            "etcd-wrong-peer-url",
+            "etcd-disk-full",
+        ]
+        for scenario_id in fault_scenarios:
+            with self.subTest(scenario=scenario_id):
+                spec = ExperimentSpec(
+                    scenario=Scenario.from_dict({"root_cause": "unused"}),
+                    backend=_Backend(),
+                    inject_cmd="",
+                    verify_cmd="true",
+                    run_env={},
+                )
+                with patch(
+                    "harness.verification.fault_checks.check_fault_present",
+                    return_value=(True, "no-op left fault present"),
+                ):
+                    verification = Verification.run(
+                        spec, scenario={"id": scenario_id}, targets=["node-b"],
+                    )
+                self.assertFalse(verification.ok)
+                self.assertIn("no-op left fault present", verification.output)
 
     def test_lease_renewer_renews_until_exit(self) -> None:
         renewed = threading.Event()

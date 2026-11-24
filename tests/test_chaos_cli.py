@@ -270,6 +270,7 @@ class TestChaosCli(unittest.TestCase):
                         "--batch-id", "sweep-1",
                         "--detach",
                         "--ui", "none",
+                        "--verbose",
                         "--logs-dir", str(logs),
                     ])
             self.assertEqual(code, 0)
@@ -280,7 +281,11 @@ class TestChaosCli(unittest.TestCase):
             self.assertEqual(payload["command"][payload["command"].index("--approve") + 1], "prompt")
             self.assertEqual(payload["command"][payload["command"].index("--batch-id") + 1], "sweep-1")
             self.assertIn("--launch-id", payload["command"])
-            self.assertTrue(payload["command"][-1].startswith("launch-"))
+            self.assertIn("--verbose", payload["command"])
+            self.assertEqual(
+                payload["command"][payload["command"].index("--launch-id") + 1],
+                payload["launch_id"],
+            )
             self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
     def test_ssh_preflight_skips_local_host(self) -> None:

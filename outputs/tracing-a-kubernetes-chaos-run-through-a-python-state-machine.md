@@ -1,53 +1,99 @@
 ---
-title: "Tracing a Kubernetes Chaos Run Through a Python State Machine"
+title: "Healthy Cluster, Failed Run: Tracing a Kubernetes Chaos Test Through a Python State Machine"
 date: "2026-11-24"
 categories: ["Software Engineering", "Agent Systems"]
-tags: ["python", "kubernetes", "chaos-engineering", "state-machines", "llm-agents"]
-excerpt: "A code-level walkthrough of a Python harness that injects real etcd faults, constrains an LLM agent with state machines and gates, and scores the path it took."
+tags: ["python", "kubernetes", "etcd", "chaos-engineering", "state-machines", "llm-agents"]
+excerpt: "A Python chaos harness breaks etcd on purpose, constrains an LLM caller with state machines and gates, and scores the path a run takes. One run exposed a verifier gap."
 ---
 
-# Tracing a Kubernetes Chaos Run Through a Python State Machine
+# Healthy Cluster, Failed Run: Tracing a Kubernetes Chaos Test Through a Python State Machine
 
-Audience note: This post assumes you can read Python and have basic Kubernetes vocabulary. You do not need prior chaos-engineering or agent-framework experience.
+*Audience: you can read Python and know basic Kubernetes vocabulary. No chaos-engineering or agent-framework experience needed.*
 
-This post is about a harness that breaks etcd in a disposable Kubernetes lab, asks an LLM to diagnose and repair the fault, and records what happened. The point is not to claim that a model is an SRE. The point is to show how to build an agent loop whose decisions can be checked after the fact: the fault comes from the harness, the model gets named tools instead of a shell, diagnosis and repair are separate steps, and the resulting run can be replayed from stored events.
+At the end of one run, every etcd member passed the final health check. The harness scored that run zero on `strict_loop_success`.
 
-The repository was not built as a public sequence of releases, so this post follows a logical build order instead: scenario policy, safety guard, event journal and state machines, constrained model loop, live runner, then storage and scoring. Every code excerpt comes from the repository, and the score table at the end is generated from the current `results.sqlite3`.
+The run was one of four against a lab Kubernetes cluster. A Python harness injected a wrong registered peer URL on `vm2`, then asked a local model served by Ollama to diagnose and repair it. The model never produced the correct diagnosis, never received a gate receipt, and left the fault in place. Verification still printed `etcd healthy: 3/3 members, quorum 2`.
 
-## TL;DR
+That was a verifier defect, not a subtle scoring choice. `cluster/verify_etcd_healthy.sh` checks Ready nodes, running etcd pods, member count, and local endpoint health. It does not compare the registered peer URL with the intended topology. The strict metric caught the bad path anyway; the older `loop_success` metric can be inflated by this scenario because it only needs a correct diagnosis, passing verification, and a repair-shaped record.
 
-- Put the fault, target policy, and repair policy in a scenario file before the model sees anything.
-- Make illegal actions impossible to express as state transitions, not merely discouraged in the prompt.
-- Let the model choose from named tools; keep protocol bookkeeping in Python.
-- Prove the cluster was healthy and the fault was present before the agent starts.
-- Score the whole path: diagnosis attempt, approval, repair policy, verification, and end reason.
+I fixed the verifier after finding this: the runner now reuses the fault-present predicate after the agent loop and requires the fault to be cleared as part of verification. The tracing, scoring, and guard behavior below come from the original run; the verifier fix is the change that run prompted.
 
-## Contents
+## Setup and provenance
 
-1. [The problem](#1-the-problem)
-2. [Scenario and hard limits](#2-scenario-and-hard-limits)
-3. [Events and state machines](#3-events-and-state-machines)
-4. [The model as constrained caller](#4-the-model-as-constrained-caller)
-5. [Running against a real cluster](#5-running-against-a-real-cluster)
-6. [Replay, scoring, and doctor checks](#6-replay-scoring-and-doctor-checks)
-7. [The demo](#7-the-demo)
-8. [Common pitfalls](#8-common-pitfalls)
-9. [Conclusion](#9-conclusion)
-10. [Appendix: references](#appendix-references)
+The numbers in this post come from `results.sqlite3`, not from a demo script.
 
-## 1. The problem
+| Field | Value |
+| --- | --- |
+| Run | `etcd-wrong-peer-url-ollama-0-441a4807` |
+| Backend / model | `ollama` / `qwen3.8:27b` |
+| Quantization | not recorded |
+| Harness SHA | `88d122adb7fe875fabcb58413df08dab80ac0a6e` |
+| Prompt hash | not recorded |
+| Temperature / seed | `0.2` / `0` (seed is metadata, not a sampler control) |
+| Scenario hash | `62a62f30baa7f8f7146aa3f4e2399e41a4a2933dba16cd02f102068056e90f2c` |
+| Topology hash | `29e67a5cab5a263103f3a8b42412587e2109a29855ecd9d84cc7a2a9c4465058` |
 
-An operational agent can fail in several different ways. It can diagnose the wrong root cause, choose a repair that is valid in general but forbidden for this scenario, attempt a repair before diagnosis, claim success after a timeout, or crash while a mutating tool call is in flight. A final health check catches only some of those failures.
+The four runs used the same model, backend, and one attempt per scenario. Run-era code excerpts link to `88d122a` so the claims can be checked against that version.
 
-The harness narrows the question. It asks whether a model can read evidence from a real cluster, identify one of a small set of etcd root causes, and choose an acceptable repair for the scenario that the harness injected [1]. The agent never injects the fault, reads the scenario truth, sees the fault script, or gets a raw shell. It receives tools and a prompt, while the harness owns the state and the cluster operations.
+## The traced run
 
-That boundary is the design idea worth taking away. Reliability comes from making the allowed paths explicit and recording which path a run actually took. The next section starts at the beginning of that design: the scenario file.
+The event log is the source of truth. The gate phase column below is folded from the stored `gate.*` events; non-gate rows leave it unchanged. These are real rows from `trace_events`.
 
-## 2. Scenario and hard limits
+| seq | event | detail | gate phase: before -> after |
+| --- | --- | --- | --- |
+| 3 | `reset` | `ok=true` | `await_diagnosis` -> `await_diagnosis` |
+| 4 | `baseline` | `ok=true`, 3-member quorum | `await_diagnosis` -> `await_diagnosis` |
+| 5 | `inject` | wrong peer URL on `vm2` | `await_diagnosis` -> `await_diagnosis` |
+| 6 | `fault_check` | `present=true`, target `vm2` | `await_diagnosis` -> `await_diagnosis` |
+| 35 | `gate.nudge` | `kind=budget`, `step=4` | `await_diagnosis` -> `await_diagnosis` |
+| 38 | `gate.diagnosis_submitted` | `label=no_fault`, `correct=false`, attempt 1 | `await_diagnosis` -> `await_diagnosis` |
+| 63 | `gate.diagnosis_submitted` | `label=etcd_member_unreachable`, `correct=false`, attempt 2 | `await_diagnosis` -> `escalated` |
+| 86 | `run.agent_done` | `gate_terminal=escalated`, `gate_reason=budget_tokens` | `escalated` -> `escalated` |
+| 87 | `verify_started` | timeout 300 | `escalated` -> `escalated` |
+| 88 | `verify` | `ok=true`, `etcd healthy: 3/3 members, quorum 2` | `escalated` -> `escalated` |
+| 90 | `record` | `verify_ok=true`, `strict_loop_success=false` | `escalated` -> `escalated` |
 
-A prompt is a poor place to define operational policy. It is prose, it is easy to contradict, and it cannot tell the runner what to do before the model starts. The harness starts with a scenario file instead.
+The truth was `etcd_config_error`. The second diagnosis attempt consumed the allowed attempts, so the gate moved to `escalated`. No repair was proposed or executed. The health check then ran and passed, because it never inspected the field that the fault had changed.
 
-`scenarios/etcd-member-down.json` defines one fault and the policy around it:
+The two diagnosis-policy violations are also real. `submit_diagnosis` was denied twice with `violation_kind="diagnosis"`; the scorer counts both denials, which is why `scores.policy_violations` is `2` for this run.
+
+## Finding and fixing the verifier gap
+
+The final verifier does useful work. It waits for Ready nodes, running etcd pods, the expected member count, and healthy endpoints. The last lines of [cluster/verify_etcd_healthy.sh](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/cluster/verify_etcd_healthy.sh) make its contract explicit:
+
+```bash
+if [[ "$member_count_ok" != "true" ]]; then
+  echo "could not confirm $EXPECTED etcd members from any pod" >&2
+  exit 1
+fi
+...
+echo "etcd healthy: $EXPECTED/$EXPECTED members, quorum $QUORUM"
+```
+
+Those checks cannot distinguish a repaired peer URL from the wrong one injected by this scenario. The fault-present predicate already knew the difference: the stored artifact said `registered peer URL is https://10.2.0.4:2399`. The fix runs that same predicate after the agent loop and folds the result into `verify_ok`:
+
+```python
+        if scenario is not None:
+            fault_cleared, fault_detail = fault_checks.check_fault_cleared(
+                scenario, targets or [], env=spec.run_env,
+            )
+            suffix = f"FAULT CLEARED: {fault_detail}"
+            output = f"{output}\n{suffix}" if output else suffix
+        return cls(
+            ok=health_ok and fault_cleared,
+            output=output,
+            fault_cleared=fault_cleared,
+            fault_detail=fault_detail,
+        )
+```
+
+A no-op calibration test now covers every fault scenario: health command passes, the fault predicate still reports the fault present, and final verification must fail. Live destructive no-op calibration on the cluster is still a separate operator task; the test does not touch infrastructure.
+
+The design lesson is narrower than "trust the scorer". Use the same invariant before and after the agent acts. If the pre-agent check can see a fault, the post-agent verifier must fail while that fault remains.
+
+## Scenario and preflight
+
+A prompt is a poor place to define operational policy. The harness starts with a scenario file. [scenarios/etcd-member-down.json](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/scenarios/etcd-member-down.json) is a representative example, abridged here:
 
 ```json
 {
@@ -61,160 +107,41 @@ A prompt is a poor place to define operational policy. It is prose, it is easy t
   "verify": "cluster/verify_etcd_healthy.sh",
   "timeout_seconds": 300,
   "fault_present_timeout_seconds": 60,
-  "max_steps": 40,
-  "max_tokens": 60000,
   "risk": "disruptive",
-  "menu": {
-    "label": "Etcd member down",
-    "summary": "Stop one etcd member while its data remains intact."
-  },
-  "min_etcd_members": 1,
-  "selector_requirements": {
-    "min_targets": 1,
-    "allowed": ["role", "index", "node"]
-  },
   "impact_class": "single_member_fault"
 }
 ```
 
-This file carries several different decisions. `root_cause` is the hidden truth. `target_nodes` is a selector, not a hard-coded hostname. `acceptable_repairs` and `forbidden_repairs` define the repair policy. `inject`, `verify`, and the timeout fields define what the runner must execute. Budgets and impact metadata describe the cost and risk of the run.
+`root_cause` is hidden truth. `target_nodes` is resolved against a frozen topology snapshot, so `second` means the second eligible control plane, not a literal hostname. `acceptable_repairs` and `forbidden_repairs` are repair policy. `risk` and `impact_class` are validated and used by the CLI and capability checks; they are metadata, not a second authorization layer.
 
-The model never receives this file. The runner validates it, resolves the selector against frozen topology, and passes only derived facts into the run. That means the scenario can say “second member” without assuming a particular cluster has a node literally named `second`.
+The runner discovers topology, applies the destructive guard, checks capability, and validates resolved target names before any fault command runs. The guard in [tools/safety.py](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/tools/safety.py) accepts either an allow-listed kubectl context or cluster ID, and checks a topology hash only when a topology allow-list is configured. Resolved names are matched against `^[A-Za-z0-9][A-Za-z0-9_.-]*$` before scenario commands expand them through a shell.
 
-Scenario policy still is not enough for destructive work. The runner needs a boundary that exists before scenario execution. `tools/safety.py` provides that boundary:
+Everything after that follows one order:
 
-```python
-def require_destructive_guard(topology: dict[str, Any] | None = None) -> dict[str, Any]:
-    topology = topology or {}
-    context = current_context()
-    cluster_id = os.environ.get("CHAOS_CLUSTER_ID", "").strip() or context
-    topology_hash = str(topology.get("topology_hash") or os.environ.get("CHAOS_TOPOLOGY_HASH", ""))
-    allowed_contexts = sorted(_values("CHAOS_ALLOWED_CLUSTER_CONTEXTS"))
-    allowed_ids = sorted(_values("CHAOS_ALLOWED_CLUSTER_IDS"))
-    allowed_hashes = sorted(_values("CHAOS_ALLOWED_TOPOLOGY_HASHES"))
-
-    identity_ok = bool(context and context in allowed_contexts) or bool(
-        cluster_id and cluster_id in allowed_ids
-    )
-    topology_ok = not allowed_hashes or (bool(topology_hash) and topology_hash in allowed_hashes)
-    payload = {
-        "enforced": True,
-        "context": context,
-        "cluster_id": cluster_id,
-        "topology_hash": topology_hash,
-        "allowed_contexts": allowed_contexts,
-        "allowed_cluster_ids": allowed_ids,
-        "allowed_topology_hashes": allowed_hashes,
-    }
-    if not identity_ok:
-        raise RuntimeError(
-            "destructive benchmark refused: current kubectl context "
-            f"{context or '<unknown>'!r} and cluster id {cluster_id or '<unknown>'!r} "
-            "are not allow-listed; set CHAOS_ALLOWED_CLUSTER_CONTEXTS or "
-            "CHAOS_ALLOWED_CLUSTER_IDS"
-        )
-    if not topology_ok:
-        raise RuntimeError(
-            "destructive benchmark refused: topology hash "
-            f"{topology_hash or '<unknown>'!r} is not allow-listed; set "
-            "CHAOS_ALLOWED_TOPOLOGY_HASHES"
-        )
-    return payload
+```text
+validate scenario -> discover + freeze topology -> safety guard
+   -> reset -> baseline verify -> inject fault -> fault-present check
+        -> agent loop (diagnose -> repair, gated)
+             -> final verify -> record + score
 ```
 
-The guard accepts either an allow-listed kubectl context or an explicit cluster ID. A topology hash is checked only when a topology allow-list is configured. This is a small choice with a clear effect: the harness can refuse destructive work on an unlisted cluster, while operators can opt into a tighter identity check.
+`_run_fresh` executes those stages in [run_benchmark.py](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/run_benchmark.py). Reset restores clean etcd state, baseline verification proves the cluster was healthy first, injection applies the fault, and `fault_checks.wait_for_fault` proves the intended stimulus was observed. Each stage has its own end reason: `reset_failed`, `baseline_failed`, `injection_failed`, or `fault_not_observed`. Those runs are excluded from headline scoring. A reset failure must not claim the baseline passed, so `baseline_ok` now starts as `False` and is set only when the baseline command actually runs.
 
-The scenario and guard decide what is allowed before the agent starts. They do not decide what is legal at each step of a run. That is the next layer.
+The model is invoked only after all four checks pass.
 
-## 3. Events and state machines
+## Machines and the model loop
 
-Scenario policy is declarative. It says that `restart_member` is acceptable and `full_cluster_reset` is forbidden, but it does not say whether a repair proposal is legal before a diagnosis. The harness models that with explicit state machines.
+Scenario files say which repair is acceptable. They do not say whether a repair is legal before a diagnosis. The gate machine in [harness/machines/gate.py](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/harness/machines/gate.py) supplies that order.
 
-The generic machine in `harness/state_machine.py` has one job: given a state and an event, produce a transition or raise.
+| Phase | Event | Outcome |
+| --- | --- | --- |
+| `AWAIT_DIAGNOSIS` | repair proposed | stays put, records `PREMATURE_REPAIR` |
+| `AWAIT_DIAGNOSIS` | repair finished | rejected |
+| `APPROVED` | repair proposed, forbidden | stays `APPROVED`, records `FORBIDDEN_REPAIR` |
+| `APPROVED` | repair proposed, not acceptable | stays `APPROVED`, records `UNACCEPTABLE_REPAIR` |
+| `APPROVED` | repair proposed, acceptable | marks the repair proposed |
 
-```python
-def transition(
-    machine: Machine[S, I, E, C],
-    state: S,
-    event: E | MachineEvent[E],
-) -> Transition[S]:
-    machine_event = _as_event(event)
-    state_key = machine.state_id(state)
-    rule = machine.rules.get((state_key, machine_event.type))
-    if rule is None:
-        raise IllegalTransition(machine.kind, state_key, machine_event.type)
-    resolved = _resolve(machine, state, machine_event, rule)
-    if isinstance(resolved, Rejection):
-        raise IllegalTransition(machine.kind, state_key, machine_event.type, resolved.reason)
-    if resolved.update is not None:
-        return Transition(resolved.update(state, machine_event), resolved.effects, resolved.reason)
-    return resolved
-```
-
-The folded version of the same idea walks an event stream and rejects out-of-order or duplicate sequence markers:
-
-```python
-def fold(
-    machine: Machine[S, I, E, C],
-    events: Iterable[E | MachineEvent[E]],
-    initial: S | None = None,
-) -> S:
-    state = machine.initial if initial is None else initial
-    seen: set[str] = set()
-    last_seq: int | None = None
-
-    for raw_event in events:
-        event = _as_event(raw_event)
-        dedupe_key: str | None = None
-        if event.seq is not None:
-            if last_seq is not None and event.seq <= last_seq:
-                raise ValueError(f"events out of order: {last_seq} then {event.seq}")
-            last_seq = event.seq
-            dedupe_key = f"seq:{event.seq}"
-        elif event.idempotency_key is not None:
-            dedupe_key = f"key:{event.idempotency_key}"
-        if dedupe_key is not None:
-            if dedupe_key in seen:
-                continue
-            seen.add(dedupe_key)
-        state = transition(machine, state, event).state
-
-    return state
-```
-
-This makes state a derived fact. If the stored events are complete and ordered, the run state can be rebuilt without trusting a mutable cache.
-
-The gate machine applies that idea to diagnosis and repair. `harness/machines/gate.py` declares the phases, events, and violations:
-
-```python
-class GatePhase(StrEnum):
-    AWAIT_DIAGNOSIS = "await_diagnosis"
-    APPROVED = "approved"
-    REPAIRED = "repaired"
-    CLEARED = "no_fault_cleared"
-    ESCALATED = "escalated"
-
-
-class GateEvent(StrEnum):
-    DIAGNOSIS_SUBMITTED = "diagnosis_submitted"
-    NUDGE = "nudge"
-    REPAIR_PROPOSED = "repair_proposed"
-    REPAIR_FINISHED = "repair_finished"
-    ESCALATE = "escalate"
-    BUDGET_EXHAUSTED = "budget_exhausted"
-    ABORT = "abort"
-    UNKNOWN_EFFECT = "unknown_effect"
-```
-
-```python
-class GateViolation(StrEnum):
-    PREMATURE_REPAIR = "premature_repair"
-    FORBIDDEN_REPAIR = "forbidden_repair"
-    UNACCEPTABLE_REPAIR = "unacceptable_repair"
-    REPAIR_AFTER_NO_FAULT = "repair_after_no_fault"
-```
-
-The rules encode the order. A repair proposal before diagnosis records `PREMATURE_REPAIR`; a finished repair before diagnosis is rejected outright:
+One transition from the table:
 
 ```python
     (GatePhase.AWAIT_DIAGNOSIS, GateEvent.REPAIR_PROPOSED): Transition(
@@ -224,330 +151,26 @@ The rules encode the order. A repair proposal before diagnosis records `PREMATUR
     ),
 ```
 
-```python
-    (GatePhase.AWAIT_DIAGNOSIS, GateEvent.REPAIR_FINISHED): Rejection("no repair before diagnosis"),
-    (GatePhase.AWAIT_DIAGNOSIS, GateEvent.UNKNOWN_EFFECT): Rejection("no tool before diagnosis"),
-```
+An illegal call becomes a recorded rejection, not an unlogged change to state. Escalation is a terminal phase, which lets the harness stop cleanly when the diagnosis budget is exhausted.
 
-After approval, the machine still checks repair policy. Only three branches are relevant here; the rest of `GATE_RULES` is omitted:
-
-```python
-    (GatePhase.APPROVED, GateEvent.REPAIR_PROPOSED): Guards(
-        (
-            Branch(
-                _forbidden,
-                Transition(
-                    GateState(phase=GatePhase.APPROVED),
-                    (_effect(EffectKind.RECORD_VIOLATION, violation=GateViolation.FORBIDDEN_REPAIR.value),),
-                    update=_repair_proposed_update(GateViolation.FORBIDDEN_REPAIR),
-                ),
-            ),
-            Branch(
-                lambda _state, event: not bool(_payload(event).get("acceptable")),
-                Transition(
-                    GateState(phase=GatePhase.APPROVED),
-                    (_effect(EffectKind.RECORD_VIOLATION, violation=GateViolation.UNACCEPTABLE_REPAIR.value),),
-                    update=_repair_proposed_update(GateViolation.UNACCEPTABLE_REPAIR),
-                ),
-            ),
-            Branch(
-                lambda _state, event: bool(_payload(event).get("acceptable")),
-                Transition(
-                    GateState(phase=GatePhase.APPROVED),
-                    (_effect(EffectKind.SET_PROJECTION, repair_proposed=True),),
-                    update=_repair_proposed_update(None),
-                ),
-            ),
-        )
-    ),
-```
-
-This is where scenario policy becomes operational policy. `classify_repair` in `harness/gate_runtime.py` canonicalizes the repair name and compares it to the scenario’s acceptable and forbidden sets. The gate then decides whether that repair proposal is legal in the current phase.
-
-`GateRuntime.emit` is the bridge between a Python call and the event log:
-
-```python
-    def emit(
-        self,
-        event_type: GateEvent,
-        payload: Mapping[str, Any] | None = None,
-        idempotency_key: str | None = None,
-    ) -> MachineEvent[GateEvent] | None:
-        if idempotency_key is not None and idempotency_key in self._seen_keys:
-            return None
-        event = MachineEvent(event_type, dict(payload or {}), idempotency_key=idempotency_key)
-        try:
-            transition = GATE_MACHINE.transition(self.state, event)
-        except IllegalTransition as exc:
-            self.rejections.append(str(exc))
-            if self.log is not None:
-                self.log(rejection_event(GATE_MACHINE, self.state, event, str(exc)))
-            return None
-        if idempotency_key is not None:
-            self._seen_keys.add(idempotency_key)
-        self.events.append(event)
-        self.state = transition.state
-        if self.log is not None:
-            self.log(canonical_gate_event(event))
-        return event
-```
-
-An illegal call does not silently mutate state. It becomes a rejection event when a logger is attached. A duplicate idempotency key returns without emitting a second event. The receipt is also derived from state, not passed in as an argument:
-
-```python
-    @property
-    def receipt(self) -> str | None:
-        return receipt_for(self.run_id) if self.state.receipt_issued else None
-```
-
-`harness/journal.py` connects those machine events to durable storage. It redacts first, then routes only `gate`, `run`, and `tool` prefixes through machine-event application:
-
-```python
-    def event(self, event: dict[str, Any]) -> int:
-        event["ts"] = time.time()
-        event_type = str(event.get("type", "unknown"))
-        redacted = Message.redact_payload(event)
-        self.emit(event_type, self.describe(event_type, redacted))
-        if event_type.split(".", 1)[0] in {"gate", "run", "tool"}:
-            return int(self.store.apply_machine_event(self.run_id, event_type, dict(redacted)))
-        return int(self.store.add_event(self.run_id, event_type, dict(redacted)))
-```
-
-The state machine can reject actions, but it cannot make an LLM emit legal tool calls. That requires a narrow model interface, which is the next stage.
-
-## 4. The model as constrained caller
-
-The gate machine is only useful if the model’s output is converted into a small set of calls. `harness/prompt.py` states the interface in plain language:
+The model sees a narrow interface. [harness/prompt.py](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/harness/prompt.py) includes these constraints:
 
 ```text
-The discoverable node names are: {', '.join(self.control_planes)}. Use only those exact names for node arguments.
-The default probe node is {self.probe_node}.
 Read-only investigation tools are safe to call at any time. Submit a diagnosis with submit_diagnosis before any repair.
 root_cause MUST be exactly one of: {', '.join(ROOT_CAUSE_LABELS)}. Do not write a sentence, a node name, or an explanation in root_cause.
-
 If the diagnosis is accepted, the harness gate is open internally; do not pass receipts or approval tokens to repair calls.
 submit_diagnosis accepts at most two attempts. If rejected, gather one new decisive observation before the final attempt; do not brute-force labels.
-Use etcdctl_member_list and etcdctl_endpoint_health from the default probe node, plus pod status and logs, to identify the affected member.
-Investigate briefly: use at most four assistant turns of read-only tools, then call submit_diagnosis immediately. Do not keep investigating once the likely root cause is clear.
-A stopped or unreachable member is etcd_member_unreachable. A wiped data directory is etcd_member_data_loss.
-A wrong peer URL is etcd_config_error. A full disk is etcd_disk_exhaustion. {self.quorum_line}
-A healthy cluster with only noisy events is no_fault. Do not repair a healthy cluster.
-Choose only repairs allowed by the scenario. Keep steps efficient.
-If a repair call is BLOCKED, forbidden, or rejected, do not try another repair; report the limitation and escalate to the operator.
-If a repair reports a timeout, make at most one read-only health check, then report that the repair did not complete and escalate to the operator.
 ```
 
-This prompt constrains labels and behavior, but the harness does not trust the prompt alone. `harness/loop.py` invokes the model with tool schemas and a fixed temperature, then dispatches returned tool calls through the registry:
+The gate receipt is a correctness handshake derived from folded state. It is not passed as a tool argument and is not the authorization boundary; the gate rules and scenario repair policy are.
 
-```python
-                outcome = LLMOutcome.invoke(
-                    client,
-                    [message.to_dict() for message in messages],
-                    tools=registry.schemas(),
-                    temperature=0.2,
-                    max_tokens=2048,
-                    on_chunk=(lambda text: journal.emit("assistant_delta", text)) if ctx.reporter is not None else None,
-                )
-```
+`harness/loop.py` calls the model with tool schemas at temperature `0.2`, binds each returned call to a registered tool, and journals the execution. If the model stops without diagnosing, the harness nudges it. If it exhausts the budget, the run ends with a specific reason. The model proposes calls; Python decides what they mean.
 
-```python
-                tool_calls = msg.tool_calls
-                if not tool_calls and not state.diagnosis_submitted:
-                    if budget.can_continue_without_tool_call():
-                        nudge = Message.user("You have not submitted a diagnosis. Call submit_diagnosis with one exact root cause label.")
-                        messages.append(nudge)
-                        state.record_nudge(step=budget.steps, kind="no_tool")
-                        nudge.persist(journal, backend="harness")
-                        checkpointer.capture()
-                        continue
-```
+## Journal and scoring
 
-```python
-                for tool_call in tool_calls:
-                    tool = registry.get(str((tool_call.get("function") or {}).get("name") or ""))
-                    call = Call.from_tool_call(tool_call, len(messages) - 1).for_tool(tool)
-                    execution = call.invoke(tool, context, journal)
-                    messages.append(execution.commit(journal, backend_name))
-                    checkpointer.capture()
-```
+Events are appended to `trace_events` with a per-run sequence number. Machine events rebuild folded state, and run columns are projections of that state. `replay.py` reads the same rows and renders a static, redacted HTML view; it cannot change a score. Event sourcing is a standard pattern for keeping a replayable history [2].
 
-The model proposes a call. The registry resolves it to a known tool. The tool execution updates state through the journal. If the model stops talking without submitting a diagnosis, the harness adds a nudge message and records the nudge. If it keeps avoiding the protocol until the budget ends, the run ends with a specific reason instead of being reinterpreted as success.
-
-This interface also fixes a common source of confusion around the gate receipt. The receipt is a correctness handshake derived from folded state; it is not a secret that protects repair tools. The prompt tells the model not to pass it because protocol arguments should not be model-owned. Safety comes from the gate rules and repair policy from the previous section.
-
-A constrained loop still assumes the fault is real. The runner establishes that next.
-
-## 5. Running against a real cluster
-
-A clean protocol over an unverified fault would only test the harness. `run_benchmark.py` therefore validates and freezes the cluster before the model is invoked.
-
-The main preflight validates the scenario, discovers topology, applies the destructive guard, checks capability, and resolves targets:
-
-```python
-    scenario_obj = load_scenario_object(root, args.scenario)
-    errors = scenario_obj.validate(root, expected_id=args.scenario).to_list()
-    if errors:
-        print("Invalid scenario:", file=sys.stderr)
-        for error in errors:
-            print(f"- {error}", file=sys.stderr)
-        sys.exit(2)
-    scenario = scenario_obj
-
-    try:
-        topology_data = topology_tools.discover_topology()
-        destructive_guard = safety_tools.require_destructive_guard(topology_data)
-        topology_tools.freeze_topology(topology_data)
-        capability = topology_tools.capability_check(scenario, topology_data, args.mode)
-        targets = scenario.target_nodes
-        resolved = topology_tools.resolve_targets(
-            topology_data,
-            targets,
-            avoid_local=scenario.avoid_local_target,
-        )
-        min_targets = scenario.min_targets
-        if len(resolved) < min_targets:
-            raise RuntimeError(f"scenario requires at least {min_targets} target node(s); resolved {resolved}")
-        resolved = _validate_targets(resolved)
-    except Exception as e:
-        print(f"Topology preflight failed: {e}", file=sys.stderr)
-        sys.exit(2)
-```
-
-Fixture topology is refused unless it is explicitly enabled for offline tests:
-
-```python
-    if topology_data.get("source") == "fixture" and os.environ.get("CHAOS_ALLOW_FIXTURE_RUNS") != "1":
-        print(
-            "fixture topology rejected: set CHAOS_ALLOW_FIXTURE_RUNS=1 only for offline tests",
-            file=sys.stderr,
-        )
-        sys.exit(2)
-```
-
-Topology identity also decides whether stored state belongs to the current epoch. A changed topology archives stale state by default and refuses explicit resume:
-
-```python
-    active_hash = active_topology_hash(args.db)
-    if (args.resume or args.resume_of) and active_hash and active_hash != topology_data["topology_hash"]:
-        print(
-            f"refusing resume: active topology {active_hash} differs from discovered topology "
-            f"{topology_data['topology_hash']}; discard stale state first",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-```
-
-After preflight, `_run_fresh` proves the cluster state before handing control to the agent. Reset failure, baseline failure, injection failure, and missing fault all end the run before the model sees the problem:
-
-```python
-    if reset_ok:
-        store.update_run(run_id, phase="baseline")
-        baseline_ok, base_out = _run(verify_cmd, timeout, run_env, log_path)
-        setup_parts.append(f"BASELINE: {base_out}")
-        _artifact(store, run_id, "baseline_output_full", base_out)
-        store.add_event(run_id, "baseline", {"ok": baseline_ok, "output": base_out[:2000]})
-        store.update_run(run_id, baseline_ok=baseline_ok)
-```
-
-```python
-    store.update_run(run_id, phase="injecting")
-    inject_ok, inject_out = _run(inject_cmd, max(timeout, 120), run_env, log_path)
-```
-
-```python
-    fault_present, fault_detail, fault_elapsed = fault_checks.wait_for_fault(
-        scenario, targets, env=run_env,
-    )
-```
-
-The run environment carries the frozen topology and resolved targets, so reset, fault, tools, and verification all refer to the same cluster snapshot:
-
-```python
-    run_env = os.environ.copy()
-    run_env["CHAOS_TOPOLOGY_JSON"] = json.dumps(topology_data, sort_keys=True)
-    if topology_data.get("source") == "fixture":
-        run_env["CHAOS_FAULT_CHECK_MODE"] = "fixture"
-    run_env["TARGET_NODE"] = resolved[0] if resolved else ""
-    run_env["TARGET_NODES"] = " ".join(resolved)
-```
-
-Reset uses `cluster/restore_clean_state.sh` by default. The script removes fault artifacts, normalizes etcd manifests and peer URLs, verifies health, and only escalates to member-level repair if plain restoration is insufficient. After the agent loop, `harness/loop.py` runs the scenario’s final verification command and records the result as another state event.
-
-At this point the runner has produced evidence: a validated scenario, a frozen topology, a proven fault, a bounded model conversation, and a final health check. The remaining question is how to keep that evidence honest.
-
-## 6. Replay, scoring, and doctor checks
-
-The final health check is not enough for scoring. A run may end healthy after an unsafe repair, a forbidden action, a second-attempt diagnosis, or a budget cutoff. Storage and scoring exist to preserve the difference.
-
-`storage/sqlite_store.py` states the storage boundary at the top of the file:
-
-```python
-"""SQLite-backed authoritative store for benchmark runs.
-
-The event tables are the source of truth: messages, tool_calls, llm_requests
-and trace_events are append-only. A runs.state_json blob is only a cache that
-is rebuilt from the log whenever its seq marker is stale.
-"""
-```
-
-Events are appended with a per-run sequence number, and the run row’s sequence marker is updated in the same operation:
-
-```python
-    def add_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int:
-        ts = float(payload.get("ts") or self._now())
-        with self._connect() as conn:
-            seq = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 AS seq FROM trace_events WHERE run_id=?",
-                (run_id,),
-            ).fetchone()["seq"]
-            conn.execute(
-                "INSERT INTO trace_events(run_id, seq, ts, type, payload_json) VALUES (?, ?, ?, ?, ?)",
-                (run_id, seq, ts, event_type, self._dumps(payload)),
-            )
-            conn.execute(
-                "UPDATE runs SET seq=?, updated_at=? WHERE run_id=?", (seq, self._now(), run_id)
-            )
-        return int(seq)
-```
-
-Machine events trigger a rebuild of the folded state and update projections from it:
-
-```python
-    def apply_machine_event(self, run_id: str, event_type: str, payload: dict[str, Any]) -> int:
-        seq = self.add_event(run_id, event_type, payload)
-        state = self.rebuild_state(run_id)
-        projection_keys = (
-            "status", "phase", "end_reason", "fault_present", "verify_ok",
-            "diagnosis", "diagnosis_raw", "diagnosis_correct", "approval_granted",
-            "repair", "repair_args", "policy_violations", "forbidden_reason",
-        )
-        self.update_run(run_id, **{
-            RECORD_TO_COLUMN.get(key, key): state.get(key)
-            for key in projection_keys
-        })
-```
-
-`replay.py` uses those stored events to produce a static HTML view. It reads events and stream chunks in sequence order and renders the final record:
-
-```python
-        events = read_only_rows(
-            db_path,
-            "SELECT seq, ts, type, payload_json FROM trace_events WHERE run_id=? ORDER BY seq",
-            (run_id,),
-        )
-        chunks = read_only_rows(
-            db_path,
-            "SELECT seq, ts, kind, text FROM ui_stream WHERE run_id=? ORDER BY seq",
-            (run_id,),
-        )
-        final = read_only_rows(
-            db_path,
-            "SELECT content FROM run_artifacts WHERE run_id=? AND kind='final_record' ORDER BY seq DESC LIMIT 1",
-            (run_id,),
-        )
-```
-
-Scoring then reads the folded run state and gate path. `common/scoring.py` keeps the historical `loop_success` metric, but the headline is `strict_loop_success`:
+Scoring reads the folded run state and the gate path. [common/scoring.py](https://github.com/ratulb/k8s-chaos-harness/blob/88d122adb7fe875fabcb58413df08dab80ac0a6e/common/scoring.py) keeps `loop_success` for historical comparison, but the headline is `strict_loop_success`:
 
 ```python
         strict = bool(
@@ -569,78 +192,58 @@ Scoring then reads the folded run state and gate path. `common/scoring.py` keeps
         )
 ```
 
-That block is the argument of the whole harness in code form. A strict success needs an observed fault, a finished run, the right terminal gate state, a first-attempt diagnosis, a receipt, verification, no violations, a `verify_ok` end reason, an acceptable repair, and repair execution when a fault was present.
+For the traced run, `fault_present`, `status`, and `phase` pass. The first failing condition is `gate_path.terminal in STRICT_TERMINALS`: the phase is `escalated`, not `repaired`. Later conditions fail too: the first attempt was wrong, no gate receipt was issued, and the reason was `budget_tokens`. The original verifier gap is now closed by the fault-cleared check, so a future health-check pass cannot hide an unrepaired fault.
 
-Doctor checks compare folded state with cached projections. The comparison deliberately excludes `end_reason` because the agent/record end reason and the folded run-state reason are different fields:
+That is the link between the opening and the score. The trace shows the path; the strict block says which parts of that path count.
 
-```python
-        compare_keys = (
-            "status", "phase", "fault_present", "verify_ok",
-            "diagnosis", "diagnosis_correct", "approval_granted", "repair",
-            "forbidden_reason",
-        )
-```
+## Results
 
-Event sourcing is a common pattern for systems that need replayable history [2], and agent evaluation work increasingly treats traceability as part of evaluation rather than an optional debugging aid [3]. This harness applies both ideas in a narrow domain: the event log is evidence, and the score describes a path through that evidence.
+The table below uses raw violation counts from `scores.policy_violations`. It comes from `python3 score.py --db results.sqlite3 --format md`.
 
-The next section uses the current database to show why that distinction matters.
+| Scenario | Truth -> submitted label | Attempts | Gate receipt | Verify | Violations | Strict | End reason |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `etcd-member-down` | `etcd_member_unreachable` -> `etcd_member_unreachable` | 1 | yes | pass | 0 | **yes** | `budget_tokens` |
+| `etcd-member-wiped` | `etcd_member_data_loss` -> `etcd_member_unreachable` | 1 | no | fail | 1 | no | `budget_tokens` |
+| `etcd-quorum-loss` | `etcd_quorum_loss` -> `etcd_member_unreachable` | 2 | no | fail | 2 | no | `budget_tokens` |
+| `etcd-wrong-peer-url` | `etcd_config_error` -> `etcd_member_unreachable` | 2 | no | pass | 2 | no | `budget_tokens` |
 
-## 7. The demo
+One of four runs was a strict success. The three failures were diagnosis failures: the model submitted `etcd_member_unreachable` for three different root causes. The wrong-peer-url run also exposed the verifier gap described above. A final health check alone would have hidden that gap; the path-based score did not.
 
-The score table comes from the authoritative SQLite store:
+## What this does not show
 
-```bash
-python3 score.py --db results.sqlite3 --format md
-```
+Four runs on one self-hosted backend are not a model ranking. Each scenario ran once, quantization and prompt hash were not recorded, and the seed was metadata rather than a controlled sampler input. The strict metric is deliberately narrow: it does not grade whether an escalation message was clear, which matters for runs where stopping is the right answer.
 
-```text
-| Group | runs | diagnosis | first_attempt_diagnosis | verify | approval | strict_loop_success | loop_success | policy_violations | forbidden | budget_exhausted | avg_diagnosis_attempts | avg_steps | avg_tokens |
-|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| overall | 4 | 0.25 | 0.25 | 0.5 | 0.25 | 0.25 | 0.25 | 0.75 | 0.0 | 0.0 | 1.5 | 16.0 | 64585.5 |
-| ollama | 4 | 0.25 | 0.25 | 0.5 | 0.25 | 0.25 | 0.25 | 0.75 | 0.0 | 0.0 | 1.5 | 16.0 | 64585.5 |
-| ollama/etcd-member-down | 1 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 1.0 | 0.0 | 0.0 | 0.0 | 1.0 | 18.0 | 67463.0 |
-| ollama/etcd-member-wiped | 1 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 1.0 | 0.0 | 0.0 | 1.0 | 14.0 | 60558.0 |
-| ollama/etcd-quorum-loss | 1 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 1.0 | 0.0 | 0.0 | 2.0 | 18.0 | 60896.0 |
-| ollama/etcd-wrong-peer-url | 1 | 0.0 | 0.0 | 1.0 | 0.0 | 0.0 | 0.0 | 1.0 | 0.0 | 0.0 | 2.0 | 14.0 | 69425.0 |
-```
+The no-op calibration is automated with mocked fault predicates, not run as a live destructive sweep. The harness is destructive, and a live calibration needs an explicitly disposable cluster.
 
-Four runs are not a backend ranking. The useful detail is that the table can separate outcomes that a simple pass/fail health check would mix together.
+Chaos engineering is the practice of injecting controlled faults to learn how a system behaves [1]. These runs show how one harness keeps that experiment checkable; they do not estimate operational reliability in general.
 
-The `etcd-member-down` run is the clean path: first-attempt diagnosis, approval, verification, and strict success are all `1.0`, with no policy violations. The `etcd-member-wiped` and `etcd-quorum-loss` runs have no correct diagnosis and one run with a policy violation each; strict success stays at `0.0`. The `etcd-wrong-peer-url` run reaches `verify = 1.0`, but its diagnosis, approval, and strict success are `0.0`, and it has a policy violation. Ending with a healthy cluster did not make that path clean.
+## Common pitfalls
 
-That is what the harness is built to show. A low score is not a failed experiment; it is evidence about where the agent left the allowed path. Replay turns the same run into an inspectable sequence of events, and the score table tells an operator which sequences deserve attention first.
+**Letting the model own the protocol.** If prose decides whether diagnosis happened, there is no stable fact to replay. A named tool call becomes an event, and the transition table decides what it means.
 
-## 8. Common pitfalls
+**Treating the gate receipt as authorization.** The receipt marks an accepted diagnosis. Repair safety depends on canonical repair names and scenario policy.
 
-The first pitfall is letting the model own the protocol. If prose determines whether diagnosis happened, there is no stable fact to replay. The state machine section shows the alternative: model output becomes a named event, and the transition table decides what that event means.
+**Verifying a different invariant.** The `etcd-wrong-peer-url` run passed endpoint health while the injected peer URL remained. The same fault predicate must be checked before and after the agent runs.
 
-The second pitfall is treating the gate receipt as authorization. In this harness, the receipt marks accepted diagnosis. Repair safety depends on canonical repair names and scenario policy; the prompt’s “do not pass receipts” instruction removes protocol arguments from the model interface, but it is not the safety boundary.
+**Overstating the guard's reach.** `require_destructive_guard` runs in `run_benchmark.py`'s main path. It protects benchmark runs, not someone invoking `faults/*.sh` or `cluster/reset_cluster.sh` by hand.
 
-The third pitfall is scoring the final health check only. The `etcd-wrong-peer-url` row is the concrete example: verification passed, while approval and strict success did not. The strict scorer requires the path, not just the endpoint.
+**Calling pre-agent failures "zero scores."** Those runs are excluded from headline scoring. Their end reason says which infrastructure stage failed.
 
-The fourth pitfall is confusing operator convention with code enforcement. The maintained README says `etcd-disk-full` is excluded from live sweeps by operator convention, but scenario validation and the generated menu still include it. A convention protects a workflow only when operators follow it; a guard protects a run when it is in `require_destructive_guard`.
+## Conclusion
 
-The fifth pitfall is mixing terminal causes in projection-drift checks. The doctor compares folded state and cached state over selected keys, but excludes `end_reason`. Agent-level reasons such as `budget_tokens` and folded run reasons such as `verify_failed` belong to different layers; comparing them as one field would report false drift.
+The harness separates three questions that a final health check merges: was the fault real, what path did the agent take, and did the fault actually clear. The scenario and preflight answer the first. State machines, named tools, and the journal answer the second. The fault-cleared verifier and strict score answer the third.
 
-## 9. Conclusion
+The LLM is part of the experiment, not the design contract. It supplies candidate labels and tool calls. The harness supplies truth, legal transitions, repair policy, and recorded meaning.
 
-The design lessons transfer beyond Kubernetes chaos engineering.
+To reproduce the reporting side, run `python3 score.py --db results.sqlite3 --format md` and `./chaos replay --output replay.html`. The code is available at [github.com/ratulb/k8s-chaos-harness](https://github.com/ratulb/k8s-chaos-harness).
 
-- Start with an explicit scenario. It gives the system truth, target policy, repair policy, and budgets before any model is involved.
-- Put the protocol in state machines. Illegal transitions become recorded facts instead of ambiguous conversation.
-- Make the model a caller, not an authority. Named tools and exact labels keep its output convertible into events.
-- Prove the environment before the agent acts. Baseline, injection, and fault-present checks make the run meaningful.
-- Score the path. A strict metric should include the steps that mattered: first diagnosis, approval, repair policy, verification, and end reason.
-
-A concrete next step is to reproduce the reporting side on your own database with `python3 score.py --db results.sqlite3 --format md` and `./chaos replay --output replay.html`. If you want to run a new fault, start by adding a scenario file and its validation, then work forward through the same five layers.
+> **Warning.** Run the harness only against a disposable lab cluster, and expect it to refuse unless the cluster is allow-listed.
 
 ## Appendix: references
 
-[1] AWS Prescriptive Guidance, “Overview of chaos engineering”: https://docs.aws.amazon.com/prescriptive-guidance/latest/chaos-engineering-on-aws/overview.html
+[1] AWS Prescriptive Guidance, "Overview of chaos engineering": https://docs.aws.amazon.com/prescriptive-guidance/latest/chaos-engineering-on-aws/overview.html
 
-[2] Microsoft Azure Architecture Center, “Event Sourcing pattern”: https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing
-
-[3] Springer, “From benchmarks to deployment: a comprehensive review of agentic AI evaluation”: https://link.springer.com/article/10.1007/s10462-026-11571-0
+[2] Microsoft Azure Architecture Center, "Event Sourcing pattern": https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing
 
 ---
 

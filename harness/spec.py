@@ -22,6 +22,7 @@ class ExperimentSpec:
     config_hash: str = ""
     scenario_version: int = 1
     topology_hash: str | None = None
+    verbose: bool = False
 
 
 @dataclass

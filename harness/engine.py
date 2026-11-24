@@ -37,6 +37,7 @@ def run_scenario(
     diagnosis_class: Any = Diagnosis,
     repair_class: Any = Repair,
     run_env: dict[str, str] | None = None,
+    verbose: bool = False,
 ) -> dict:
     temp: tempfile.TemporaryDirectory[str] | None = None
     if store is None:
@@ -63,6 +64,7 @@ def run_scenario(
             trace_dir=trace_dir,
             run_env=dict(run_env or {}),
             approve=approve,
+            verbose=verbose,
         )
         ctx = RunContext(
             run_id=run_id,

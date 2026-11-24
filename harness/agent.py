@@ -56,6 +56,7 @@ def run_scenario(
     pause_reporter: Any = None,
     resume_reporter: Any = None,
     run_env: dict[str, str] | None = None,
+    verbose: bool = False,
 ) -> dict:
     agent = Agent()
     return engine.run_scenario(
@@ -79,6 +80,7 @@ def run_scenario(
         pause_reporter=pause_reporter,
         resume_reporter=resume_reporter,
         run_env=run_env,
+        verbose=verbose,
         client_factory=agent.client_factory,
         tool_registry=agent.tool_registry,
         diagnosis_class=agent.diagnosis_class,
