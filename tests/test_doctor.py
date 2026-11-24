@@ -101,6 +101,29 @@ class TestDoctor(unittest.TestCase):
         self.assertIn("run-1:approval_granted", report["cache_projection_drift"])
         self.assertNotIn("run-1", report["runs_with_stale_state_cache"])
 
+    def test_agent_end_reason_is_not_cache_projection_drift(self) -> None:
+        self._seed_run()
+        store = SQLiteStore(self.db)
+        row = store.get_run("run-1")
+        folded = store.rebuild_state("run-1")
+        cache = {
+            key: folded.get(key)
+            for key in (
+                "status", "phase", "fault_present", "verify_ok",
+                "diagnosis", "diagnosis_correct", "approval_granted", "repair",
+                "forbidden_reason",
+            )
+        }
+        with store._connect() as conn:
+            conn.execute(
+                "UPDATE runs SET state_json=?, state_seq=?, end_reason='budget_tokens' WHERE run_id='run-1'",
+                (json.dumps(cache), row["seq"]),
+            )
+        store.close()
+        report = self._doctor()
+        self.assertNotIn("run-1:end_reason", report["cache_projection_drift"])
+        self.assertTrue(report["ok"], report["issues"])
+
     def test_unknown_mutating_tool_effect_is_reported(self) -> None:
         self._seed_run()
         store = SQLiteStore(self.db)

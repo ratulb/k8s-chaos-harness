@@ -1832,7 +1832,7 @@ class SQLiteStore:
         interrupted_incomplete: list[str] = []
         state_drift: list[str] = []
         compare_keys = (
-            "status", "phase", "end_reason", "fault_present", "verify_ok",
+            "status", "phase", "fault_present", "verify_ok",
             "diagnosis", "diagnosis_correct", "approval_granted", "repair",
             "forbidden_reason",
         )
