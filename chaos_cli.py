@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 from llm.client import LLMClient
 from llm.env import load_env
 from llm.registry import AUTO_BACKEND, backend_choices, resolve_backend
+from harness.reaper import abandon_run, reap_expired
 from llm.response import LLMOutcome
 from replay import write_replay as write_replay_file
 from storage import sqlite_store as store_tools
@@ -317,6 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     abort.add_argument("run_id")
     abort.add_argument("--yes", action="store_true")
     abort.add_argument("--no-kill", action="store_true")
+    abort.add_argument("--abandon", action="store_true")
 
     run = sub.add_parser("run")
     run.add_argument("--scenario", required=True)
@@ -359,6 +361,10 @@ def main(argv: list[str] | None = None) -> int:
     scenario_menu.add_argument("--output", default="menu.sh")
 
     args = ap.parse_args(argv)
+    try:
+        reaper_result = reap_expired(args.db)
+    except Exception as exc:
+        reaper_result = {"error": str(exc)}
 
     if args.command == "ping":
         return _ping(args.backend, args.message)
@@ -418,6 +424,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "abort":
+        if args.abandon:
+            if args.run_id == "all":
+                print("--abandon requires a run_id", file=sys.stderr)
+                return 2
+            try:
+                result = abandon_run(args.db, args.run_id)
+            except Exception as exc:
+                print(f"abandon failed: {exc}", file=sys.stderr)
+                return 1
+            _print_json(result)
+            return 0
         if args.run_id == "all" and not args.yes:
             try:
                 answer = input(f"Abort all active runs in {args.db}? [y/N] ").strip().lower()
@@ -550,6 +567,7 @@ def main(argv: list[str] | None = None) -> int:
         payload = {
             "database": args.db,
             "counts": store_tools.read_only_counts(args.db),
+            "reaper": reaper_result,
             "recent_runs": store_tools.read_only_rows(
                 args.db,
                 """SELECT run_id, scenario_id, backend, status, phase, end_reason,

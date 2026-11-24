@@ -288,6 +288,7 @@ class TestSQLiteStore(unittest.TestCase):
         RunRuntime("run-1", log=created.append).create()
         for event in created:
             self.store.add_event("run-1", event["type"], event)
+        self.store.update_run("run-1", status="pending", phase="queued")
 
         def write(worker: int) -> None:
             for index in range(25):

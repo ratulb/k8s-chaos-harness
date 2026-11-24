@@ -184,6 +184,31 @@ class TestChaosCli(unittest.TestCase):
             finally:
                 check.close()
 
+    def test_abandon_moves_interrupted_run_to_aborted(self) -> None:
+        from harness.reaper import reap_expired
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Path(tmp) / "results.sqlite3"
+            self._seed_run(db)
+            store = SQLiteStore(db)
+            with store._connect() as conn:
+                conn.execute(
+                    "UPDATE runs SET lease_expires_at=1.0 WHERE run_id='run-1'"
+                )
+            store.close()
+            reap_expired(str(db), now=2.0)
+            result = self._cli("--db", str(db), "abort", "run-1", "--abandon")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["status"], "aborted")
+            self.assertEqual(payload["end_reason"], "abandoned")
+            check = SQLiteStore(db)
+            try:
+                self.assertEqual(check.get_run("run-1")["status"], "aborted")
+                self.assertTrue(any(e["type"] == "run.abandon" for e in check.load_events("run-1")))
+            finally:
+                check.close()
+
     def test_abort_no_kill_refuses_live_pid(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Path(tmp) / "results.sqlite3"

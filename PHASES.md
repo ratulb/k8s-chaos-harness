@@ -293,7 +293,7 @@ or destructive validation.
 - [x] Append-only SQLite event log is authoritative; `state_json` and snapshots
       are rebuildable projections/caches
 - [x] One canonical scorer reads folded state and `GatePath`
-- [ ] Reaper, `--abandon`, and doctor checks covered by focused and full suites
+- [x] Reaper, `--abandon`, and doctor checks covered by focused and full suites
 - Deliverable: behavior owned by the three state machines with deterministic
   replay
 - Acceptance: `fold(events) == live_state` for every run; illegal transitions are

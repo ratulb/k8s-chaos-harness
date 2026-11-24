@@ -232,8 +232,12 @@ class RunRuntime:
     def abort(self, reason: str) -> None:
         self.emit(RunEvent.ABORT, {"reason": reason}, f"run:abort:{reason}")
 
-    def abandon(self) -> None:
-        self.emit(RunEvent.ABANDON, idempotency_key="run:abandon")
+    def abandon(self, actor: str = "operator") -> None:
+        self.emit(
+            RunEvent.ABANDON,
+            {"actor": actor, "reason": "abandoned"},
+            idempotency_key="run:abandon",
+        )
 
     def illegal_transition(self, machine: str, event: str, error: str) -> None:
         self.emit(
@@ -246,11 +250,18 @@ class RunRuntime:
         self,
         previous_state: RunPhase | None = None,
         lease_expires_at: float | None = None,
+        *,
+        reason: str = "lease_expired",
+        detected_by: str = "reaper",
     ) -> None:
-        payload: dict[str, Any] = {"lease_expires_at": lease_expires_at}
+        payload: dict[str, Any] = {
+            "lease_expires_at": lease_expires_at,
+            "reason": reason,
+            "detected_by": detected_by,
+        }
         if previous_state is not None:
             payload["previous_state"] = previous_state.value
-        key = f"run:lease-expired:{lease_expires_at}:{previous_state.value if previous_state else ''}"
+        key = f"reap:{self.run_id}:{previous_state.value if previous_state else ''}:{lease_expires_at}"
         self.emit(RunEvent.LEASE_EXPIRED, payload, key)
 
     def reap(
@@ -261,7 +272,7 @@ class RunRuntime:
         payload: dict[str, Any] = {"lease_expires_at": lease_expires_at}
         if previous_state is not None:
             payload["previous_state"] = previous_state.value
-        key = f"run:reap:{lease_expires_at}:{previous_state.value if previous_state else ''}"
+        key = f"reap:{self.run_id}:{previous_state.value if previous_state else ''}:{lease_expires_at}"
         self.emit(RunEvent.REAP, payload, key)
 
     def resume_action(self, unknown_effect: bool = False) -> RunCrashAction:

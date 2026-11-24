@@ -1754,6 +1754,8 @@ class SQLiteStore:
             for table in tables:
                 counts[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
             version = int(conn.execute("SELECT MAX(version) FROM schema_meta").fetchone()[0] or 0)
+            run_rows = [dict(row) for row in conn.execute("SELECT * FROM runs")]
+            row_by_id = {str(row["run_id"]): dict(row) for row in run_rows}
             missing_final = [
                 row["run_id"]
                 for row in conn.execute(
@@ -1765,9 +1767,37 @@ class SQLiteStore:
                        )"""
                 )
             ]
+            missing_score = [
+                row["run_id"]
+                for row in conn.execute(
+                    """SELECT r.run_id FROM runs r
+                       WHERE r.status='finished'
+                       AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.run_id=r.run_id)"""
+                )
+            ]
+            terminal_without_reason = [
+                row["run_id"] for row in run_rows
+                if row.get("status") in {"finished", "aborted", "skipped_unsupported"}
+                and not row.get("end_reason")
+            ]
+            now = time.time()
+            expired_live_owner = [
+                row["run_id"] for row in run_rows
+                if row.get("status") in {"pending", "running", "interrupted"}
+                and row.get("lease_expires_at") is not None
+                and float(row["lease_expires_at"]) <= now
+                and _pid_alive(row.get("pid"))
+            ]
             tool_run_ids = [
                 row["run_id"]
                 for row in conn.execute("SELECT DISTINCT run_id FROM tool_calls")
+            ]
+            unknown_tool_effects = [
+                f"{row['run_id']}:{row['call_id']}"
+                for row in conn.execute(
+                    """SELECT run_id, call_id FROM tool_calls
+                       WHERE mutating=1 AND (result_code='unknown_effect' OR phase='unknown_effect')"""
+                )
             ]
             seq_mismatch = [
                 row["run_id"]
@@ -1798,18 +1828,51 @@ class SQLiteStore:
             ]
         canonical_calls: dict[str, set[str]] = {}
         rejections: list[dict[str, Any]] = []
-        for run_id in {row["run_id"] for row in tool_rows} | set(event_run_ids):
+        duplicate_keys: list[str] = []
+        interrupted_incomplete: list[str] = []
+        state_drift: list[str] = []
+        compare_keys = (
+            "status", "phase", "end_reason", "fault_present", "verify_ok",
+            "diagnosis", "diagnosis_correct", "approval_granted", "repair",
+            "forbidden_reason",
+        )
+        for run_id in {row["run_id"] for row in run_rows} | set(event_run_ids):
             events = self.load_events(run_id)
             canonical_calls[run_id] = {
                 str((event.get("payload") or {}).get("call_id") or "")
                 for event in events
                 if event.get("type") == "tool.prepare"
             }
-            rejections.extend(
-                dict(event.get("payload") or {})
-                for event in events
-                if event.get("type") == "state_transition_rejected"
+            key_counts: dict[str, int] = {}
+            for event in events:
+                payload = event.get("payload") or {}
+                if event.get("type") == "state_transition_rejected":
+                    rejections.append(dict(payload))
+                key = str(payload.get("idempotency_key") or event.get("idempotency_key") or "")
+                if key:
+                    key_counts[key] = key_counts.get(key, 0) + 1
+            duplicate_keys.extend(
+                f"{run_id}:{key}" for key, count in key_counts.items() if count > 1
             )
+            row = row_by_id.get(str(run_id))
+            if row is None:
+                continue
+            state = self.rebuild_state(str(run_id))
+            if state.get("phase") == "interrupted" and (
+                not state.get("previous_state") or not state.get("end_reason")
+            ):
+                interrupted_incomplete.append(str(run_id))
+            cached = self._loads(row.get("state_json"), default={}) or {}
+            for key in compare_keys:
+                folded = state.get(key)
+                persisted = cached.get(key, row.get(key))
+                if folded is None and persisted in {None, 0, "", False}:
+                    continue
+                if isinstance(folded, bool) or isinstance(persisted, bool):
+                    if bool(folded) != bool(persisted):
+                        state_drift.append(f"{run_id}:{key}")
+                elif folded != persisted:
+                    state_drift.append(f"{run_id}:{key}")
         missing_canonical_tools = [
             f"{row['run_id']}:{row['call_id']}"
             for row in tool_rows
@@ -1824,8 +1887,16 @@ class SQLiteStore:
             issues.append(f"schema version {version} != {SCHEMA_VERSION}")
         if missing_final:
             issues.append(f"{len(missing_final)} finished runs missing final_record artifact")
+        if missing_score:
+            issues.append(f"{len(missing_score)} finished runs missing score row")
+        if terminal_without_reason:
+            issues.append(f"{len(terminal_without_reason)} terminal runs missing end_reason")
+        if expired_live_owner:
+            issues.append(f"{len(expired_live_owner)} expired runs still have a live owner")
         if unknown_calls:
             issues.append(f"{len(unknown_calls)} runs have in-flight tool calls")
+        if unknown_tool_effects:
+            issues.append(f"{len(unknown_tool_effects)} mutating tool calls have unknown_effect")
         if seq_mismatch:
             issues.append(f"{len(seq_mismatch)} runs have stale checkpoint seq markers")
         if stale_state_cache:
@@ -1834,16 +1905,31 @@ class SQLiteStore:
             issues.append(f"{len(missing_canonical_runs)} runs have no canonical run.create event")
         if missing_canonical_tools:
             issues.append(f"{len(missing_canonical_tools)} tool calls have no canonical tool.prepare event")
+        if rejections:
+            issues.append(f"{len(rejections)} state transition rejections")
+        if duplicate_keys:
+            issues.append(f"{len(duplicate_keys)} duplicate generated transition keys")
+        if interrupted_incomplete:
+            issues.append(f"{len(interrupted_incomplete)} interrupted runs lack previous_state or end_reason")
+        if state_drift:
+            issues.append(f"{len(state_drift)} cache/projection values disagree with folded state")
         return {
             "database": str(self.path),
             "schema_version": version,
             "counts": counts,
             "finished_runs_missing_final_record": missing_final,
+            "finished_runs_missing_score": missing_score,
+            "terminal_runs_missing_end_reason": terminal_without_reason,
+            "expired_runs_with_live_owner": expired_live_owner,
+            "finished_runs_with_unknown_tool_effect": unknown_tool_effects,
             "runs_with_in_flight_tool_calls": unknown_calls,
             "runs_with_stale_seq": seq_mismatch,
             "runs_with_stale_state_cache": stale_state_cache,
             "runs_without_run_create": missing_canonical_runs,
             "tool_calls_without_tool_prepare": missing_canonical_tools,
+            "duplicate_generated_transition_keys": duplicate_keys,
+            "interrupted_runs_incomplete": interrupted_incomplete,
+            "cache_projection_drift": state_drift,
             "state_transition_rejections": rejections,
             "issues": issues,
             "ok": not issues,
