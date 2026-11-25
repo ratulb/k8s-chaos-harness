@@ -1446,6 +1446,7 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | --- | --- |
 | `README.md` | Full operator guide: concepts, commands, configuration, safety, troubleshooting |
 | `docs/ARCHITECTURE.md` | Maintained description of the current system and roadmap |
+| `docs/call_flow.md` | End-to-end call flow from `chaos run` through setup, LLM loop, verification, and scoring |
 | `docs/STATE_MACHINE.md` | Generated state-machine reference; edit the generator or machine tables |
 | `scripts/README.md` | Helper-script details |
 

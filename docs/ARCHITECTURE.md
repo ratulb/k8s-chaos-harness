@@ -1,10 +1,11 @@
 # Architecture
 
 This file is the maintained description of the current system. `README.md` is the
-full operator guide. [STATE_MACHINE.md](STATE_MACHINE.md) is the generated state
-reference; edit its generator or the machine tables, not the Markdown file. Code
-is executable truth: if a document disagrees with the implementation, fix the
-document.
+full operator guide. [call_flow.md](call_flow.md) traces one run from the shell
+through setup, the LLM loop, verification, and scoring.
+[STATE_MACHINE.md](STATE_MACHINE.md) is the generated state reference; edit its
+generator or the machine tables, not the Markdown file. Code is executable truth:
+if a document disagrees with the implementation, fix the document.
 
 ## 1. What the harness is
 
