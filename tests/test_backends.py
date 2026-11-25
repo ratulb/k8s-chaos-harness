@@ -6,70 +6,48 @@ response shape without depending on the full benchmark harness.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from llm.env import load_env
 
-# Load .env before importing backend helpers so environment overrides apply.
 load_env()
 
 from llm.client import Backend, LLMClient
+from llm.registry import all_backends
 
 
 def configured_backends() -> list[Backend]:
-    """Build backend objects only for providers with credentials configured."""
-    backends: list[Backend] = []
+    return all_backends()
 
-    # Local Ollama (or a tunneled endpoint exposed as an Ollama-compatible URL).
-    if os.environ.get("OLLAMA_BASE_URL"):
-        backends.append(
-            Backend(
-                name="ollama",
-                base_url=os.environ["OLLAMA_BASE_URL"],
-                model=os.environ.get("OLLAMA_MODEL", "qwen3.8:27b"),
-                api_key=os.environ.get("OLLAMA_API_KEY", "ollama"),
-            )
-        )
 
-    # Groq uses an OpenAI-compatible /openai/v1 endpoint.
-    if os.environ.get("GROQ_API_KEY"):
-        backends.append(
-            Backend(
-                name="groq",
-                base_url="https://api.groq.com/openai/v1",
-                model=os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b"),
-                api_key=os.environ["GROQ_API_KEY"],
-            )
-        )
-
-    # OpenRouter uses a paid-compatible endpoint but free model names.
-    if os.environ.get("OPENROUTER_API_KEY"):
-        backends.append(
-            Backend(
-                name="openrouter",
-                base_url="https://openrouter.ai/api/v1",
-                model=os.environ.get("OPENROUTER_MODEL", "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"),
-                api_key=os.environ["OPENROUTER_API_KEY"],
-            )
-        )
-
-    # Cloudflare Workers AI needs both account id and auth token.
-    cf_account = os.environ.get("CLOUDFLARE_ACCOUNT_ID")
-    cf_token = os.environ.get("CLOUDFLARE_AUTH_TOKEN")
-    if cf_account and cf_token:
-        backends.append(
-            Backend(
-                name="cloudflare",
-                base_url=f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/v1",
-                model=os.environ.get("CLOUDFLARE_MODEL", "@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
-                api_key=cf_token,
-            )
-        )
-
-    return backends
+class TestBackendDiscovery(unittest.TestCase):
+    def test_custom_endpoints_are_included(self) -> None:
+        model = "hf.co/prism-ml/Ternary-Bonsai-2.5-27B-GGUF:Q2_0"
+        endpoints = [{
+            "name": "bonsai",
+            "base_url": "http://127.0.0.1:11436",
+            "model": model,
+            "priority": 5,
+        }]
+        env = {
+            "CHAOS_LLM_ENDPOINTS": json.dumps(endpoints),
+            "OLLAMA_BASE_URL": "",
+            "GROQ_API_KEY": "",
+            "OPENROUTER_API_KEY": "",
+            "CLOUDFLARE_ACCOUNT_ID": "",
+            "CLOUDFLARE_AUTH_TOKEN": "",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            backends = configured_backends()
+        matches = [backend for backend in backends if backend.name == "bonsai"]
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0].base_url, "http://127.0.0.1:11436")
+        self.assertEqual(matches[0].model, model)
 
 
 class TestBackends(unittest.TestCase):

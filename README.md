@@ -1449,6 +1449,7 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `docs/call_flow.md` | End-to-end call flow from `chaos run` through setup, LLM loop, verification, and scoring |
 | `docs/STATE_MACHINE.md` | Generated state-machine reference; edit the generator or machine tables |
 | `scripts/README.md` | Helper-script details |
+| `tunnel/README.md` | Remote Ollama tunnel and custom endpoint setup |
 
 Historical review artifacts remain in the repo root (`statemachine.md`,
 `state_machine_review.md`, and `new_feedback.md`) and are not maintained operator
