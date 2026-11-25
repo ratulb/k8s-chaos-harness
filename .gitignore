@@ -15,3 +15,4 @@ runs.jsonl
 traces/
 logs/
 replay.html
+outputs/
