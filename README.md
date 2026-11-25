@@ -1451,8 +1451,4 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | `scripts/README.md` | Helper-script details |
 | `tunnel/README.md` | Remote Ollama tunnel and custom endpoint setup |
 
-Historical review artifacts remain in the repo root (`statemachine.md`,
-`state_machine_review.md`, and `new_feedback.md`) and are not maintained operator
-documentation.
-
 </details>
