@@ -1,475 +1,438 @@
-# Call flow: from `chaos run` to a scored result
+# One run, end to end
 
-This document follows one benchmark run from the operator's shell to the stored
-result. It uses `etcd-wrong-peer-url` as the spine because that scenario exercises
-target selection, fault injection, diagnosis gating, blocked repairs, final
-verification, and scoring. The last scenario section shows which parts change for
-the other scenarios.
+This walkthrough follows one benchmark run from the command you type to the evidence you can inspect. It is for operators who need to know:
 
-The contract is narrow: the harness owns the cluster lifecycle, the model receives
-diagnostic and gated repair tools, and the truth label plus scoring inputs stay
-outside the prompt. `docs/ARCHITECTURE.md` states the same boundary at system
-level; this document follows the calls that enforce it.
+- what touched the disposable cluster,
+- what the model was allowed to see,
+- why the run stopped,
+- and how the score was decided.
 
-Read sections 1-4 for the machine-side path before the model speaks, sections 5-7
-for the request/response loop, sections 8-9 for the worked run and its conclusion,
-and sections 10-12 for scenario differences, failure paths, and inspection.
+> **Destructive benchmark.** `./chaos run`, reset scripts, fault scripts, state discard, and cluster nuke can break or erase a cluster. Use a disposable lab cluster only. Read the safety rules in [`README.md`](../README.md) before running anything.
 
-## 1. Call order
+This document is a walkthrough, not the full reference:
 
-The call order is linear until the agent loop starts. After setup, the same LLM
-call repeats with a growing message list until the gate, verification, budget, or
-an error ends the loop.
+- [`README.md`](../README.md) owns commands, configuration, safety, and current status.
+- [`ARCHITECTURE.md`](ARCHITECTURE.md) explains the parts of the system and why they exist.
+- [`STATE_MACHINE.md`](STATE_MACHINE.md) is the generated reference for exact states and transitions.
 
-```text
-operator shell
-  -> ./chaos run --scenario <id> --backend <name>
-     -> chaos_cli.main                     parse flags, load .env, launch child
-        -> run_benchmark.main              composition root
-           -> scenario load + validation
-           -> topology discover + freeze
-           -> capability check + target resolve + destructive guard
-           -> RunRuntime: lease -> reset -> baseline -> inject -> fault check
-           -> AgentLoop: messages + tool schemas -> LLM -> tool calls -> gate
-           -> Verification: health + fault-cleared
-           -> finish_run: record, gate path, score
-           -> derived exports: JSONL, traces, replay
-```
+The central rule is simple: the harness owns the cluster lifecycle, the model receives read-only investigation tools and gated repair tools, and the hidden truth plus scoring policy stay outside the prompt.
 
-The wrapper is four lines that call `chaos_cli.main()` (`chaos:1-10`). The `run`
-parser defines flags at `chaos_cli.py:337-352`, and the `run` branch launches
-`run_benchmark.py` as a child process in the foreground or detached
-(`chaos_cli.py:387-441`). The child's `main()` is at `run_benchmark.py:444-760`.
+The values in this guide describe behavior, not a recorded result. Use the inspection commands at the end to learn what happened in your run.
+
+## 1. Words used in this guide
+
+| Word | Meaning here |
+| --- | --- |
+| Harness | The code that resets the cluster, injects the fault, runs the model, verifies the result, and stores evidence. |
+| Scenario | A JSON file that defines the hidden fault, target rules, acceptable repairs, forbidden repairs, budgets, and verification commands. |
+| Truth label | The scenario's hidden root cause. It is stored for scoring and never shown to the model. |
+| Topology hash | A fingerprint of the discovered control-plane nodes, etcd members, member count, and probe node. It identifies the cluster layout, not its health. |
+| Destructive guard | The preflight check that refuses a live run unless the current cluster context or cluster ID is explicitly allow-listed. |
+| Probe node | The node from which the harness queries etcd for health, membership, and fault checks. |
+| Fault-present check | A harness-side predicate that proves the injected fault really happened before the model is called. |
+| Fault-cleared check | A harness-side predicate that asks whether that same fault is gone after the agent loop. |
+| Gate | The internal decision path that records diagnosis correctness, authorization, repair proposals, and violations. |
+| Receipt | A derived marker showing that the gate accepted a diagnosis and authorized repair. It is not supplied to the model as a tool argument. |
+| Approve mode | The operator-facing `--approve` setting. `policy` authorizes internally; `prompt` asks the operator to confirm. It does not change the system prompt. |
+| Nudge | A user message from the harness telling the model to submit a diagnosis or that time is running short. |
+| Budget | The step and token limits that stop a run that does not reach a clean outcome. |
+| Fold | Replaying stored events to rebuild state. Events are authoritative; folded state is the result. |
+| Projection | A stored view rebuilt from events, such as a run row, score row, or `state_json` cache. |
+| Machine phase | The internal state-machine name. Persisted run phases use `status:phase`, for example `running:baseline`. |
+| Escalation | Two related ideas: an instruction telling the model to stop repairing and report the limit, or the terminal gate state `escalated` meaning repair is no longer authorized. |
+| Strict loop success | The headline score. It requires a clean path, not merely a healthy cluster at the end. |
+
+## 2. Lifecycle at a glance
 
 ```mermaid
 sequenceDiagram
     participant Op as Operator
-    participant CLI as chaos_cli.py
+    participant CLI as ./chaos
     participant Run as run_benchmark.py
-    participant Cluster as Kubernetes cluster
+    participant Guard as Topology + guard
+    participant Cluster as Disposable cluster
     participant LLM as LLM backend
-    participant Gate as Gate + tool runtime
+    participant Check as Diagnosis + repair checks
     participant DB as results.sqlite3
 
     Op->>CLI: ./chaos run ...
     CLI->>Run: launch child with CHECKPOINT_DB
+    Run->>Guard: load scenario, discover topology
+    Guard-->>Run: guard permit, frozen topology, targets
     Run->>DB: create and lease run
-    Run->>Cluster: reset, baseline, inject, wait for fault
-    Run->>DB: append setup events and artifacts
-    loop until terminal phase or budget exhaustion
-        Run->>LLM: full message list + tool schemas
-        LLM-->>Run: content and/or tool_calls
-        Run->>Gate: execute requested tool
-        Gate-->>Run: result, denial, or receipt
-        Run->>DB: append assistant/tool messages and state snapshots
+    Run->>Cluster: reset, baseline, inject, confirm fault
+    Run->>DB: append setup evidence
+    loop until gate, budget, or error stops the loop
+        Run->>LLM: messages + tool schemas
+        LLM-->>Run: answer and/or tool calls
+        Run->>Check: evaluate diagnosis or tool call
+        Check-->>Run: evidence, blocked repair, or gate opened
+        Run->>DB: append messages, events, state
     end
-    Run->>Cluster: verify health + fault cleared
-    Run->>DB: finish run, fold state, store score
+    Run->>Cluster: verify health and fault cleared
+    Run->>DB: finish, fold state, score
+    Run-->>Op: status, trace, replay
 ```
 
-The next section covers the first two hops: environment loading and launch mode.
+The model loop ends before verification. Verification is a separate harness step, so a model claim never decides whether the cluster is healthy.
 
-## 2. Shell entry and launch
+A run can stop in four broad ways:
 
-`.env` is loaded before parsing. `load_env()` reads `KEY=VALUE` pairs from the
-current directory's `.env` and applies them with `os.environ.setdefault`, so
-explicit environment variables keep precedence (`llm/env.py:9-20`, called at
-`chaos_cli.py:32`). The child loads it again (`run_benchmark.py:15-16`).
+| Stop kind | Plain meaning |
+| --- | --- |
+| Clean repair | The diagnosis and repair path completed. Verification still decides whether the run passes. |
+| Healthy control | The model correctly identifies `no_fault`; no repair should be attempted. |
+| Escalation or budget | The diagnosis was wrong twice, the gate escalated, or step/token limits ended the attempt. |
+| Provider or run error | No usable LLM response, or the setup/verification path failed. |
 
-The `run` subcommand requires `--scenario` and `--backend`. It accepts `--mode`,
-`--approve`, `--runs`, `--seed`, `--detach`, `--ui`, `--logs-dir`, resume flags,
-`--discard-stale`, and `--verbose` (`chaos_cli.py:337-352`). `--approve` chooses
-`policy` or `prompt`; it changes prompt and reporting context, not the reset,
-baseline, or injection lifecycle (`docs/ARCHITECTURE.md`, sections 2 and 5).
+## 3. Before the model speaks
 
-In the foreground path, `subprocess.call` waits for the child. With `--detach`,
-`Popen` starts it and prints launch metadata; the child writes to
-`logs/<launch_id>.log` (`chaos_cli.py:423-440`). Either way the child receives
-`CHECKPOINT_DB`, defaulting to `results.sqlite3` (`chaos_cli.py:296,421`).
+The model is not called until the harness has already changed the cluster and proved that the intended fault is present. This is the most important boundary in the system.
 
-The child checks that at least one configured LLM backend is healthy before it
-allows a run to start (`run_benchmark.py:652-654`). A healthy backend is a
-prerequisite, not permission to touch a cluster. Permission comes from the
-preflight described next.
+### Start a run
 
-## 3. Preflight: scenario, topology, guard, target
-
-Scenario loading goes through `load_scenario_object()`
-(`tools/scenario_schema.py:36-42`) and `Scenario.from_file()`
-(`tools/scenario.py:70-77`). The schema validation in `Scenario.validate()`
-covers field types, selector requirements, repair names, and budgets
-(`tools/scenario.py:201-315`); the runner revalidates the object after loading
-(`run_benchmark.py:485-491`).
-
-Topology discovery accepts a fixture JSON when `CHAOS_TOPOLOGY_JSON` is set and
-otherwise reads the live cluster (`tools/topology.py:518-528`). All sources pass
-through `_assemble()`, which computes `topology_hash` from control planes,
-workers, probe node, and quorum data (`tools/topology.py:288-349`). The runner
-freezes that topology so later calls see one consistent view
-(`tools/topology.py:531-539`, `run_benchmark.py:497`). Capability checks and
-target resolution follow at `run_benchmark.py:498-504`.
-
-`target_nodes: ["second"]` means the second **non-local** control-plane node.
-`local_node_names()` derives local identities from `CHAOS_LOCAL_NODE`, hostname,
-DNS, and local addresses (`tools/topology.py:556-591`). `resolve_targets()`
-removes local names before applying the ordinal
-(`tools/topology.py:610-629`), and a direct node selector that resolves to the
-harness host is rejected (`tools/topology.py:630-633`). The resolved names are
-exported as `TARGET_NODE` and `TARGET_NODES` for inject commands
-(`run_benchmark.py:579-584`).
-
-The destructive guard is called unconditionally at `run_benchmark.py:496`. It
-requires permission through allow-listed cluster contexts or IDs
-(`CHAOS_ALLOWED_CLUSTER_CONTEXTS`, `CHAOS_ALLOWED_CLUSTER_IDS`) and, when set,
-requires the discovered topology hash to match `CHAOS_ALLOWED_TOPOLOGY_HASHES`
-(`tools/safety.py:29-64`). Fixture topologies additionally require
-`CHAOS_ALLOW_FIXTURE_RUNS=1` (`run_benchmark.py:513-518`).
-
-Fetch the hash from the live topology immediately before a destructive run:
+Use a disposable cluster and fetch guard values from the live cluster immediately before the run:
 
 ```bash
-python3 tools/topology.py hash
+export CHAOS_CLUSTER_ID="$(kubectl config current-context)"
+export CHAOS_ALLOWED_CLUSTER_IDS="$CHAOS_CLUSTER_ID"
+export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(python3 tools/topology.py hash)"
+
+./chaos run --scenario etcd-wrong-peer-url --backend ollama --runs 1 --verbose
+```
+
+Replace `ollama` with your configured backend name. The alternative hash command is:
+
+```bash
 ./chaos target show --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["topology"]["topology_hash"])'
 ```
 
-The hash source and the reason stale values fail are documented at
-`README.md:513-517`. Restores and membership changes can change the hash, so a
-hash copied from an earlier run is not a guard value for the next run.
+A hash from an earlier run is not a guard value for the next run. Restores and membership changes can change it. The topology hash is built from control-plane name/IP pairs, etcd member id/name/node/peer URL records, member count, and the probe node. Health, noisy events, and transient faults are excluded.
 
-Once preflight passes, the runner changes the cluster before the model is called.
+### What preflight does
 
-## 4. Setup before the first LLM request
+1. The scenario is loaded and validated. Invalid scenario files stop before topology discovery.
+2. Topology is discovered from the live cluster, or from a fixture only when `CHAOS_TOPOLOGY_JSON` and `CHAOS_ALLOW_FIXTURE_RUNS=1` are set for offline tests.
+3. The destructive guard checks the current cluster context or cluster ID, and the topology hash if an allow-list is configured.
+4. The topology is frozen so later checks and prompts use one consistent view.
+5. Capability checks and target resolution decide which nodes may be affected.
+6. `target_nodes: ["second"]` means the second **non-local** control-plane node. A direct selector that points at the harness host is rejected.
 
-`_run_fresh()` owns reset, baseline, injection, and fault observation
-(`run_benchmark.py:159-302`). The run is leased first, then the run machine moves
-through `resetting`, `baselining`, `injecting`, and `fault_check`
-(`harness/machines/run.py:21-33`, `run_benchmark.py:181-244`).
+If any preflight check fails, no fault is injected and the run exits before touching the cluster.
 
-The default reset command is `cluster/restore_clean_state.sh`
-(`run_benchmark.py:456`). The runner records `reset_output_full` and a `reset`
-event, then runs the scenario's `verify` command to establish a baseline
-(`run_benchmark.py:190-201`). It executes the scenario's `inject` command with
-resolved targets, stores `injection_output_full`, and emits an `inject` event
-(`run_benchmark.py:214-219`). Finally, `fault_checks.wait_for_fault()` polls the
-scenario's fault predicate until it is present or its timeout expires
-(`run_benchmark.py:230-244`, `tools/fault_checks.py:221-239`).
+### What setup does
 
-`AgentLoop.run()` replays those lifecycle outcomes into the run state machine:
-`create`, `lease`, `begin_reset`, `reset_ok`, `baseline_ok`, `inject_ok`, and
-`fault_observed` (`harness/loop.py:76-95`). The agent does not redo cluster
-actions; it starts after the state machine records that the fault is present.
+After preflight, the runner leases the run and performs four harness-owned steps:
 
-Setup output is written to the trace as a truncated `setup` event and to the
-artifact store as `setup_output_full` (`harness/loop.py:141-155`). It is not an
-LLM message. The initial message list contains only the rendered system prompt
-and one user instruction (`harness/loop.py:96-104`). The model therefore starts
-with a faulty cluster it has not been told how to reach.
+| Step | What happens | Evidence left behind |
+| --- | --- | --- |
+| Reset | Restore the disposable cluster to a clean baseline. | Reset event and `reset_output_full`. |
+| Baseline | Run the scenario's verify command to prove the cluster is healthy before injection. | Setup event and baseline result. |
+| Inject | Run the scenario's fault command with resolved targets. | Injection event and `injection_output_full`. |
+| Fault check | Poll the harness-side fault predicate until it is present or times out. | Fault observation event and artifact. |
 
-The next section details the exact contents of that first request and every
-request after it.
+The model never performs these steps. It starts with a broken cluster it has not been told how to reach.
 
-## 5. What is passed to the LLM
+## 4. What the model is given
 
-For a fresh run, the harness builds two messages and persists both
-(`harness/loop.py:98-104`):
+A fresh run starts with exactly two messages:
 
-1. A `system` message from `SystemPrompt.render()`.
-2. A `user` message with the exact text `Investigate the Kubernetes cluster for
-   an etcd fault. Diagnose and repair if needed.`
+1. A system message rendered from the prompt template.
+2. A user message with the text: `Investigate the Kubernetes cluster for an etcd fault. Diagnose and repair if needed.`
 
-For a resumed run, the harness loads persisted messages from SQLite instead of
-rebuilding them (`harness/loop.py:96`). Assistant and tool messages from earlier
-turns are part of the next request, so the conversation is continuous across
-turns and resumes.
+A resumed run loads persisted messages from SQLite instead of rebuilding them. Earlier assistant, tool, and nudge messages continue the same conversation.
 
-The system prompt is rendered from `harness/prompt.py:43-61`. It includes the
-count and exact names of control-plane nodes, the default probe node, the rule to
-submit a diagnosis before repairs, the six allowed root-cause labels, the
-two-attempt diagnosis cap, and generic mapping hints such as "A wrong peer URL is
-etcd_config_error" (`harness/prompt.py:49-58`). The quorum sentence is generated
-from the frozen topology (`harness/prompt.py:34-41`). Section A.1 reproduces the
-prompt template.
-
-Every request also includes the tool schemas from `registry.schemas()`
-(`harness/loop.py:166-173`). Those schemas are generated from the tool registry
-in `tools/tool.py:197-245`; Appendix A.2 lists them. All tools are advertised,
-including destructive ones that the gate will later refuse. Advertising a tool
-is not the same as authorizing it.
-
-The request call passes the full message list, the tool schemas, `temperature=0.2`,
-`max_tokens=2048`, and an optional streaming callback (`harness/loop.py:168-172`).
-`LLMClient.chat` resolves the requested backend and fallback chain; the response
-records the backend actually used, fallback, attempts, and skipped backends
-(`llm/response.py:71-95`).
+Every request includes the tool schemas. The schemas advertise all tools, including repair tools that the gate may later refuse. Advertising a tool is not the same as authorizing it.
 
 | Visible to the model | Kept outside the prompt |
 | --- | --- |
 | Control-plane node names and default probe node | Scenario id and `root_cause` truth |
 | Quorum sentence derived from frozen topology | Reset, baseline, inject, and verify commands |
 | Six allowed diagnosis labels and generic cue mappings | Fault-present and fault-cleared predicates |
-| One user instruction | Setup output and all earlier cluster command output |
-| Tool names, parameters, and descriptions | Scenario acceptable/forbidden repair lists |
-| Prior assistant, tool, and nudge messages | Gate phase, receipt, budget counters, and score formula |
+| One user instruction | Setup output and full untruncated command payloads |
+| Tool names, parameters, and descriptions | Scenario acceptable and forbidden repair lists |
+| Prior assistant messages, nudge messages, and truncated diagnostic tool output | Live gate phase, receipt, budget counters, and score formula |
 
-The split is deliberate. The model gets a narrow taxonomy and live read-only
-tools; the harness keeps the answer and the policy. After the response returns,
-the harness turns it into messages and tool executions.
+The prompt mentions the gate concept, the two-attempt diagnosis cap, and the four-turn investigation guideline. It does not expose the live gate state, receipts, counters, hidden truth, or scoring formula.
 
-## 6. What the model returns and what the harness does with it
+Setup output is stored as evidence but is not an LLM message. Diagnostic tool output is truncated in the conversation and stored in full as an artifact.
 
-`LLMOutcome.invoke()` wraps `client.chat()` and converts exceptions into a failed
-outcome (`llm/response.py:105-132`). `LLMResponse.from_value()` keeps the first
-choice's message, usage numbers, finish reason, and provider provenance; the raw
-provider response is archived as `llm_response_full` when the response is
-committed (`llm/response.py:36-62,71-95`).
+## 5. The agent loop, in plain terms
 
-The loop appends only `response.primary` to the conversation and adds
-`usage.total_tokens` to the budget (`harness/loop.py:179-189`). A `Message` keeps
-`role`, `content`, `tool_calls`, and `tool_call_id` (`harness/message.py:11-17,86-100`).
-Raw provider fields stay in the artifact, not in the next request.
+Each turn sends the full conversation and tool schemas to the configured LLM backend. The harness appends the assistant response, executes requested tools, records the result, and repeats until a stop condition is reached.
 
-If the assistant message has no tool calls and no diagnosis has been submitted,
-the harness appends a user nudge telling it to call `submit_diagnosis`
-(`harness/loop.py:192-201`). If the diagnosis has already been submitted and the
-assistant stops calling tools, the loop ends (`harness/loop.py:203-205`).
+Fixed call settings are `temperature=0.2` and `max_tokens=2048` so runs stay comparable. Backend identity is separate from backend provenance: the run row records the configured chain, while LLM request records show which backend actually answered and which candidates were skipped.
 
-For each tool call, the harness looks up the tool, builds a `Call`, and invokes
-it (`harness/loop.py:207-218`). The tool result is appended as a `tool` message.
-The conversation copy is truncated to 4,000 characters
-(`harness/call.py:132-143`, `harness/message.py:79-83`), while diagnostic tools
-also write `tool_output_full` with the untruncated result
-(`harness/call.py:136-143`). Approval-like strings and tokens are redacted in
-stored payloads (`harness/message.py:18-52`).
+### What the model can do
 
-The next section explains what stops this loop and how the diagnosis and repair
-gates evaluate tool calls.
+- Call read-only investigation tools at any time.
+- Submit one diagnosis label, with at most two attempts.
+- Propose a repair only after diagnosis has been accepted.
+- Stop and escalate when a repair is blocked or fails.
 
-## 7. The loop, budgets, and gates
+`submit_diagnosis` advertises six labels. Runtime normalization accepts exact lowercase labels, substring matches, underscore-to-space forms, and aliases such as `no fault`, `cluster healthy`, and `healthy`. The stored diagnosis is normalized to the enum label.
 
-The conversation is multi-turn. Its condition is
-`while not budget.exhausted and not run.terminal` (`harness/loop.py:161`). Each
-turn increments the step count, sends the full message list, and processes every
-tool call in the assistant response (`harness/budget.py:33-37`, `harness/loop.py:162-218`).
-Token exhaustion uses the provider's reported total tokens
-(`harness/budget.py:36-44`).
+### Gate decisions
 
-`submit_diagnosis` accepts one exact label from the six-value enum and allows at
-most two attempts (`tools/tool.py:225-227`). The gate transitions are:
-
-- A correct, allowed diagnosis opens the gate internally (`approved`), or clears
-  a healthy control (`no_fault_cleared`).
-- A wrong diagnosis below the cap leaves the gate waiting; a wrong second attempt
-  escalates with `diagnosis_attempts_exhausted`.
-- A repair proposed before approval is recorded as a `premature_repair` violation.
-- A successful allowed repair moves the gate to `repaired`.
-- Escalation, budget exhaustion, abort, or unknown mutating effect ends at
-  `escalated`.
-
-These transitions live in `harness/machines/gate.py:300-487`; terminal gate
-phases are `repaired`, `no_fault_cleared`, and `escalated`
-(`harness/machines/gate.py:89-95`). Diagnosis nudges are capped at two
-(`harness/machines/gate.py:20-22`), and the loop adds a deadline nudge when the
-step count reaches `diagnosis_deadline_steps` without a submission
-(`harness/budget.py:46-48`, `harness/loop.py:220-226`).
-
-Repair tools are visible in the schemas but checked at invocation. The policy
-returns `BLOCKED` when the gate is not open, no fault was detected, the repair is
-forbidden for the scenario, or the repair is not in the acceptable set
-(`harness/tooling.py:291-305`). The returned message tells the model to stop
-attempting repairs and escalate (`harness/tooling.py:314`,
-`harness/prompt.py:10-13`). Violations are recorded in the event log and folded
-into the gate path.
-
-When the loop ends, `end_reason` starts as `submitted` or `agent_stopped`, then
-may become a provider error, budget reason, or run reason
-(`harness/loop.py:107-109,228-238`). `run.agent_done()` records the gate phase as
-`gate_terminal` and the agent reason as `gate_reason`
-(`harness/loop.py:236-238`, `harness/run_runtime.py:213-219`). The run machine
-then leaves `agent_running` for `verifying` on `AGENT_DONE`
-(`harness/machines/run.py:256-263,405-409`).
-
-The worked walkthrough now shows these mechanics in one concrete run.
-
-## 8. Worked run: `etcd-wrong-peer-url`
-
-The scenario declares truth `etcd_config_error`, targets `second`, avoids the
-local host, allows `restart_member` and `member_remove_readd`, and forbids
-`full_cluster_reset` (`scenarios/etcd-wrong-peer-url.json:2-7`). Its inject
-command is `faults/etcd_wrong_peer_url.sh $TARGET_NODE` and its verify command is
-`cluster/verify_etcd_healthy.sh` (`scenarios/etcd-wrong-peer-url.json:8-9`). The
-timeout is 300 seconds, the fault-present timeout is 60 seconds, and the budgets
-are 40 steps and 60,000 tokens (`scenarios/etcd-wrong-peer-url.json:10-13`).
-
-An operator can start a foreground run like this, with guard values fetched for
-the current cluster:
-
-```bash
-export CHAOS_CLUSTER_ID="$(kubectl config current-context)"
-export CHAOS_ALLOWED_CLUSTER_IDS="$CHAOS_CLUSTER_ID"
-export CHAOS_ALLOWED_TOPOLOGY_HASHES="$(python3 tools/topology.py hash)"
-./chaos run --scenario etcd-wrong-peer-url --backend groq --runs 1 --verbose
-```
-
-The runner resolves `second` to the second non-local control-plane node. In the
-observed run, that member's registered peer URL was
-`https://10.2.0.4:2399`. The fault script changes the peer URL and restarts the
-member (`faults/etcd_wrong_peer_url.sh:54-59`); the fault-present predicate looks
-for `:2399` in the member list obtained from the probe node
-(`tools/fault_checks.py:79-112,188-194`). The fault-cleared predicate is the same
-test negated (`tools/fault_checks.py:204-218`).
-
-The first message sent to the model is the system prompt plus the single user
-instruction. The prompt says that a wrong peer URL maps to `etcd_config_error`
-(`harness/prompt.py:57`), but it does not say that this run has a wrong peer URL.
-In the observed run, the first decisive tool output came from
-`etcdctl_member_list` and showed the `2399` peer URL. The model nevertheless
-submitted `etcd_member_unreachable`, so the gate did not open and repairs were
-blocked.
-
-The observed run id was `etcd-wrong-peer-url-groq-0-90acc1a1`. Its recorded truth
-was `etcd_config_error`, its diagnosis was `etcd_member_unreachable`, and its
-verification reported that the registered peer URL was still
-`https://10.2.0.4:2399` with `verify_ok=false`. The event log carries the full
-sequence of prompts, tool calls, gate decisions, and verification output; the
-run row is a projection of that sequence.
-
-This run shows three separate signals. The fault was injected and observed, so
-setup succeeded. The model gathered decisive evidence but produced the wrong
-label. Verification then measured the cluster as it stood, independent of what
-the model claimed. Section 9 explains how those signals become a stored result.
-
-## 9. How a run concludes
-
-Verification runs after the loop, not inside it. `Verification.run()` executes
-`spec.verify_cmd` and then the scenario's fault-cleared predicate
-(`harness/verification.py:20-54`). It writes `verify_output_full`, a
-`fault_cleared` artifact, and a `verify` trace event (`harness/verification.py:60-72`).
-The loop calls `run.verified()` or `run.verification_failed()` based on the
-combined result (`harness/loop.py:243-252`).
-
-The run machine moves `VERIFYING -> FINISHED` with `end_reason` of `verify_ok` or
-`verify_failed` in its folded state (`harness/machines/run.py:420-435`). The
-record emitted by the loop also carries the agent-side `end_reason`
-(`harness/loop.py:254-279`), and `finish_run()` stores that value in the run
-row's `end_reason` column (`harness/loop.py:289-292`,
-`storage/sqlite_store.py:1464-1488`). The two values answer different questions:
-the folded run state records the verification outcome, while the row column
-records why the agent loop stopped.
-
-Scoring folds the event log again. `Score.from_record()` reads the run snapshot
-and `gate_path` artifact rather than trusting the row's `end_reason`
-(`common/scoring.py:37-69,106-118`). Strict loop success requires fault present,
-finished status and phase, gate terminal `repaired` or `no_fault_cleared`, an
-approval path, first-attempt-correct diagnosis, receipt issued, `verify_ok`, no
-policy violations, `end_reason=verify_ok` in the folded run state, no budget or
-exclusion reason, and an acceptable repair or no-fault run
-(`common/scoring.py:141-157`). That is why `verify_ok` alone is not a strict pass.
-
-SQLite holds the durable evidence. Trace events, messages, tool calls, LLM
-requests, and artifacts are append-only sources of truth; `runs.state_json` is a
-cache rebuilt by folding those events (`storage/sqlite_store.py:1-6,1298-1348`).
-`finish_run()` writes the final record, gate path, state snapshot, and score
-projection (`storage/sqlite_store.py:1464-1538`). JSONL exports, per-run traces,
-replay HTML, and score reports are derived from that database
-(`run_benchmark.py:293-301`, `score.py:45-87`, `replay.py:220-228`).
-
-The next section changes one input at a time: the scenario.
-
-## 10. How another scenario changes the flow
-
-The setup, message construction, loop, verification, and scoring calls stay the
-same. Scenarios differ in truth label, target selector, inject command, fault
-predicate, repair policy, and budgets. Fault-present and fault-cleared checks are
-Python predicates in `tools/fault_checks.py`, not fields in the scenario JSON.
-
-| Scenario | Truth and target | Fault predicate | Repairs allowed / forbidden | Flow difference |
-| --- | --- | --- | --- | --- |
-| `control-healthy-noisy` | `no_fault`, no target | No stimulus; present is always true (`tools/fault_checks.py:177-178`) | None / all three | No injection effect to find; a correct diagnosis clears the gate without a repair |
-| `etcd-member-down` | `etcd_member_unreachable`, second non-local | Target pod not ready (`tools/fault_checks.py:57-62,182-185`) | `restart_member` / `full_cluster_reset` | Pod status and logs are the decisive evidence; only a restart is acceptable |
-| `etcd-member-wiped` | `etcd_member_data_loss`, second non-local | Pod down plus missing DB or manifest version (`tools/fault_checks.py:134-151,195-196`) | `member_remove_readd` / `full_cluster_reset` | Destructive data loss; a plain restart cannot restore the member |
-| `etcd-quorum-loss` | `etcd_quorum_loss`, quorum-losing set | Ready etcd pods below quorum (`tools/fault_checks.py:154-164,197-198`) | `restart_member`, `full_cluster_reset` / none | Multiple targets, `min_etcd_members: 2`, impact class `quorum_loss`; full reset is allowed |
-| `etcd-wrong-peer-url` | `etcd_config_error`, second non-local | Registered peer URL contains `:2399` (`tools/fault_checks.py:79-112,188-194`) | `restart_member`, `member_remove_readd` / `full_cluster_reset` | A registry config error; member list is the decisive evidence |
-| `etcd-disk-full` | `etcd_disk_exhaustion`, second non-local | Filler marker or disk use at least 95% (`tools/fault_checks.py:115-131,186-187`) | `restart_member`, `member_remove_readd` / `full_cluster_reset` | Same repair policy as wrong-peer-url, different predicate and 15-second fault timeout; excluded from live runs here |
-
-All six use `cluster/verify_etcd_healthy.sh` as the health verify command. The
-distinguishing verification signal is the scenario-specific fault-cleared
-predicate appended to that output (`harness/verification.py:43-48`). Budgets are
-40 steps and 60,000 tokens across these scenarios.
-
-The scenario's `menu` fields only drive selection display; they do not change the
-agent loop. `impact_class`, `risk`, and `min_etcd_members` inform capability and
-operator-facing behavior (`tools/scenario.py:201-315`). The excluded live
-scenario is a risk decision, not a different code path.
-
-Failure paths are collected in the next section so they can be compared without
-repeating the normal flow.
-
-## 11. Failure paths and operating notes
-
-| Where it stops | Trigger and result |
+| Situation | What the gate does |
 | --- | --- |
-| CLI/child startup | Backend configuration error exits with code 2 (`chaos_cli.py:291-294`, `run_benchmark.py:446-449`). No healthy LLM chain exits with code 1 (`run_benchmark.py:652-654`). |
-| Scenario load | Invalid JSON or schema exits 2 before topology discovery (`run_benchmark.py:485-491`). |
-| Preflight | Guard, freeze, capability, target, or target-name failure prints `Topology preflight failed` and exits 2 (`run_benchmark.py:494-511`, `tools/safety.py:51-63`). Fixture topology without opt-in also exits 2 (`run_benchmark.py:513-518`). |
-| Resume | Changed active topology or mismatched row topology exits 1 (`run_benchmark.py:520-527,678-685`). Unsafe resume state is aborted and retried (`run_benchmark.py:403-441,689-710`). |
-| Stale state | A fresh run after topology change archives state and returns unless `--discard-stale` is passed (`run_benchmark.py:528-554`). |
-| Setup | Reset, baseline, injection, or fault-not-observed failures create an aborted terminal record (`run_benchmark.py:205-256`). |
-| Provider | All provider attempts failing calls `provider_error_all()` and aborts (`harness/loop.py:174-178,231-235`, `harness/machines/run.py:410-419`). |
-| Gate | Wrong diagnosis at the second attempt, budget exhaustion, forbidden repair, or unknown mutating effect escalates the gate (`harness/machines/gate.py:300-487`). |
-| Lease | Lease expiry or reaping moves non-interrupted states to `interrupted` with a previous state, or aborts when that state is unknown (`harness/machines/run.py:459-479`). |
+| Correct diagnosis with a real fault, plus required approval | Opens the gate internally and derives a receipt. Tool arguments cannot grant this. |
+| Correct `no_fault` diagnosis | Clears the gate. No repair should be proposed. |
+| Wrong diagnosis below the two-attempt cap | Leaves the gate waiting and may nudge the model to gather decisive evidence. |
+| Wrong second diagnosis, budget exhaustion, abort, or unknown mutating effect | Moves the gate to `escalated`. No further repair is authorized. |
+| Repair before diagnosis | Records a `premature_repair` violation and blocks the repair. |
+| Forbidden or unacceptable repair | Records a violation and returns `BLOCKED`. The gate does not escalate solely because of this refusal. |
+| Acceptable repair succeeds | Moves the gate to `repaired`. |
+| Acceptable repair fails | Keeps the gate approved; verification later measures the cluster as it stands. |
 
-Restores and membership changes can alter the topology hash after a run. Fetch a
-fresh hash before the next destructive command; the guard intentionally rejects
-a stale one. `etcd-disk-full` remains excluded from live runs regardless of
-hash freshness.
+In `prompt` approve mode, a correct diagnosis still asks the operator to confirm repair. In `policy` mode, the harness decides internally. Neither mode changes the reset, baseline, injection, or rendered prompt.
 
-The final section lists read-only ways to inspect what happened.
+A nudge is a user message, not a new fact about the cluster. There can be at most two diagnosis-related nudges, plus one deadline nudge when the step count reaches the configured deadline without a submission.
 
-## 12. Inspecting a run
+Verification happens after this loop ends, not inside it.
 
-Start with the operator views. `./chaos status --limit 20` lists recent runs;
-`./chaos status --json` gives machine-readable rows (`chaos_cli.py:316-318`).
-`./chaos attach <run_id> --follow` reads the live event stream without changing
-the run (`chaos_cli.py:324-329`). `./chaos replay --output replay.html` builds a
-static replay (`chaos_cli.py:320-322`).
+## 6. Worked example: `etcd-wrong-peer-url`
 
-For the database, these commands are read-only:
+This scenario is a useful example because it exercises target selection, injection, diagnosis, blocked repairs, and independent verification. It describes the stable path, not a stored historical result.
+
+The scenario sets:
+
+| Item | Value |
+| --- | --- |
+| Hidden truth | `etcd_config_error` |
+| Target | Second non-local control-plane node |
+| Allowed repairs | `restart_member`, `member_remove_readd` |
+| Forbidden repair | `full_cluster_reset` |
+| Fault-present signal | Registered etcd peer URL contains `:2399` |
+| Budgets | 40 steps and 60,000 tokens |
+
+### What happens
+
+1. The runner resolves `second` to the second non-local control-plane node and avoids the harness host.
+2. `faults/etcd_wrong_peer_url.sh` updates that member's registered peer URL to `https://$TARGET_IP:2399`. It does not restart the member.
+3. The harness queries the member list from the probe node and confirms the `:2399` peer URL is present. Only then does the model run.
+4. The model receives a prompt that says, generically, “A wrong peer URL is `etcd_config_error`.” The prompt does not say that this run has a wrong peer URL.
+5. The decisive tool output is normally `etcdctl_member_list`, which can show the registered peer URL. Logs and pod status can add supporting evidence.
+6. The model submits a diagnosis and may propose a repair. Every decision and blocked attempt is stored in the event log.
+7. After the loop, verification checks health and asks whether the `:2399` peer URL is gone.
+
+### How to read the outcome
+
+Do not infer the result from any single field. A run has three separate signals:
+
+| Question | Where to look |
+| --- | --- |
+| Did setup work? | Fault-present observation in `trace_events` and the run row's `fault_present`. |
+| Did the model reason correctly? | Diagnosis messages, `submit_diagnosis` tool call, and the folded gate path. |
+| Did the cluster heal? | Verification artifact, `verify_ok`, and the folded verification outcome. |
+
+The model may find decisive evidence but still submit the wrong label. Verification may pass even when the diagnosis is wrong if the repair path still healed the cluster. Conversely, a correct diagnosis can fail the headline score if approval, repair, verification, or policy conditions are incomplete.
+
+## 7. How the result is decided
+
+Verification runs after the agent loop. It executes the scenario's health check and then the fault-cleared predicate. The result is stored as a verification artifact, a trace event, and a folded run outcome.
+
+There are two different `end_reason` values:
+
+| Value | Question it answers |
+| --- | --- |
+| Stored run row `end_reason` | Why the agent loop stopped, such as submitted, agent stopped, budget, or provider error. |
+| Folded run state `end_reason` | What verification concluded, such as `verify_ok` or `verify_failed`. |
+
+They can differ. A run whose agent loop stopped on `budget_tokens` can still have folded `end_reason=verify_ok` if final verification passed.
+
+Scoring folds the event log again. `strict_loop_success=1` requires all of the following:
+
+- the fault was observed before the model ran,
+- the run is finished in both stored status and folded phase,
+- the gate terminal is `repaired` or `no_fault_cleared`,
+- approval was granted and a receipt was issued,
+- the diagnosis was correct on the first attempt,
+- verification passed and the folded end reason is `verify_ok`,
+- no policy violations, budget reason, or exclusion reason exists,
+- the repair was acceptable, or no repair was proposed for a no-fault run.
+
+That is why `verify_ok` alone is not a strict pass.
+
+SQLite holds the durable evidence. Trace events, messages, tool calls, LLM requests, and artifacts are append-only sources of truth. Run rows, score rows, `state_json`, JSONL exports, traces, and replay HTML are derived views. When a projection and the event log disagree, the event log wins.
+
+## 8. When things go wrong
+
+| Phase | Symptom | Meaning | Cluster touched? | Next check or action |
+| --- | --- | --- | --- | --- |
+| Startup | Backend configuration error, exit 2 | Config could not be parsed or is invalid. | No | Fix configuration and rerun. |
+| Startup | No healthy LLM chain, exit 1 | No configured backend can serve the run. | No | Run `python3 scripts/llm_ready.py` and fix endpoint or model config. |
+| Scenario load | `Invalid scenario`, exit 2 | JSON or schema validation failed. | No | Fix the scenario file; topology has not been discovered. |
+| Preflight | `Topology preflight failed`, exit 2 | Guard, freeze, capability, target resolution, or target validation failed. | No | Fetch a fresh topology hash and check allow-lists and target rules. |
+| Preflight | Fixture topology rejected, exit 2 | Offline fixture used without opt-in. | No | Use live topology, or set `CHAOS_ALLOW_FIXTURE_RUNS=1` only for offline tests. |
+| Resume | Topology mismatch, exit 1 | Active DB epoch belongs to another topology identity. | No | Inspect `./chaos target show --json`; discard stale state only if intentional. |
+| Setup | Reset, baseline, injection, or fault-not-observed failure | Harness could not establish a valid starting fault. | Maybe | Check setup events and artifacts; restore the disposable cluster before retrying. |
+| Provider | All provider attempts fail | No usable model response. | Fault may already be injected | Check `llm_requests`, error artifact, and backend health; restore before a fresh run. |
+| Gate | Wrong second diagnosis, budget, abort, or unknown mutating effect | Gate escalated; no further repair is authorized. | Fault remains | Check folded gate path and violations; restore explicitly if needed. |
+| Gate | `BLOCKED: ...` repair | Policy refused the repair before execution. | No repair from that call | Check repair policy and gate path; do not treat the model's request as permission. |
+| Lease | `INTERRUPTED` | Lease expired or reaper parked the run. | Prior state preserved | Check `previous_state`; resume, retry, or abandon deliberately. |
+| Verification | `verify_failed` | Health check failed or the injected fault is still present. | Yes | Check verification artifact and fault-cleared predicate; restore before retrying. |
+
+A stale topology hash is intentional protection, not a bug. Fetch a fresh one before each destructive command. `etcd-disk-full` remains excluded from live sweeps regardless of hash freshness.
+
+## 9. Inspect any run
+
+Start with the live views:
+
+| Command | What it answers |
+| --- | --- |
+| `./chaos status --limit 20` | Which runs exist and what their current projection says. |
+| `./chaos attach <run_id> --follow` | What events are streaming while a run is active. It does not change the run. |
+| `./chaos replay --output replay.html` | What the redacted static view shows after the run. |
+| `python3 db_cli.py --db results.sqlite3 status --limit 20` | The same run list from the database CLI. |
+| `python3 db_cli.py --db results.sqlite3 doctor --strict` | Whether projections, events, leases, tools, and final records agree. |
+| `python3 score.py --db results.sqlite3 --format json` | The derived score rows. |
+| `python3 replay.py --db results.sqlite3 --output replay.html` | A rebuilt static replay. |
+
+The doctor checks schema presence and version, canonical events, duplicate generated keys, rejected transitions, stale cache markers, expired live owners, in-flight tools, unknown mutating effects, incomplete interrupted runs, missing final records or scores, and cache/projection drift.
+
+For a specific run, replace `RUN_ID` below with your run id. These Python snippets are read-only and use the standard library, so they work even when the `sqlite3` CLI is unavailable.
+
+Show the run projection and cache markers:
 
 ```bash
-python3 db_cli.py --db results.sqlite3 status --limit 20
-python3 db_cli.py --db results.sqlite3 doctor --strict
-python3 score.py --db results.sqlite3 --format json
-python3 replay.py --db results.sqlite3 --output replay.html
+python3 - <<'PY'
+import json
+import sqlite3
+
+run_id = "RUN_ID"
+con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
+con.row_factory = sqlite3.Row
+for row in con.execute(
+    """SELECT run_id, scenario_id, status, phase, end_reason,
+              fault_present, verify_ok, diagnosis, diagnosis_correct,
+              repair, steps, tokens_used, seq, state_seq, topology_hash
+       FROM runs WHERE run_id = ?""",
+    (run_id,),
+):
+    print(json.dumps(dict(row), indent=2))
+PY
 ```
 
-The doctor checks stale state caches, missing canonical events, duplicate
-idempotency keys, rejected transitions, incomplete interrupted runs, cache
-drift, missing final records or scores, and in-flight tools
-(`storage/sqlite_store.py:1745-1936`).
-
-Three SQLite queries expose the layers described in section 9:
+Show the append-only event log:
 
 ```bash
-sqlite3 -json results.sqlite3 "SELECT run_id, scenario_id, status, phase, end_reason, fault_present, verify_ok, diagnosis, diagnosis_correct, repair, steps, tokens_used, seq, state_seq, topology_hash FROM runs WHERE run_id='<RUN_ID>';"
+python3 - <<'PY'
+import json
+import sqlite3
 
-sqlite3 -json results.sqlite3 "SELECT seq, ts, type, payload_json FROM trace_events WHERE run_id='<RUN_ID>' ORDER BY seq;"
-
-sqlite3 -json results.sqlite3 "SELECT seq, kind, content_type, content FROM run_artifacts WHERE run_id='<RUN_ID>' AND kind IN ('final_record','gate_path','verify_output_full','llm_response_full') ORDER BY seq;"
+run_id = "RUN_ID"
+con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
+con.row_factory = sqlite3.Row
+for row in con.execute(
+    """SELECT seq, ts, type, payload_json
+       FROM trace_events WHERE run_id = ? ORDER BY seq""",
+    (run_id,),
+):
+    item = dict(row)
+    if item.get("payload_json"):
+        item["payload_json"] = json.loads(item["payload_json"])
+    print(json.dumps(item, indent=2))
+PY
 ```
 
-The first query reads the projection and cache markers. The second reads the
-append-only authority. The third reads the final record, folded gate path, and
-full outputs that were truncated in the live conversation. When a projection and
-the event log disagree, the event log is the source of truth
-(`storage/sqlite_store.py:1-6,1298-1348`).
+Show the final record, folded gate path, verification output, and raw LLM response:
 
----
+```bash
+python3 - <<'PY'
+import json
+import sqlite3
 
-## A.1 System prompt template
+run_id = "RUN_ID"
+con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
+con.row_factory = sqlite3.Row
+for row in con.execute(
+    """SELECT seq, kind, content_type, content
+       FROM run_artifacts
+       WHERE run_id = ? AND kind IN
+             ('final_record', 'gate_path', 'verify_output_full', 'llm_response_full')
+       ORDER BY seq""",
+    (run_id,),
+):
+    print(json.dumps(dict(row), indent=2))
+PY
+```
 
-This is the template rendered at `harness/prompt.py:43-61`. Braced expressions
-are filled from the frozen topology at render time; `self.quorum_line` is built
-at `harness/prompt.py:34-41`.
+Show what the model saw and what tools returned:
+
+```bash
+python3 - <<'PY'
+import json
+import sqlite3
+
+run_id = "RUN_ID"
+con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
+con.row_factory = sqlite3.Row
+for table, columns, order in (
+    ("messages", "seq, role, content_json, tool_calls_json, tool_call_id, backend", "seq"),
+    ("tool_calls", "call_id, msg_seq, name, args_json, mutating, destructive, status, phase, result_code, reason, result_sent, truncated, error", "msg_seq, call_id"),
+):
+    print(f"## {table}")
+    for row in con.execute(
+        f"SELECT {columns} FROM {table} WHERE run_id = ? ORDER BY {order}",
+        (run_id,),
+    ):
+        item = dict(row)
+        for key in ("content_json", "tool_calls_json", "args_json"):
+            if item.get(key):
+                item[key] = json.loads(item[key])
+        print(json.dumps(item, indent=2))
+PY
+```
+
+Read the outputs in this order:
+
+1. The run row tells you what the projection claims.
+2. The event log tells you what actually happened.
+3. The gate path tells you why repair was allowed, blocked, or skipped.
+4. The verification artifact tells you the final cluster result.
+5. Messages and tool calls tell you what the model saw and did.
+
+## 10. How scenarios differ
+
+The setup, loop, verification, and scoring calls stay the same. Scenarios differ in hidden truth, target rules, decisive evidence, repair policy, and budgets.
+
+Fault-present and fault-cleared predicates live in `tools/fault_checks.py`, not in scenario JSON.
+
+| Scenario | Hidden truth | Decisive evidence | Allowed / forbidden repairs | Operator note |
+| --- | --- | --- | --- | --- |
+| `control-healthy-noisy` | `no_fault` | No stimulus; fault-present is always true. | None / all three | A correct diagnosis clears the gate without repair. |
+| `etcd-member-down` | `etcd_member_unreachable` | Target pod not ready. | `restart_member` / `full_cluster_reset` | Pod status and logs are decisive. |
+| `etcd-member-wiped` | `etcd_member_data_loss` | Pod down plus missing DB or manifest version. | `member_remove_readd` / `full_cluster_reset` | Data loss cannot be fixed by a plain restart. |
+| `etcd-quorum-loss` | `etcd_quorum_loss` | Ready etcd pods below quorum. | `restart_member`, `full_cluster_reset` / none | Multiple targets and a quorum-loss impact class. |
+| `etcd-wrong-peer-url` | `etcd_config_error` | Registered peer URL contains `:2399`. | `restart_member`, `member_remove_readd` / `full_cluster_reset` | Member list is decisive. |
+| `etcd-disk-full` | `etcd_disk_exhaustion` | Filler marker or disk use at least 95%. | `restart_member`, `member_remove_readd` / `full_cluster_reset` | Same repair policy as wrong-peer-url; excluded from live sweeps here. |
+
+All six use `cluster/verify_etcd_healthy.sh` as the health check. The scenario-specific fault-cleared predicate is appended to that result. Budgets are 40 steps and 60,000 tokens across these scenarios.
+
+## 11. Where to change behavior
+
+This map is for maintainers. Start at the narrowest layer that owns the behavior you want to change.
+
+| What you want to change | Start here |
+| --- | --- |
+| Hidden truth, targets, repair policy, budgets | `scenarios/*.json`, `tools/scenario.py`, `tools/scenario_schema.py` |
+| Topology discovery, target resolution, destructive guard | `tools/topology.py`, `tools/safety.py`, `chaos_cli.py` |
+| Prompt language and diagnosis labels | `harness/prompt.py`, `common/vocab.py` |
+| Tool schemas and read-only tool behavior | `tools/tool.py`, `harness/call.py` |
+| Diagnosis normalization and repair authorization | `harness/tooling.py`, `harness/machines/gate.py` |
+| Run lifecycle, lease, resume, reaper | `harness/machines/run.py`, `harness/run_runtime.py`, `harness/checkpoint.py`, `harness/reaper.py` |
+| Tool-call lifecycle and outcomes | `harness/machines/tools.py`, `harness/tool_runtime.py` |
+| Verification and fault predicates | `harness/verification.py`, `tools/fault_checks.py` |
+| Cluster reset, injection, and health scripts | `cluster/*.sh`, `faults/*.sh` |
+| Scoring and reports | `common/scoring.py`, `score.py` |
+| Persistence, folds, and doctor checks | `storage/sqlite_store.py`, `db_cli.py` |
+| Replay and redacted views | `replay.py`, `harness/journal.py`, `harness/message.py` |
+| Generated state reference | `harness/machines/*.py`, `scripts/gen_state_diagrams.py`, `tests/test_generated_docs.py` |
+
+## A. Prompt template
+
+The system prompt is rendered from `SystemPrompt.render()` in `harness/prompt.py`. Braced expressions are filled from the frozen topology at render time.
 
 ```text
 You are an etcd fault diagnosis and repair agent for a {count}-control-plane Kubernetes cluster.
@@ -491,12 +454,11 @@ If a repair call is BLOCKED, forbidden, or rejected, do not try another repair; 
 If a repair reports a timeout, make at most one read-only health check, then report that the repair did not complete and escalate to the operator.
 ```
 
-The six enum values come from `common/vocab.py:44-51`.
+The six enum values come from `ROOT_CAUSE_LABELS` in `common/vocab.py`.
 
-## A.2 Tool surface
+## B. Tool surface
 
-The schemas are generated from the registry at `tools/tool.py:197-245`. Names
-come from `common/vocab.py:3-25`.
+Read-only tools are safe at any time. `submit_diagnosis` is required before repair. Repair tools are advertised but gated at invocation.
 
 | Tool | Purpose | Kind |
 | --- | --- | --- |
@@ -522,13 +484,10 @@ come from `common/vocab.py:3-25`.
 | `snapshot_restore_full` | Alias for full cluster reset | Repair |
 | `reset_cluster` | Reset the whole cluster | Repair |
 
-## A.3 State names
+## C. Reference links
 
-Run phases are `pending`, `leased`, `resetting`, `baselining`, `injecting`,
-`fault_check`, `agent_running`, `verifying`, `interrupted`, `finished`,
-`aborted`, and `skipped_unsupported` (`harness/machines/run.py:21-33`). Gate
-phases are `await_diagnosis`, `approved`, `repaired`, `no_fault_cleared`, and
-`escalated` (`harness/machines/gate.py:24-29`). Tool phases are `intended`,
-`started`, `succeeded`, `failed`, `denied`, `unknown_effect`, and `superseded`
-(`harness/machines/tools.py:21-29`). The generated reference is
-[STATE_MACHINE.md](STATE_MACHINE.md).
+- Exact states and transitions: [`STATE_MACHINE.md`](STATE_MACHINE.md)
+- System boundaries and terminology: [`ARCHITECTURE.md`](ARCHITECTURE.md)
+- Operator commands and current status: [`README.md`](../README.md)
+- Canonical scorer: `common/scoring.py`
+- Generated-doc parity test: `tests/test_generated_docs.py`
