@@ -278,7 +278,8 @@ host-level recovery; validation and `menu.sh` still include the scenario.
 `./chaos` is the intended entry point. It provides `ping`, `status`, `target`,
 `scenario`, `run`, `attach`, `abort` (including `--abandon`), `state`, `cluster`,
 and `replay`. Lower-level tools are `db_cli.py`, `score.py`, `replay.py`, and
-`run_benchmark.py`. The generated `menu.sh` calls `./chaos run`.
+`run_benchmark.py`. The generated `menu.sh` offers `./chaos ping` plus scenario
+choices that call `./chaos run`.
 
 The live view and `attach` are read-only followers of the SQLite event and UI
 streams. Detached runs record `launch_id` and `pid`. Destructive commands require

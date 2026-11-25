@@ -441,6 +441,9 @@ class TestHardening(unittest.TestCase):
 
     def test_menu_uses_chaos_run(self) -> None:
         script = chaos_cli._menu_script([{"id": "etcd-member-down", "label": "Etcd member down"}])
+        self.assertIn("ids=(ping etcd-member-down)", script)
+        self.assertIn("'Ping LLM (auto fallback)'", script)
+        self.assertIn('exec ./chaos ping "$@"', script)
         self.assertIn('exec ./chaos run --scenario "$id" --backend "$BACKEND" "$@"', script)
         self.assertNotIn("run_benchmark.sh", script)
 

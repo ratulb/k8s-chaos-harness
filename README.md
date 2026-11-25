@@ -253,8 +253,9 @@ Inspect scenarios:
 ./chaos scenario menu --output menu.sh
 ```
 
-Each scenario also defines inject/verify commands, timeout, step/token budget,
-minimum member count, menu label, and summary.
+The generated menu offers LLM ping first, using the default auto fallback, then
+the scenarios. Each scenario also defines inject/verify commands, timeout,
+step/token budget, minimum member count, menu label, and summary.
 
 ## 7. Backends and configuration
 
@@ -450,7 +451,8 @@ python3 replay.py --db results.sqlite3 --output replay.html
 For `db_cli.py`, global `--db` goes before the subcommand. Its subcommands are
 `init`, `migrate`, `import-runs`, `doctor`, `status`, `export`, `prune`, and
 `resume`. `run_benchmark.sh` is the older init/run/score wrapper. The generated
-`menu.sh` picker calls `./chaos run` and accepts its run flags; use `./chaos
+`menu.sh` picker offers LLM ping and scenarios; scenario choices call `./chaos
+run` and accept its run flags, while ping uses auto fallback. Use `./chaos
 attach` and `./chaos status` separately for monitoring.
 
 Not implemented: `./chaos doctor`, `./chaos score`, `./chaos export`, and
@@ -526,7 +528,8 @@ do not start `./chaos run`; re-check cluster access and refresh the allow-list.
 **Expects.** Files under `scenarios/`. `validate` needs no live cluster.
 
 **Does.** Lists IDs, shows one definition, validates schemas/repair sets/fault
-timeouts, or writes a `menu.sh` picker whose choices call `./chaos run`.
+timeouts, or writes a `menu.sh` picker whose ping choice calls `./chaos ping`
+and scenario choices call `./chaos run`.
 
 **Evidence produced / scoring effect.** None for `list`, `show`, or `validate`;
 `menu` writes a derived launcher. No scores are affected.

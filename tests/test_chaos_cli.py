@@ -93,6 +93,8 @@ class TestChaosCli(unittest.TestCase):
             text = output.read_text(encoding="utf-8")
             self.assertIn('BACKEND="${BACKEND:-ollama}"', text)
             self.assertIn("--backend \"$BACKEND\"", text)
+            self.assertIn("Ping LLM (auto fallback)", text)
+            self.assertIn('exec ./chaos ping "$@"', text)
             self.assertIn("etcd-quorum-loss", text)
             self.assertTrue(os.access(output, os.X_OK))
             syntax = subprocess.run(["bash", "-n", str(output)], capture_output=True, text=True)

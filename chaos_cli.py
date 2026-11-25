@@ -185,8 +185,10 @@ def _setup_topology_warnings(setup: dict[str, Any], topology_data: dict[str, Any
 
 
 def _menu_script(summaries: list[dict[str, Any]]) -> str:
-    ids = " ".join(shlex.quote(str(item["id"])) for item in summaries)
-    labels = " ".join(shlex.quote(str(item["label"])) for item in summaries)
+    ids = " ".join(["ping", *(shlex.quote(str(item["id"])) for item in summaries)])
+    labels = " ".join(
+        [shlex.quote("Ping LLM (auto fallback)"), *(shlex.quote(str(item["label"])) for item in summaries)]
+    )
     lines = [
         "#!/usr/bin/env bash",
         "set -euo pipefail",
@@ -199,14 +201,17 @@ def _menu_script(summaries: list[dict[str, Any]]) -> str:
         "for i in \"${!labels[@]}\"; do",
         '  printf "%2d) %s\\n" "$((i + 1))" "${labels[$i]}"',
         "done",
-        'printf "Scenario [1-%d]: " "${#labels[@]}"',
+        'printf "Action [1-%d]: " "${#labels[@]}"',
         "read -r choice",
         'if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#labels[@]} )); then',
-        '  echo "invalid scenario selection" >&2',
+        '  echo "invalid selection" >&2',
         "  exit 2",
         "fi",
         'id="${ids[$((choice - 1))]}"',
         'cd "$ROOT"',
+        'if [[ "$id" == "ping" ]]; then',
+        '  exec ./chaos ping "$@"',
+        "fi",
         'exec ./chaos run --scenario "$id" --backend "$BACKEND" "$@"',
         "",
     ]
