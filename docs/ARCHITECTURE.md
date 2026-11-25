@@ -1,298 +1,264 @@
 # Architecture
 
-This file is the maintained description of the current system. `README.md` is the
-full operator guide. [call_flow.md](call_flow.md) traces one run from the shell
-through setup, the LLM loop, verification, and scoring.
-[STATE_MACHINE.md](STATE_MACHINE.md) is the generated state reference; edit its
-generator or the machine tables, not the Markdown file. Code is executable truth:
-if a document disagrees with the implementation, fix the document.
+This document explains the parts of the harness, what each part owns, and how they work together during one run. It is written for someone who needs to understand the system before operating or changing it.
 
-## 1. What the harness is
+Start here:
 
-The harness is a reproducible benchmark for operational reasoning on a real
-Kubernetes cluster. It injects harness-owned etcd faults, gives the model
-read-only diagnostics plus gated repair tools, verifies the final cluster state,
-and scores the run from an append-only event log.
+- [`README.md`](../README.md) for commands, configuration, safety, and troubleshooting.
+- [`call_flow.md`](call_flow.md) for one worked run, call by call.
+- [`STATE_MACHINE.md`](STATE_MACHINE.md) for generated state and transition reference.
 
-The benchmark asks one narrow question: can a model identify the root cause from
-live evidence and choose an acceptable, safe repair? Diagnosis and repair are
-separate signals. A correct guess is not a safe repair, and a failed repair can
-still produce an educational trace. Triggering external remediation workflows is
-out of scope.
+Read sections 1-4 first. They give the mental model needed for the rest.
 
-The active SQLite database is the durable operational artifact and the only
-input to headline scoring. JSONL exports, trace files, replay HTML, score
-summaries, and UI streams are derived outputs.
+## 1. What this system is
 
-### Scope
+This harness asks a narrow question:
 
-- Five injected etcd fault classes and one healthy control.
-- Runtime-discovered Kubernetes clusters; three etcd members are recommended but
-  not required.
-- Self-hosted Ollama-compatible and hosted OpenAI-compatible backends, with
-  explicit provenance for fallback chains.
-- Direct named tool calls; no raw shell and no MCP transport in the benchmark.
-- Diagnosis gate, policy-checked repairs, bounded budgets, and final verification.
-- SQLite checkpoint/event store with safe resume and a reaper for crashed runs.
-- Live/plain terminal views, read-only attach, static replay, and one canonical
-  scorer.
+> Given a real Kubernetes control plane with a broken etcd member, can a model find the root cause from read-only evidence and choose an acceptable, safe repair?
 
-Explicit non-goals include generic Kubernetes autopilot behavior, full Kubernetes
-API fault emulation, model-visible fault injection, model-visible scoring truth,
-and production remediation. Repair mode is best effort: it changes prompt and
-reporting context but still resets, verifies baseline, and injects. The
-`recovered|partial|unverified|cannot_proceed` incident statuses are not
-implemented.
+The harness, not the model, owns the dangerous parts of the experiment. It resets the cluster, establishes a baseline, injects a known etcd fault, proves the fault is present, runs the model against a constrained tool surface, verifies the final cluster state, and scores the result.
 
-## 2. System at a glance
+Diagnosis and repair are separate signals. A correct diagnosis does not authorize any repair. A useful run can fail the headline metric if it guesses right but proposes an unsafe repair.
+
+This is an educational benchmark, not a production remediation service, a generic Kubernetes autopilot, or a model-visible fault injector. External remediation workflows are out of scope. Repair mode is best effort: it changes prompts and reporting, but still resets, verifies a baseline, and injects.
+
+## 2. The participants
 
 ```text
 operator / CI
-  -> ./chaos                         CLI, safety, launch/attach/abort/status
-  -> run_benchmark.py                 composition root
-       scenario -> topology -> guard -> capability -> target
-       RunRuntime -> reset -> baseline -> inject -> fault check
-       AgentLoop -> LLM -> GateRuntime / ToolRuntime
-       verification -> finish -> score projection -> derived exports
-
-infrastructure
-  cluster/*.sh, faults/*.sh, verify/*.sh, kubectl, etcdctl, ssh
-  LLM endpoint chain
-
-persistence
-  SQLite append-only trace_events = authority
-  RunState / GateState / ToolState = folds over those events
-  runs, state_json, snapshots, artifacts, scores = projections
-  live UI, attach, replay, score.py = read-only views
+    |
+    v
+./chaos  ---------  run_benchmark.py
+                        |
+        +---------------+---------------+
+        |               |               |
+   Kubernetes/etcd    LLM backend    results.sqlite3
+        |               |               |
+   cluster scripts   tool schemas    events, state, scores
+                        |               |
+                   named tools ------> live UI / replay / score.py
 ```
 
-The runner owns destructive setup: reset, baseline, injection, final verify, and
-the post-agent fault-cleared check. The model never sees fault scripts, truth
-labels, or scoring inputs. Tools expose
-only named read-only diagnostics and gated repairs.
+| Participant | Owns | Does not own |
+| --- | --- | --- |
+| Operator / CI | Choosing scenario, backend, guard, and when to run | Cluster repair decisions |
+| `./chaos` (`chaos_cli.py`) | Parsing commands, loading `.env`, launching the runner, reaping expired leases | Scenario policy or scoring |
+| `run_benchmark.py` | Wiring the whole run: scenario, topology, guard, store, runner, agent, verification, exports | The truth label or model answer |
+| Kubernetes / etcd | The live substrate that is reset, broken, inspected, and verified | The benchmark's definition of success |
+| LLM backend | Producing messages and named tool calls | Injecting faults, seeing truth, bypassing policy |
+| `results.sqlite3` | Durable evidence and authoritative event log | Producing a diagnosis itself |
+| Reports and views | Reading stored evidence to show status, scores, and replay | Changing run state |
 
-## 3. Ownership map
+The important boundary: the model receives a narrow prompt, frozen topology facts, tool schemas, and conversation history. It does not receive the scenario id, root-cause truth, fault scripts, injection commands, repair policy, score formula, or raw shell access.
 
-| Concern | Owner |
+## 3. Terms used in this document
+
+| Term | Meaning in this system |
 | --- | --- |
-| Scenario definition and validation | `tools/scenario.py`, `tools/scenario_schema.py` |
-| Cluster identity and topology | `tools/topology.py` |
-| Destructive safety | `tools/safety.py` |
-| Backend chain and responder provenance | `llm/client.py`, `llm/backends.py`, `llm/registry.py` |
-| Chat messages and redaction | `harness/message.py` |
-| Event and artifact channel | `harness/journal.py` |
-| Prompt policy | `harness/prompt.py` |
-| Tool catalog and schemas | `tools/tool.py` |
-| Gate behavior | `GateRuntime` and `GateState` |
-| Run lifecycle | `RunRuntime` and `RunState` |
-| Tool status/outcome | `ToolLedger` and `ToolState` |
-| Agent orchestration | `harness/loop.py` |
-| Checkpointing and lease renewal | `harness/checkpoint.py` |
-| Verification | `harness/verification.py` |
-| Persistence and doctor | `storage/sqlite_store.py` |
-| Scoring | `common/scoring.py` |
-| Reaper and explicit abandon | `harness/reaper.py` |
+| Scenario | A JSON file that defines the fault, hidden root cause, target rules, acceptable and forbidden repairs, commands, and budgets. |
+| Topology hash | A stable fingerprint of the discovered control planes, etcd membership, member count, and probe node. Health and transient faults are excluded. |
+| Epoch | The active `results.sqlite3` associated with one topology identity. A topology change starts a new epoch by archiving the old one. |
+| Event | An append-only record in `trace_events`, such as `tool.success` or `verify_ok`. Events are the authority for state and scoring. |
+| Fold | Replaying events through a state machine to reconstruct current state. It is how a crashed run becomes understandable. |
+| Projection | A stored or exported view rebuilt from events, such as `runs.status`, `state_json`, `scores`, or replay HTML. |
+| Gate | The diagnosis and repair authorization path. It opens only after an accepted diagnosis. |
+| Receipt | A derived marker, `approved:{run_id}`, proving the gate accepted a diagnosis. It is not a secret or human authorization. |
+| Truth | The scenario's hidden `root_cause`. It is stored for scoring and never shown to the model. |
+| Responder | The backend that actually answered. It is recorded separately from the configured backend chain. |
+| Headline score | `strict_loop_success`, the current end-to-end cleanliness metric. |
 
-Domain and application code receives typed inputs at composition boundaries.
-Runtimes emit canonical events through `Journal`; the store appends events and
-rebuilds projections from them. State machines do not call infrastructure.
+## 4. One run, in order
 
-## 4. State-machine model
+The detailed call-by-call version is in [`call_flow.md`](call_flow.md). The short version:
 
-Three always-on machines own behavior:
+1. `./chaos run` loads `.env`, calls the reaper, and launches `run_benchmark.py`.
+2. The scenario is loaded and validated before any side effect.
+3. Topology is discovered and frozen.
+4. The destructive guard checks the cluster context or cluster id; the topology hash is checked if an allow-list is configured.
+5. Capability checks and target resolution decide eligible nodes and quorum behavior.
+6. A stale epoch is archived and the run exits unless `--discard-stale` is intentional.
+7. The run is created, leased, and moved through reset, baseline, injection, and fault observation.
+8. The agent loop begins only after the harness has proven the fault is present.
+9. The model calls named diagnostic tools, submits a diagnosis, and may propose a repair.
+10. The gate checks diagnosis correctness, approval, repair canonicalization, forbidden repairs, and acceptable repairs.
+11. Final verification checks etcd health and that the injected fault is cleared.
+12. The run finishes, the canonical scorer computes a score, the lease is released, and derived exports are written.
 
-- `GateState` decides whether diagnosis is correct, whether repair is authorized,
-  which repair was attempted, and which gate violations occurred.
-- `RunState` owns status, phase, lease, verification, interruption, resume triage,
-  and terminal outcome.
-- `ToolState` owns each call's intended/started/finished/failed status and typed
-  outcome.
+A healthy LLM backend is a prerequisite for the run, but it is not permission to touch the cluster. That permission comes from the destructive guard.
 
-The pure core in `harness/state_machine.py` provides transition lookup, folding,
-validation, and rejection events. Runtimes in `harness/*_runtime.py` turn method
-calls into canonical events. The tables in `harness/machines/` are the
-exhaustive definition of legal transitions and are projected into
-[STATE_MACHINE.md](STATE_MACHINE.md).
+## 5. Scenario contract and safety
 
-Canonical events use a nested envelope:
+Each scenario JSON file is the contract for one experiment:
 
-```json
-{
-  "type": "run.lease_expired",
-  "payload": {
-    "event": "lease_expired",
-    "payload": { "previous_state": "leased", "lease_expires_at": 100.0 },
-    "idempotency_key": "reap:run-1:leased:100.0"
-  }
-}
-```
+| Field group | What it controls |
+| --- | --- |
+| `root_cause` | The hidden truth label. |
+| `inject` / `verify` | The harness-owned fault command and health command. |
+| `fault_present_check` | How the harness proves the stimulus actually happened. |
+| `target_nodes`, selectors, quorum rules | Which discovered nodes may be affected. |
+| `acceptable_repairs`, `forbidden_repairs` | The repair policy enforced by the gate. |
+| `timeout_seconds`, budgets | How long setup and agent work may run. |
+| `risk`, `impact_class` | Operator-facing classification and capability checks. |
 
-Runtimes deduplicate generated events by `idempotency_key`; folding deduplicates
-by `seq`/key. Illegal transitions are recorded as `state_transition_rejected`
-events and ignored by the emitting runtime. A duplicate generated key is a doctor
-error, not silently accepted history.
+Safety works in layers:
 
-Diagram labels are persisted values, not enum names. Gate states use wire values
-such as `no_fault_cleared`. Run states appear as `status:phase`, such as
-`running:baseline`. Tool diagrams collapse machine phases to persisted status;
-`UNKNOWN_EFFECT` appears as `failed` with `result_code=unknown_effect`.
+- The destructive guard in `tools/safety.py` requires an allow-listed current context or cluster id. `CHAOS_ALLOWED_TOPOLOGY_HASHES` is optional but strongly recommended.
+- `./chaos run` is guarded by configuration, not an interactive prompt. Confirmation exists for `abort all`, `state discard`, and `cluster nuke`.
+- Fixture topology is rejected for live runs unless `CHAOS_ALLOW_FIXTURE_RUNS=1`; fixtures are for offline tests.
+- Topology mismatch refuses resume. A fresh run archives the old epoch and exits unless `--discard-stale` is passed.
+- `setup.conf` is external lab configuration at `$K8S_EASY_INSTALL/setup.conf`, defaulting to `~/k8s-easy-install/setup.conf`. It is a rebuild recipe and fallback host list, not an override for live discovery.
+- `etcd-disk-full` is excluded from live sweeps by operator convention. Code and `menu.sh` still include it, so the operator must skip it deliberately.
 
-## 5. Run lifecycle
+## 6. What the model sees and may do
+
+The model gets a deliberately small view of the system:
+
+| Visible to the model | Kept outside the prompt |
+| --- | --- |
+| Control-plane node names and probe node | Scenario id and `root_cause` truth |
+| Quorum sentence derived from frozen topology | Reset, baseline, inject, and verify commands |
+| Six allowed diagnosis labels | Fault-present and fault-cleared predicates |
+| Tool names, parameters, and descriptions | Acceptable and forbidden repair lists |
+| Prior assistant, tool, and nudge messages | Gate phase, receipt, budget counters, score formula |
+
+All model-visible operations are named tools. There is no raw shell and no MCP transport in the benchmark. Read-only diagnostics cover Kubernetes resources, logs, events, etcd health and membership, alarms, host journals, containers, services, disk usage, and paths.
+
+The gate order is:
 
 ```text
-create run -> lease -> reset -> baseline -> inject -> fault check -> agent
-                                                            |
-                                              agent done / terminal error
-                                                            v
-                                                        verify
-                                                            v
-                                  FINISHED or ABORTED -> score -> final record
+diagnosis submitted
+  -> canonical label accepted within the two-attempt cap
+  -> harness-side approval active
+  -> repair name canonicalized
+  -> repair not forbidden
+  -> repair acceptable
+  -> repair executed
 ```
 
-Each run pins a scenario hash, topology hash, backend chain, prompt hash, and
-provenance fields before destructive work. Reset failures and baseline failures
-are infrastructure failures. An injection command failure is `injection_failed`;
-a stimulus that was not proven present is `fault_not_observed`. Both are terminal
-and excluded from headline scoring.
+A blocked repair is a recorded policy violation, not a prompt suggestion. `harness/tooling.py` enforces the six `BLOCKED` conditions. In autonomous mode the receipt is a correctness handshake, not a secret. Prompt mode adds operator confirmation and marks the run interactive; harness state remains authoritative after resume.
 
-The final state writes terminal fields, recomputes the canonical score, writes a
-final-record artifact, and releases the lease. Derived JSONL/trace/UI exports
-happen only after the terminal state unless disabled.
+## 7. Where evidence lives
 
-### Resume, reaper, and abandon
+SQLite is the active epoch and the authority. Event tables are the truth; scalar columns, caches, scores, exports, and replay are rebuildable views.
 
-A crashed run is parked in `INTERRUPTED` with `previous_state`,
-`lease_expires_at`, and an end reason. The reaper runs on CLI invocation: it finds
-expired leases with no live owner and emits `run.lease_expired` once per
-observation key. It never resumes work from the dead process.
+The core chain is:
 
-Resume triage is a lookup from `previous_state`:
+```text
+tool or agent action
+  -> Journal.event()
+  -> trace_events append
+  -> rebuild_state() folds gate/run/tool machines
+  -> GatePath + RunState + ToolState
+  -> scores / state_json / live UI / replay
+```
 
-- Early setup phases re-lease and resume.
-- Inject/fault-check phases start a new run after reset.
-- Agent phases resume unless a mutating call has an unknown effect, which aborts
-  and retries.
-- Verify phases rerun verification.
-
-Topology mismatch always refuses resume. `--force-resume` bypasses only a config
-hash mismatch. `./chaos abort <run_id> --abandon` is the explicit operator exit
-from `INTERRUPTED` and writes `run.abandon`.
-
-## 6. Agent surface
-
-The model sees the system prompt, frozen topology, tool schemas, conversation
-state, and truncated tool output. It does not see fault scripts, truth labels,
-raw shell, SQLite, or scoring inputs.
-
-Read-only diagnostics cover Kubernetes resources, logs, events, etcd health and
-membership, alarms, host journals, containers, services, disk usage, and paths.
-`submit_diagnosis` accepts one exact root-cause label and can succeed at most on
-the first accepted attempt for strict scoring.
-
-The gate receipt is derived from folded `GateState` and `run_id`. It is a
-correctness handshake, not a secret or a client-supplied token. Prompt mode adds
-operator confirmation and marks the run interactive; harness state remains
-authoritative after resume.
-
-Repair names are canonicalized before policy. Blocked calls produce typed policy
-violations; forbidden calls also set `forbidden_reason`. Repair result strings are
-evidence for operators, but state and score read typed fields.
-
-## 7. Persistence and projections
-
-SQLite is the active epoch. The tables have distinct roles:
-
-| Tables | Role |
+| Table group | Role |
 | --- | --- |
-| `trace_events` | Append-only authority for machine transitions |
-| `messages`, `llm_requests`, `tool_calls`, `run_artifacts` | Append-only evidence |
-| `runs`, `batches`, `scenarios` | Run/control projections and pinned facts |
-| `state_snapshots`, `ui_stream` | Durable snapshots and redacted UI stream |
+| `messages`, `trace_events`, `llm_requests`, `tool_calls`, `run_artifacts` | Append-only evidence |
+| `runs`, `batches`, `scenarios` | Run and control projections, including pinned hashes |
+| `state_snapshots`, `ui_stream` | Durable snapshots and redacted UI chunks |
 | `diagnosis_attempts`, `policy_violations` | Gate history |
 | `scores`, `score_reports` | Derived score projections |
 
-`apply_machine_event()` appends an event, rebuilds state from the event log, and
-writes projections. `runs.status`, `runs.phase`, `runs.end_reason`, lease fields,
-gate scalars, tool status fields, `state_json`, and `state_snapshots` are all
-rebuildable. Readers never derive authority from scalar defaults.
+`runs.state_json` is a cache, not a second source of truth. `get_state()` rebuilds from events and writes a snapshot. `db_cli.py doctor --strict` checks drift between authoritative events and projections.
 
-`db_cli.py doctor --strict` checks schema version, final records, score rows,
-terminal reasons, expired leases with live owners, in-flight tools, unknown
-mutating effects, stale sequence markers, stale caches, missing canonical
-events, rejection events, duplicate generated keys, interrupted metadata, and
-cache/fold drift.
+Derived files are useful but not authoritative:
 
-Exports, replay HTML, and score reports are read-only outputs. `state discard`
-deletes the active epoch and evidence; read-only commands and explicit resume
-never do that.
+| File | Role |
+| --- | --- |
+| `runs.jsonl` | Legacy export |
+| `traces/*.jsonl` | Per-run traces, snapshots, and UI artifacts |
+| `logs/*.log` | Runner and launcher output |
+| `replay.html` | Redacted static view |
 
-## 8. Scoring
+`quant` and `prompt_hash` exist for schema and import compatibility; live runs leave them unset. Live provenance fields are `model`, `temperature`, `seed`, and `harness_git_sha`.
 
-`common/scoring.py` is the single canonical scorer, `gate-path-v1`. It reads the
-folded `GatePath`, run state, and tool states from `SQLiteStore.load_records()`.
-Score rows are projections recomputed from the fold; the scorer is not a second
-source of truth.
+## 8. Three state machines, in operator language
 
-`strict_loop_success` is the headline metric. It requires an observed fault,
-finished run, strict gate terminal, first-attempt correct diagnosis, receipt,
-passing verification and fault-cleared check, no violations,
-`end_reason=verify_ok`, acceptable repair or
-no repair for `no_fault`, and no exclusion reason. `loop_success` is historical
-only and must not be quoted as the current headline.
+Three machines fold the event log. They do not call infrastructure; runtimes translate method calls into canonical events.
 
-Excluded groups include resumed, interactive, unsupported, provider-error,
-unverified-fault, budget cutoff, abandoned, and illegal-transition runs. A
-fallback answer is headline-eligible; earlier failed candidates are not a
-run-level provider error. `runs.backend`/`runs.model` keep the configured chain
-identity, while the responding backend and attempted path are recorded in
-`llm_requests`, messages, artifacts, and assistant events. Per-backend baselines
-pin one endpoint with `CHAOS_LLM_FALLBACK=0`. Temperature is fixed at `0.2`;
-`--seed` is metadata.
+| Machine | What it answers | Generated reference |
+| --- | --- | --- |
+| Gate | Was the diagnosis accepted, is repair allowed, and did a violation occur? | [`STATE_MACHINE.md`](STATE_MACHINE.md) |
+| Run | What phase is the run in, is it terminal, and what happens after a crash? | [`STATE_MACHINE.md`](STATE_MACHINE.md) |
+| Tool | Did each call succeed, fail, get denied, or become unsafe to replay? | [`STATE_MACHINE.md`](STATE_MACHINE.md) |
 
-## 9. Topology and safety contract
+Run phases are persisted as `status:phase`. For example, machine phase `baselining` appears as `running:baseline`. Tool phases collapse into persisted statuses: success and supersede both appear as `finished`; unknown effect appears as `failed` with `result_code=unknown_effect`.
 
-A live reachable cluster is the source of truth. `setup.conf` is a rebuild recipe
-and fallback host list, never an override for live discovery. `CHAOS_TOPOLOGY_JSON`
-is for tests and offline inspection; `./chaos run` refuses fixture topology unless
-`CHAOS_ALLOW_FIXTURE_RUNS=1` is set.
+A crashed run is parked in `interrupted:interrupted` with `previous_state`. The reaper runs on CLI startup and records expired leases once per observation key. Resume triage is a lookup from `previous_state`:
 
-The topology hash includes sorted control-plane names/IPs, etcd member identity,
-member count, and probe node. It excludes health, Ready state, transient faults,
-and scores, so recovery alone does not create a new epoch. Quorum is
-`floor(N / 2) + 1`; selectors resolve against the frozen topology.
+| Previous phase | Action |
+| --- | --- |
+| `pending`, `leased`, `resetting`, `baselining` | Re-lease and resume |
+| `injecting`, `fault_check` | Create a new run after reset |
+| `agent_running` | Resume; abort and retry if a mutating tool has unknown effect |
+| `verifying` | Rerun verification |
 
-`tools/safety.py` requires either the current kubectl context or the configured
-cluster ID to be allow-listed before destructive actions. It checks the topology
-hash only when `CHAOS_ALLOWED_TOPOLOGY_HASHES` is set. A normal run with a changed
-topology archives the old epoch and exits; `--discard-stale` is required for
-intentional archival and deletion. Resume refuses a topology change. `./chaos
-status`, attach, and target show are read-only and warn instead of deleting.
+Topology mismatch always refuses resume. `--force-resume` bypasses only a config hash mismatch. `./chaos abort <run_id> --abandon` is the explicit exit from `INTERRUPTED`.
 
-Messages, events, artifacts, exports, UI chunks, and state caches are redacted at
-write time. Gate receipts are derived and stripped from persisted caches. Never
-put secrets in traces or commits. `etcd-disk-full` is excluded by operator
-convention from live sweeps because filling an etcd data filesystem can require
-host-level recovery; validation and `menu.sh` still include the scenario.
+## 9. How scoring works
 
-## 10. Operator surface
+`common/scoring.py` is the only scorer, version `gate-path-v1`. It reads folded `GatePath`, run state, and tool states. `loop_success` is historical only; `strict_loop_success` is the headline.
 
-`./chaos` is the intended entry point. It provides `ping`, `status`, `target`,
-`scenario`, `run`, `attach`, `abort` (including `--abandon`), `state`, `cluster`,
-and `replay`. Lower-level tools are `db_cli.py`, `score.py`, `replay.py`, and
-`run_benchmark.py`. The generated `menu.sh` offers `./chaos ping` plus scenario
-choices that call `./chaos run`.
+`strict_loop_success=1` requires:
 
-The live view and `attach` are read-only followers of the SQLite event and UI
-streams. Detached runs record `launch_id` and `pid`. Destructive commands require
-explicit confirmation. `./chaos doctor`, `./chaos score`, `./chaos export`, and
-`score.py --reference-only` are not implemented; use the lower-level commands.
+| Requirement | Where it comes from |
+| --- | --- |
+| Fault was observed | Folded run state from `fault_observed` |
+| Run is `finished:finished` | Folded run state |
+| Gate terminal is `repaired` or `no_fault_cleared` | Folded `GatePath` |
+| Diagnosis was correct on the first attempt | Folded gate path |
+| Receipt was issued | Folded gate path |
+| Verification passed | Folded run state |
+| No gate or tool policy violations | Folded gate path and tool states |
+| Folded end reason is `verify_ok` | Folded run state, not raw `runs.end_reason` |
+| Acceptable repair, or no repair for `no_fault` | Gate path and scenario policy |
+| No exclusion reason | Scorer |
 
-See `README.md` for quickstart, command flags, backend configuration, scenario
-tables, troubleshooting, and safety examples.
+A stored `runs.end_reason` of `budget_tokens` can still coexist with `strict_loop_success=1` when final verification changes the folded reason to `verify_ok`. This is intentional: scoring reads the fold.
 
-## 11. Verification
+Fallback is provenance, not a score gate. `runs.backend` and `runs.model` keep the configured chain identity. The responding backend, requested backend, skipped candidates, and fallback path are recorded in `llm_requests`, messages, `llm_response_full`, and assistant events. For clean per-backend baselines, pin one endpoint with `CHAOS_LLM_FALLBACK=0`.
 
-Offline verification for changes:
+Benchmark turns use `temperature=0.2`. `--seed` is metadata, not sampling control.
+
+## 10. Failure playbook
+
+| Symptom | Meaning | Next place to look |
+| --- | --- | --- |
+| `reset_failed`, `baseline_failed` | Cluster was not clean before injection; infrastructure failure | Runner logs, reset ladder, cluster health |
+| `injection_failed` | Fault command failed | Injection artifact, target resolution |
+| `fault_not_observed` | Stimulus was not proven present | Fault-check predicate, scenario timeout |
+| `BLOCKED: ...` | Gate rejected a repair before execution | `harness/tooling.py`, policy violations |
+| `provider_error_*` | Every configured candidate failed | LLM request events and error artifact |
+| `INTERRUPTED` | Lease expired or reaper parked the run | `previous_state`, resume triage, `attach` |
+| `verify_ok=false` | Health check failed or fault was not cleared | Verify artifact and fault-cleared check |
+| Stale topology message | Active epoch belongs to another topology identity | `./chaos target show --json`, archive directory |
+| Doctor drift | Cache or projection disagrees with events | `db_cli.py doctor --strict`, trace events |
+
+## 11. Code map for debugging
+
+| Concern | Primary files |
+| --- | --- |
+| CLI and launch | `chaos_cli.py`, `chaos` |
+| Composition root | `run_benchmark.py` |
+| Scenario definition and validation | `scenarios/*.json`, `tools/scenario.py`, `tools/scenario_schema.py` |
+| Topology, quorum, targets, hashes | `tools/topology.py` |
+| Destructive guard | `tools/safety.py` |
+| LLM chain and provider calls | `llm/registry.py`, `llm/client.py`, `llm/response.py` |
+| Prompt and tool schemas | `harness/prompt.py`, `tools/tool.py`, `common/vocab.py` |
+| Agent loop | `harness/loop.py`, `harness/budget.py` |
+| Diagnosis and repair enforcement | `harness/tooling.py`, `harness/call.py` |
+| Gate, run, and tool machines | `harness/machines/`, `harness/*_runtime.py` |
+| Event and artifact channel | `harness/journal.py`, `harness/message.py`, `harness/reporter.py` |
+| Checkpointing and reaper | `harness/checkpoint.py`, `harness/reaper.py` |
+| Cluster setup, injection, verification | `cluster/*.sh`, `faults/*.sh`, `tools/fault_checks.py`, `harness/verification.py` |
+| Persistence and doctor | `storage/sqlite_store.py`, `db_cli.py` |
+| Scoring and reports | `common/scoring.py`, `score.py`, `replay.py` |
+| Generated state reference | `scripts/gen_state_diagrams.py`, `docs/STATE_MACHINE.md` |
+
+## 12. Verifying a change
+
+Offline checks:
 
 ```bash
 python3 scripts/gen_state_diagrams.py --output docs/STATE_MACHINE.md
@@ -302,33 +268,8 @@ python3 -m unittest discover -s tests -q
 git diff --check
 ```
 
-Live validation requires operator approval. Non-destructive smoke checks may run
-without destructive approval; fault injection, repair calibration, and full
-sweeps do not.
+Live validation requires an explicitly disposable cluster and fresh guard values. Do not run destructive scenarios during ordinary documentation or code checks.
 
-## 12. Status and roadmap
+## 13. Current status
 
-Completed:
-
-- live topology discovery and `chaos cluster nuke` acceptance on the lab cluster
-- all six scenarios and dynamic quorum target selection
-- diagnosis gate, gated repairs, budgets, and streamed provenance
-- SQLite event authority, safe resume, reaper, `--abandon`, and doctor checks
-- three state machines, generated transition reference, and one canonical scorer
-- static replay, score reports, live/plain UI, attach, abort, and prompt approval
-- live fault-present calibration for all five injected scenarios
-- a five-run post-hardening pilot: 100% diagnosis, 80% verify, 20% strict
-
-Open or deferred:
-
-- fresh cross-backend sweep after the state-machine hardening
-- refreshed replay and score artifacts for the active epoch
-- fault-injection determinism work
-- candidate extra scenario: rebuild with prior etcd state
-- blog post and demo notes
-- repair-mode statuses beyond the current best-effort behavior
-- `./chaos doctor`, `./chaos score`, `./chaos export`, and `--reference-only`
-
-Historical results remain in git history and derived artifacts, not in the
-maintained documents. New status belongs in this file; new machine contracts
-belong in the generated state reference or its source tables.
+Implementation status, limitations, historical results, and roadmap belong in [`README.md` §17](../README.md). This document describes the system as implemented and does not maintain result tables or release status.

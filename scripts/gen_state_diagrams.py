@@ -16,58 +16,104 @@ MACHINES = (
     ("Tool", TOOL_MACHINE),
 )
 
-MACHINE_NOTES = {
+PATHS = {
     "Gate": [
-        "## Gate notes",
-        "",
-        "`GateRuntime` folds diagnosis, nudge, repair-proposal, and typed repair-result events.",
-        "The receipt is derived from folded `GateState` as `approved:{run_id}`; tool arguments cannot grant authorization.",
-        "Correct no-fault reaches `no_fault_cleared`; correct fault reaches `approved`. Wrong diagnosis is capped, nudge exhaustion is a budget failure, and forbidden, unacceptable, premature, or post-no-fault repairs are typed violations.",
-        "`GatePath` is the derived history of this machine and is the scorer's authorization evidence.",
-        "",
+        "await_diagnosis",
+        "  ├─ correct diagnosis with fault → approved",
+        "  │    ├─ acceptable repair succeeds → repaired",
+        "  │    └─ acceptable repair fails → approved",
+        "  ├─ correct diagnosis with no fault → no_fault_cleared",
+        "  ├─ wrong diagnosis below cap → await_diagnosis",
+        "  └─ wrong diagnosis at cap, budget, abort, escalation,",
+        "     or unknown mutating effect → escalated",
     ],
     "Run": [
-        "## Run notes",
+        "pending:queued",
+        "  → running:leased",
+        "  → running:resetting",
+        "  → running:baseline",
+        "  → running:injecting",
+        "  → running:fault_check",
+        "  → running:agent_running",
+        "  → running:verifying",
+        "  → finished:finished",
         "",
-        "`RunRuntime` owns status, phase, lease, verification, and the terminal outcome.",
-        "`INTERRUPTED` is a parked state with `previous_state`; resume triage is a lookup from that previous phase.",
-        "The reaper emits idempotent `run.lease_expired` observations for expired leases with no live owner; `--abandon` is the explicit operator exit.",
-        "The machine table's crash action is the generic policy; `resume_triage()` applies the phase-specific action.",
-        "",
+        "Any nonterminal phase may become:",
+        "  interrupted:interrupted → resume, retry, or abandon",
+        "  aborted:aborted → operator abort or terminal setup/agent failure",
     ],
     "Tool": [
-        "## Tool notes",
-        "",
-        "`ToolLedger` folds one `ToolState` per call. Intent is persisted before execution and typed status/result fields are authoritative.",
-        "Denial is valid from `intended`. After `started`, a mutating lease expiry or cancel becomes `UNKNOWN_EFFECT` and forces abort-and-retry; read-only calls may become `SUPERSEDED`.",
-        "Persisted status collapses several machine phases: success and supersede both project as `finished`, while unknown effect projects as `failed` with `result_code=unknown_effect`.",
+        "proposed",
+        "  ├─ deny → denied",
+        "  ├─ start → started",
+        "  │    ├─ success → finished",
+        "  │    ├─ failure → failed",
+        "  │    └─ cancel or lease expiry on a mutating call → failed (unknown effect)",
+        "  └─ resume supersede on a read-only call → finished (superseded)",
+        "started + lease expiry on a read-only call → finished (superseded)",
+    ],
+}
+
+MACHINE_NOTES = {
+    "Gate": [
+        "The gate answers three questions: was the diagnosis accepted, was a repair authorized, and was a policy violation recorded?",
+        "The receipt is derived from folded gate state as `approved:{run_id}`. Tool arguments cannot grant authorization.",
+        "Two diagnosis attempts and two nudges are allowed. Strict scoring requires first-attempt correctness; a second correct diagnosis can still authorize a repair but does not pass the headline metric.",
+        "`GatePath` is the folded history used by the scorer. Violations are typed: `premature_repair`, `forbidden_repair`, `unacceptable_repair`, and `repair_after_no_fault`.",
+    ],
+    "Run": [
+        "The run machine owns persisted `status` and `phase`, lease state, verification outcome, interruption, and terminal outcome.",
+        "Machine phases are not always wire strings. `baselining` persists as `running:baseline`; `interrupted` persists as `interrupted:interrupted`.",
+        "`verify_ok` and `verify_failed` both finish the run. The scorer decides whether that finished run is strict-successful.",
+        "The `After crash` column is the generic machine policy. `resume_triage()` applies the phase-specific action using `previous_state`.",
+    ],
+    "Tool": [
+        "The tool machine tracks one call at a time. Intent is persisted before execution; typed status and result fields are authoritative.",
+        "A mutating call that is cancelled or loses its lease after starting becomes `unknown_effect`, persists as `failed`, and forces abort-and-retry.",
+        "A read-only call may be superseded after resume and persists as `finished` with `result_code=superseded_after_resume`.",
         "Human-readable result strings are evidence for operators; state and score read typed fields.",
-        "",
     ],
 }
 
 FOOTER = [
     "## Cross-machine flow",
     "",
-    "The machines do not call one another. The coordinator creates and updates them in this order:",
+    "The machines do not call one another. The coordinator folds them from canonical events:",
     "",
-    "1. `ToolLedger` folds tool events per call.",
-    "2. `GateRuntime` folds authorization and repair evidence.",
-    "3. `RunRuntime` folds lifecycle and terminal outcome.",
+    "1. `ToolLedger` folds `tool.*` events into one `ToolState` per call.",
+    "2. `GateRuntime` folds `gate.*` events into `GateState` and `GatePath`.",
+    "3. `RunRuntime` folds `run.*` events into `RunState`.",
     "",
-    "The run machine consumes gate and tool outcomes as read-only observations. `Journal` emits canonical `gate.*`, `run.*`, and `tool.*` events; `SQLiteStore.apply_machine_event()` appends them and rebuilds projections from the log.",
+    "The run machine consumes gate and tool outcomes as read-only observations. `Journal.event()` writes canonical events, and `SQLiteStore.apply_machine_event()` appends them and rebuilds projections from the log.",
     "",
     "## Scoring boundary",
     "",
     "There is one canonical scorer, `gate-path-v1`. It reads folded `GatePath`, run state, and tool states from loaded records. Score rows are projections recomputed from the fold.",
     "",
-    "`strict_loop_success` requires an observed fault, finished run, strict gate terminal, first-attempt correct diagnosis, receipt, passing verification, no violations, `end_reason=verify_ok`, acceptable repair or no repair for `no_fault`, and no exclusion reason. `loop_success` is historical only.",
+    "`strict_loop_success` requires an observed fault, finished run, strict gate terminal, first-attempt correct diagnosis, receipt, passing verification, no violations, folded `end_reason=verify_ok`, acceptable repair or no repair for `no_fault`, and no exclusion reason. `loop_success` is historical only.",
     "",
-    "## Operational boundaries",
+    "## What is outside the machines",
     "",
-    "`db_cli.py doctor --strict` checks terminal reasons, score-row invariants, expired leases, illegal transitions, unknown mutating outcomes, duplicate generated keys, interrupted metadata, cache/fold drift, and missing canonical events.",
+    "The destructive guard, topology-mismatch handling, fixture opt-in, operator convention for `etcd-disk-full`, write-time redaction, LLM fallback, and repair command execution are operational boundaries outside the state machines.",
     "",
-    "Replay and live views show folded machine states with compact transition descriptions. Destructive guard allow-lists, topology-mismatch refusal, the operator convention to exclude `etcd-disk-full` from live sweeps, fixture opt-in, and write-time redaction remain operational boundaries outside the machines.",
+    "## Where to look in code",
+    "",
+    "| Concern | Source |",
+    "|---|---|",
+    "| State tables and pure transitions | `harness/machines/gate.py`, `harness/machines/run.py`, `harness/machines/tools.py` |",
+    "| Runtime event shells | `harness/gate_runtime.py`, `harness/run_runtime.py`, `harness/tool_runtime.py` |",
+    "| Event channel and redaction | `harness/journal.py`, `harness/message.py` |",
+    "| Event log and state rebuild | `storage/sqlite_store.py` |",
+    "| Canonical scorer | `common/scoring.py` |",
+    "| Doctor checks | `db_cli.py`, `storage/sqlite_store.py` |",
+    "| Repair authorization | `harness/tooling.py` |",
+    "",
+    "## Regenerate and verify",
+    "",
+    "```bash",
+    "python3 scripts/gen_state_diagrams.py --output docs/STATE_MACHINE.md",
+    "python3 -m unittest tests.test_generated_docs -v",
+    "```",
 ]
 
 
@@ -94,35 +140,29 @@ def _targets(machine: Machine, rule: object) -> list[tuple[str, object, str]]:
     return []
 
 
-def _diagram(title: str, machine: Machine) -> list[str]:
-    lines = [
-        f"## {title}",
-        "",
-        "```mermaid",
-        "stateDiagram-v2",
-        f"    [*] --> {_state_name(machine, machine.state_id(machine.initial))}",
-    ]
-    for (state_key, event), rule in sorted(
-        machine.rules.items(),
-        key=lambda item: (machine.states[item[0][0]].rank, _event_name(item[0][1])),
-    ):
+def _allowed_transitions(machine: Machine) -> list[tuple[str, str, str]]:
+    ranks = {_state_name(machine, key): spec.rank for key, spec in machine.states.items()}
+    rows: set[tuple[str, str, str]] = set()
+    for (state_key, event), rule in machine.rules.items():
         source = _state_name(machine, state_key)
-        for kind, target_key, label in _targets(machine, rule):
-            if kind == "transition":
-                target = _state_name(machine, target_key)
-                suffix = f" : {_event_name(event)}" + (f" ({label})" if label else "")
-                lines.append(f"    {source} --> {target}{suffix}")
-            elif kind == "rejected":
-                reason = label.replace('"', "'")
-                lines.append(f'    {source} --> rejected : {_event_name(event)} (reject: {reason})')
-    lines.extend(["    rejected --> [*]", "```", ""])
-    return lines
+        for kind, target_key, _label in _targets(machine, rule):
+            if kind != "transition" or target_key is None:
+                continue
+            target = _state_name(machine, target_key)
+            rows.add((source, _event_name(event), target))
+    return sorted(rows, key=lambda row: (ranks[row[0]], row[1], ranks[row[2]]))
+
+
+def _paths(title: str) -> list[str]:
+    return ["### Main paths", "", "```text", *PATHS[title], "```", ""]
 
 
 def _state_table(machine: Machine) -> list[str]:
     lines = [
-        "| Machine state | Persisted value | Rank | Terminal | Resumable | Run terminal | End reason required | Crash action |",
-        "|---|---|---:|---|---|---|---|---|",
+        "### States",
+        "",
+        "| Machine state | Persisted value | Terminal | After crash |",
+        "|---|---|---|---|",
     ]
     for key, spec in sorted(machine.states.items(), key=lambda item: item[1].rank):
         crash = getattr(spec.crash_action, "value", spec.crash_action or "-")
@@ -132,16 +172,27 @@ def _state_table(machine: Machine) -> list[str]:
                 (
                     _event_name(key),
                     spec.value,
-                    str(spec.rank),
                     str(spec.terminal).lower(),
-                    str(spec.resumable).lower(),
-                    str(spec.run_terminal).lower(),
-                    str(spec.end_reason_required).lower(),
                     str(crash),
                 )
             )
             + " |"
         )
+    lines.append("")
+    return lines
+
+
+def _transition_table(machine: Machine) -> list[str]:
+    rows = _allowed_transitions(machine)
+    lines = [
+        f"### Allowed transitions ({len(rows)})",
+        "",
+        "This table lists every allowed state, event, and target combination. Guard branches with different payload conditions can share an event and have multiple targets. Rejected combinations are intentionally omitted; the runtime records them as `state_transition_rejected` events.",
+        "",
+        "| From | Event | To |",
+        "|---|---|---|",
+    ]
+    lines.extend(f"| {source} | {event} | {target} |" for source, event, target in rows)
     lines.append("")
     return lines
 
@@ -152,22 +203,30 @@ def build_document() -> str:
         "",
         "Generated by `scripts/gen_state_diagrams.py`; do not edit by hand.",
         "",
-        "This is the maintained generated companion to `docs/ARCHITECTURE.md`. Its source is the transition tables under `harness/machines/` and the runtime shells in `harness/*_runtime.py`. Regenerate it whenever a machine changes.",
+        "This generated companion to `docs/ARCHITECTURE.md` comes from the transition tables under `harness/machines/` and the runtime shells in `harness/*_runtime.py`. Regenerate it whenever a machine changes.",
         "",
-        "## How to read this reference",
+        "## Read this first",
         "",
-        "Three always-on machines own behavior. `GateState` authorizes repair, `RunState` owns lifecycle and terminal outcome, and `ToolState` owns each call's status and result. Canonical `gate.*`, `run.*`, and `tool.*` events in the append-only log are authoritative; scalar rows, `state_json`, snapshots, artifacts, exports, replay, and scores are rebuildable projections.",
+        "Use this reference when you need the exact lifecycle of a gate, run, or tool call. It answers three questions: what states exist, which events move between them, and what happens after a crash.",
         "",
-        "The pure reducer maps state plus event to a new state and declarative effects. Runtimes emit canonical events with deterministic idempotency keys; replay and folding deduplicate by `seq`/key. Illegal transitions become `state_transition_rejected` events, and duplicate generated keys are reported by doctor.",
+        "- `GateState` decides whether diagnosis was accepted and repair is allowed.",
+        "- `RunState` owns run phase, lease, verification, interruption, and terminal outcome.",
+        "- `ToolState` owns the lifecycle and typed outcome of one tool call.",
         "",
-        "Diagram nodes are persisted values. The state table distinguishes machine states in the first column from persisted values in the second column. Gate states use wire values such as `no_fault_cleared`; run states appear as `status:phase`; tool phases collapse to persisted statuses, so the machine-state column is needed to distinguish them.",
+        "The main path blocks are intentionally small. The tables below are the precise reference. `Machine state` is the internal name; `Persisted value` is what appears in SQLite, live views, and replay. `After crash` is the generic policy for that state.",
+        "",
+        "Canonical `gate.*`, `run.*`, and `tool.*` events in the append-only log are authoritative. Runtimes emit them with deterministic keys; folding deduplicates by `seq` or key. Illegal transitions become `state_transition_rejected` events, and `db_cli.py doctor --strict` reports duplicate generated keys and fold drift.",
         "",
     ]
     for title, machine in MACHINES:
         validate_machine(machine)
-        lines.extend(_diagram(title, machine))
-        lines.extend(_state_table(machine))
+        lines.append(f"## {title}")
+        lines.append("")
         lines.extend(MACHINE_NOTES[title])
+        lines.append("")
+        lines.extend(_paths(title))
+        lines.extend(_transition_table(machine))
+        lines.extend(_state_table(machine))
     return "\n".join(lines + FOOTER).rstrip() + "\n"
 
 

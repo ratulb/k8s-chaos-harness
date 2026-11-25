@@ -9,9 +9,10 @@ etcd failures in a live Kubernetes cluster.
 > kubectl context or an explicit cluster ID is allow-listed; a topology hash is
 > checked only when an allow-list is configured (§15).
 
-This README is the full operator guide. `docs/ARCHITECTURE.md` is the maintained
-description of the current system, and `docs/STATE_MACHINE.md` is the generated
-state-machine reference.
+This README is the full operator guide. `docs/ARCHITECTURE.md` explains the
+parts of the system and how they work together. `docs/call_flow.md` follows one
+run call by call, and `docs/STATE_MACHINE.md` is the generated reference for
+state and transition lifecycles.
 
 > **Authority.** Code is executable truth. If a document disagrees with the
 > implementation, fix the document. Secondary reference material is collapsible.
@@ -123,9 +124,9 @@ Legend: the operator, `./chaos`, and `run_benchmark.py` are orchestration;
 cluster scripts, the LLM backend, tool registry/gates, SQLite, and reports are
 external systems or outputs.
 
-The maintained system overview is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
-The generated transition reference is in
-[docs/STATE_MACHINE.md](docs/STATE_MACHINE.md).
+The end-user architecture guide is in
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). The generated transition reference
+is in [docs/STATE_MACHINE.md](docs/STATE_MACHINE.md).
 
 SQLite is both the coordination layer and the history. The runner writes
 
@@ -1430,8 +1431,9 @@ unreadable DB.
   still written; topology-mismatch discard still truncates default `runs.jsonl`
 - the full fresh cross-backend sweep and refreshed artifacts remain pending
 
-The maintained status and roadmap live in `docs/ARCHITECTURE.md` §12. Historical
-results remain in git history and derived artifacts, not in this guide.
+This section owns current status and limitations. `docs/ARCHITECTURE.md`
+describes implemented behavior and does not track roadmap. Historical results
+are embedded in §14 and derived artifacts; older snapshots remain in git history.
 
 </details>
 
@@ -1445,7 +1447,7 @@ Start here: README → §8 Quickstart → §10 One run, end to end.
 | Document | Role |
 | --- | --- |
 | `README.md` | Full operator guide: concepts, commands, configuration, safety, troubleshooting |
-| `docs/ARCHITECTURE.md` | Maintained description of the current system and roadmap |
+| `docs/ARCHITECTURE.md` | End-user guide to the parts, boundaries, and lifecycle of the current system |
 | `docs/call_flow.md` | End-to-end call flow from `chaos run` through setup, LLM loop, verification, and scoring |
 | `docs/STATE_MACHINE.md` | Generated state-machine reference; edit the generator or machine tables |
 | `scripts/README.md` | Helper-script details |

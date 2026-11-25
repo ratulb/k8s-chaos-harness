@@ -8,7 +8,7 @@ the other scenarios.
 
 The contract is narrow: the harness owns the cluster lifecycle, the model receives
 diagnostic and gated repair tools, and the truth label plus scoring inputs stay
-outside the prompt. `docs/ARCHITECTURE.md:9-24` states the same boundary at system
+outside the prompt. `docs/ARCHITECTURE.md` states the same boundary at system
 level; this document follows the calls that enforce it.
 
 Read sections 1-4 for the machine-side path before the model speaks, sections 5-7
@@ -80,7 +80,7 @@ The `run` subcommand requires `--scenario` and `--backend`. It accepts `--mode`,
 `--approve`, `--runs`, `--seed`, `--detach`, `--ui`, `--logs-dir`, resume flags,
 `--discard-stale`, and `--verbose` (`chaos_cli.py:337-352`). `--approve` chooses
 `policy` or `prompt`; it changes prompt and reporting context, not the reset,
-baseline, or injection lifecycle (`docs/ARCHITECTURE.md:39-44`).
+baseline, or injection lifecycle (`docs/ARCHITECTURE.md`, sections 2 and 5).
 
 In the foreground path, `subprocess.call` waits for the child. With `--detach`,
 `Popen` starts it and prints launch metadata; the child writes to
