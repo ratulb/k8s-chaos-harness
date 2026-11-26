@@ -20,6 +20,21 @@ LINK_RE = re.compile(r"\[[^\]]*\]\(([^)]+)\)")
 REF_RE = re.compile(r"`([A-Za-z0-9_./-]+\.(?:py|sh|md|json)):(\d+(?:[,\-]\d+)*)`")
 
 
+def heading_anchor(text: str) -> str:
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"<[^>]+>", "", text).lower()
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE)
+    return re.sub(r"\s+", "-", text.strip())
+
+
+def markdown_anchors(text: str) -> set[str]:
+    anchors = set()
+    for line in text.splitlines():
+        if line.startswith("#"):
+            anchors.add(heading_anchor(line.lstrip("#").strip()))
+    return anchors
+
+
 class TestGeneratedDocs(unittest.TestCase):
     def test_state_machine_reference_matches_generator(self) -> None:
         generated = gen_state_diagrams.build_document()
@@ -44,11 +59,15 @@ class TestGeneratedDocs(unittest.TestCase):
             text = doc.read_text(encoding="utf-8")
             self.assertEqual(text.count("```") % 2, 0, f"{name}: unbalanced code fences")
             for link in LINK_RE.findall(text):
-                target = link.split("#", 1)[0]
-                if not target or target.startswith(("http://", "https://", "mailto:")):
+                target, _, anchor = link.partition("#")
+                if target.startswith(("http://", "https://", "mailto:")):
                     continue
-                resolved = (doc.parent / target).resolve()
-                self.assertTrue(resolved.exists(), f"{name}: broken link {link}")
+                resolved = (doc.parent / target).resolve() if target else doc.resolve()
+                if target:
+                    self.assertTrue(resolved.exists(), f"{name}: broken link {link}")
+                if anchor and resolved.suffix == ".md":
+                    anchors = markdown_anchors(resolved.read_text(encoding="utf-8"))
+                    self.assertIn(anchor.lower(), anchors, f"{name}: broken anchor {link}")
             for match in REF_RE.finditer(text):
                 path = ROOT / match.group(1)
                 self.assertTrue(path.exists(), f"{name}: missing reference {match.group(1)}")

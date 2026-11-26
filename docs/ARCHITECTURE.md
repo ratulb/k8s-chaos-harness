@@ -20,7 +20,7 @@ The harness, not the model, owns the dangerous parts of the experiment. It reset
 
 Diagnosis and repair are separate signals. A correct diagnosis does not authorize any repair. A useful run can fail the headline metric if it guesses right but proposes an unsafe repair.
 
-This is an educational benchmark, not a production remediation service, a generic Kubernetes autopilot, or a model-visible fault injector. External remediation workflows are out of scope. Repair mode is best effort: it changes prompts and reporting, but still resets, verifies a baseline, and injects.
+This is an educational benchmark, not a production remediation service, a generic Kubernetes autopilot, or a model-visible fault injector. External remediation workflows are out of scope.
 
 ## 2. The participants
 
@@ -272,4 +272,4 @@ Live validation requires an explicitly disposable cluster and fresh guard values
 
 ## 13. Current status
 
-Implementation status, limitations, historical results, and roadmap belong in [`README.md` §17](../README.md). This document describes the system as implemented and does not maintain result tables or release status.
+Implementation status, limitations, historical results, and roadmap belong in [`README.md` current status](../README.md#10-current-status-and-limits). This document describes the system as implemented and does not maintain result tables or release status.

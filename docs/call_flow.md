@@ -11,7 +11,7 @@ This walkthrough follows one benchmark run from the command you type to the evid
 
 This document is a walkthrough, not the full reference:
 
-- [`README.md`](../README.md) owns commands, configuration, safety, and current status.
+- [`README.md`](../README.md) covers commands, configuration, safety, and current status.
 - [`ARCHITECTURE.md`](ARCHITECTURE.md) explains the parts of the system and why they exist.
 - [`STATE_MACHINE.md`](STATE_MACHINE.md) is the generated reference for exact states and transitions.
 
@@ -291,16 +291,15 @@ Start with the live views:
 
 The doctor checks schema presence and version, canonical events, duplicate generated keys, rejected transitions, stale cache markers, expired live owners, in-flight tools, unknown mutating effects, incomplete interrupted runs, missing final records or scores, and cache/projection drift.
 
-For a specific run, replace `RUN_ID` below with your run id. These Python snippets are read-only and use the standard library, so they work even when the `sqlite3` CLI is unavailable.
+For a specific run, replace `[RUN_ID]` below with the run id from `./chaos status`. These Python snippets are read-only and use the standard library, so they work even when the `sqlite3` CLI is unavailable.
 
 Show the run projection and cache markers:
 
-```bash
-python3 - <<'PY'
+```python
 import json
 import sqlite3
 
-run_id = "RUN_ID"
+run_id = "[RUN_ID]"
 con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 for row in con.execute(
@@ -311,17 +310,15 @@ for row in con.execute(
     (run_id,),
 ):
     print(json.dumps(dict(row), indent=2))
-PY
 ```
 
 Show the append-only event log:
 
-```bash
-python3 - <<'PY'
+```python
 import json
 import sqlite3
 
-run_id = "RUN_ID"
+run_id = "[RUN_ID]"
 con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 for row in con.execute(
@@ -333,17 +330,15 @@ for row in con.execute(
     if item.get("payload_json"):
         item["payload_json"] = json.loads(item["payload_json"])
     print(json.dumps(item, indent=2))
-PY
 ```
 
 Show the final record, folded gate path, verification output, and raw LLM response:
 
-```bash
-python3 - <<'PY'
+```python
 import json
 import sqlite3
 
-run_id = "RUN_ID"
+run_id = "[RUN_ID]"
 con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 for row in con.execute(
@@ -355,17 +350,15 @@ for row in con.execute(
     (run_id,),
 ):
     print(json.dumps(dict(row), indent=2))
-PY
 ```
 
 Show what the model saw and what tools returned:
 
-```bash
-python3 - <<'PY'
+```python
 import json
 import sqlite3
 
-run_id = "RUN_ID"
+run_id = "[RUN_ID]"
 con = sqlite3.connect("file:results.sqlite3?mode=ro", uri=True)
 con.row_factory = sqlite3.Row
 for table, columns, order in (
@@ -382,7 +375,6 @@ for table, columns, order in (
             if item.get(key):
                 item[key] = json.loads(item[key])
         print(json.dumps(item, indent=2))
-PY
 ```
 
 Read the outputs in this order:
